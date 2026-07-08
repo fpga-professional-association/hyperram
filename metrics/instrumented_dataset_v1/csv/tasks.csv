@@ -1,0 +1,29 @@
+id,date,project,stage,origin,agent_tool,wallclock_min,iterations,notes
+1,2026-07-07,infra-hyperram,SPEC,agent,claude,6,1,sourcing: research OSS HyperRAM cores + Agilex options (standalone agent a6e989ab); chose MJoergen(MIT)+OpenHBMC(Apache) refs
+2,2026-07-07,infra-hyperram,SPEC,agent,claude,15,2,"spec acquisition: download+extract Infineon HyperBus spec 001-99253 RevH (main-loop; PDF via WebFetch, pypdf); wallclock approx (interleaved)"
+3,2026-07-08,infra-hyperram,DOC,agent,claude,20,3,"orchestration+publish: repo scaffold, 3 git commits, push to fpga-professional-association/hyperram, dataset assembly; wallclock approx (interleaved)"
+4,2026-07-08,infra-hyperram,SPEC,agent,claude,3,1,core:spec-digest
+5,2026-07-08,infra-hyperram,SPEC,agent,claude,2,1,core:spec-protocol
+6,2026-07-08,infra-hyperram,SPEC,agent,claude,2,1,core:spec-registers
+7,2026-07-08,infra-hyperram,SPEC,agent,claude,3,1,core:spec-refs
+8,2026-07-08,infra-hyperram,ARCH,agent,claude,16,2,core:design-arch
+9,2026-07-08,infra-hyperram,RTL,agent,claude,5,2,core:tops
+10,2026-07-08,infra-hyperram,RTL,agent,claude,25,10,core:phy-generic
+11,2026-07-08,infra-hyperram,RTL,agent,claude,6,3,core:avalon-frontend
+12,2026-07-08,infra-hyperram,RTL,agent,claude,5,4,core:axi-frontend
+13,2026-07-08,infra-hyperram,RTL,agent,claude,14,3,core:ctrl
+14,2026-07-08,infra-hyperram,TB,agent,claude,38,26,core:tb-integrate+debug
+15,2026-07-08,infra-hyperram,TB,agent,claude,28,12,core:device-model
+16,2026-07-08,infra-hyperram,REVIEW,agent,claude,4,1,core:spec-conformance
+17,2026-07-08,infra-hyperram,REVIEW,agent,claude,5,1,core:spec-conformance (parallel/retry #2)
+18,2026-07-08,infra-hyperram,REVIEW,agent,claude,5,1,core:spec-conformance (parallel/retry #3)
+19,2026-07-08,infra-hyperram,REVIEW,agent,claude,6,1,core:spec-conformance (parallel/retry #4)
+20,2026-07-08,infra-hyperram,DEBUG,agent,claude,31,17,core:verify-fix
+21,2026-07-08,infra-hyperram,DOC,agent,claude,6,3,core:package
+22,2026-07-08,infra-hyperram,RTL,agent,claude,9,2,bw:bw-harness
+23,2026-07-08,infra-hyperram,TB,agent,claude,2,1,bw:bw-tb
+24,2026-07-08,infra-hyperram,TB,agent,claude,2,3,bw:bw-tb (parallel/retry #2)
+25,2026-07-08,infra-hyperram,REVIEW,agent,claude,8,6,bw:bw-measure-review
+26,2026-07-08,infra-hyperram,RTL,agent,claude,48,19,hw:board-integration
+27,2026-07-08,infra-hyperram,RTL,agent,claude,8,3,hw:agilex-phy
+28,2026-07-08,infra-hyperram,PNR,agent,claude,9,5,hw:fit-attempt

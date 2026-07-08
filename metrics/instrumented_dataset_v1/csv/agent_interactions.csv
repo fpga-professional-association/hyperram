@@ -1,0 +1,29 @@
+id,task_id,invocations,context_tokens,prompt_tokens,prompt_complexity,accepted_without_edit,prompt_ref
+1,1,1,52077,13019,4,1,workflow/agent research
+2,2,2,8000,1200,2,1,main-loop direct
+3,3,3,12000,1500,3,1,main-loop direct
+4,4,7,48415,11542,5,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#spec-digest
+5,5,12,44246,504,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#spec-protocol
+6,6,12,64444,496,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#spec-registers
+7,7,34,84953,611,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#spec-refs
+8,8,49,83310,719,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#design-arch
+9,9,24,76245,489,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#tops
+10,10,73,183346,579,2,0,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#phy-generic
+11,11,30,71393,455,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#avalon-frontend
+12,12,28,84490,462,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#axi-frontend
+13,13,29,110005,516,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#ctrl
+14,14,160,271411,592,2,0,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#tb-integrate+debug
+15,15,74,177814,503,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#device-model
+16,16,27,73819,488,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#spec-conformance
+17,17,25,67486,486,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#spec-conformance
+18,18,19,81855,487,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#spec-conformance
+19,19,22,89767,486,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#spec-conformance
+20,20,163,252040,3984,5,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#verify-fix
+21,21,42,99589,657,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperbus-ip-build-wf_4e3224cd-1eb.js#package
+22,22,36,85145,707,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperram-bw-harness-wf_901a8c66-485.js#bw-harness
+23,23,18,47755,428,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperram-bw-harness-wf_901a8c66-485.js#bw-tb
+24,24,25,55587,428,2,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperram-bw-harness-wf_901a8c66-485.js#bw-tb
+25,25,37,85784,397,1,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/77d24dba-da55-4473-8242-0cc9c9c99f7d/workflows/scripts/hyperram-bw-harness-wf_901a8c66-485.js#bw-measure-review
+26,26,267,280043,1115,3,0,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/4575e435-34e5-4a49-84f3-e5d26a110cce/workflows/scripts/hyperram-axc3000-bw-hw-wf_66c8719c-410.js#board-integration
+27,27,34,92522,877,3,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/4575e435-34e5-4a49-84f3-e5d26a110cce/workflows/scripts/hyperram-axc3000-bw-hw-wf_66c8719c-410.js#agilex-phy
+28,28,67,80157,773,2,0,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/4575e435-34e5-4a49-84f3-e5d26a110cce/workflows/scripts/hyperram-axc3000-bw-hw-wf_66c8719c-410.js#fit-attempt

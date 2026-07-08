@@ -1,0 +1,8 @@
+id,task_id,origin,detected_at,rework_min,description
+1,14,rtl-interface,sim,6,Missing hyperbus_phy.sv variant-selector module: tops instantiated hyperbus_phy but only _generic/_altera/_xilinx existed; design would not elaborate. Verify created the selector.
+2,14,rtl-logic,sim,12,Generic PHY read-capture sampled DQ on the RWDS edge (data transition) -> shifted/garbage read words. Fixed to sample at DDR eye centres in the clk domain.
+3,14,rtl-logic,sim,10,Generic PHY CK-gating produced a runt/extra pulse (clk90-domain resample) -> phantom 0x0000 word corrupted CR0 program and shifted writes. Fixed by gating clk90 with the clk-domain enable.
+4,23,tool-flow,sim,1,"run.sh defined BENCH_SRCS but never invoked tb_bw (harness/flow gap, not RTL). Added the tb_bw run line."
+5,28,tool-flow,pnr,4,Stale qsys make_bw_sys.qpf/.qsf blocked qsys-script regeneration. Cleaned scratch project.
+6,28,integration,pnr,5,Mismatched _0/_1 IP instance naming between regenerated sub-IP and bw.qsf IP_FILE lines. Normalised to deterministic names.
+7,28,constraint-timing,pnr,9,"UNRESOLVED: IOPLL cannot route clk(0deg, DQ DDIOs) + clk90(90deg, hb_ck DDIO) both into the I/O region (Quartus Err 24403/24404). hb_ck eye-centering needs the 2nd phase at the I/O; real fix = physical floorplan of hb_ck pad into a separate I/O sub-bank (needs AXC3000 package bank map) or hardened DDR-I/O. Not faked with single-phase CK."

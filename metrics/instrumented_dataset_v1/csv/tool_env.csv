@@ -1,0 +1,13 @@
+key,value
+os,"WSL2 Ubuntu, Linux 6.6.87.2-microsoft-standard-WSL2"
+quartus,Quartus Prime Pro 26.1.0 Build 110 (Docker alterafpga/quartus-pro:26.1-agilex3)
+fpga_ai_suite,2026.1.1+b17
+verilator,5.020
+docker,29.6.1
+python,3.12
+verilator_flags,--binary --timing -Wall
+quartus_flow,quartus_sh --flow compile; qsys-generate -syn
+device,A3CY100BM16AE7S (Agilex 3)
+board,Arrow AXC3000 + Winbond W957D8NB HyperRAM
+llm,"Claude Opus 4.8 (agentic; Claude Code harness, Workflow multi-agent orchestration)"
+fit_seed,1 (default)

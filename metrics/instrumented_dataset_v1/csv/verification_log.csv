@@ -1,0 +1,8 @@
+id,testbench,checks,assertions,method,outcome,coverage_notes
+1,tb_avalon,53,5,Verilator 5.020 --binary --timing (self-checking),PASS,Avalon path: single/burst4/8/16 + wrap-crossing + CR0 wr/rd + ID0 rd
+2,tb_axi,132,3,Verilator 5.020 --binary --timing (self-checking),PASS,AXI4 path: single/INCR4/8/16 + WRAP + FIXED + CR0 + ID0 + B/R OKAY resp
+3,tb_fixed2x,65,2,Verilator 5.020 --binary --timing (self-checking),PASS,fixed-latency and variable-2x latency latency-mode coverage
+4,tb_timeout,11,2,Verilator 5.020 --binary --timing (self-checking),PASS,timeout/guard behaviour
+5,tb_bw,1,3,Verilator 5.020 --binary --timing (self-checking),PASS,"bandwidth harness: integrity clean (ERR_COUNT=0), WR=126/RD=151 clk @LEN=64, cycle counts sane"
+6,(formal),0,0,none,N/A,No formal verification performed
+7,(hardware),0,0,AXC3000 on-board bandwidth,BLOCKED,No bitstream (PNR blocker); on-hardware read/write MB/s not obtained
