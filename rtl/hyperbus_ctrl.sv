@@ -101,7 +101,15 @@ module hyperbus_ctrl
   localparam int unsigned RECOVERY_CYCLES  = 4;                    // tCSHI + tRWR gap (SPEC §6)
   localparam int unsigned TAIL_CYCLES      = 2;                    // extra CS# Low after last word (tCSH note)
   localparam int unsigned READ_STALL_LIMIT = 32;                   // RWDS Low >= 32 clk => timeout (SPEC §4/§7)
-  localparam int unsigned RD_FIFO_DEPTH    = 8;                    // read holding buffer (rd_ready slack)
+  localparam int unsigned RD_FIFO_DEPTH    = 32;                   // read holding buffer (rd_ready slack).
+                                                                    // Must exceed the largest single read
+                                                                    // segment (Avalon burstcount) + the SDR
+                                                                    // PHY read-pipeline depth so the final,
+                                                                    // rd_last-tagged word is never dropped on
+                                                                    // rd_fifo_full: on the AXC3000 SDR path a
+                                                                    // depth of 8 capped completing reads at ~5
+                                                                    // words (bursts >=6 hung). 32 covers the
+                                                                    // board's 16-word bursts with slack.
   localparam int unsigned RD_AW            = $clog2(RD_FIFO_DEPTH);
 
   typedef enum logic [3:0] {
@@ -341,6 +349,14 @@ module hyperbus_ctrl
 
         // ---------------- idle / accept ----------------
         ST_IDLE: begin
+          // Flush the read holding FIFO between transactions. A real HyperRAM keeps streaming read
+          // data for a few extra words after the master has counted its burst (the master's CK stop
+          // has pipeline latency), so a completed read can leave stray words buffered. Left in place
+          // they keep rd_fifo non-empty, block the next command (cmd_ready gates on rd_fifo_empty),
+          // and hang multi-burst reads on hardware. In ST_IDLE the previous transaction is fully
+          // drained (its rd_last was delivered), so clearing the pointers only discards those extras.
+          rd_wptr <= '0;
+          rd_rptr <= '0;
           if (cmd_valid & init_done & rd_fifo_empty) begin
             cur_read  <= cmd_read;
             cur_reg   <= cmd_reg;

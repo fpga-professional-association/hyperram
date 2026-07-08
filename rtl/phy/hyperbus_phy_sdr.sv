@@ -82,7 +82,15 @@ module hyperbus_phy_sdr
     // Read-capture eye phase select (non-frozen, defaulted). 0 = sample DQ/RWDS on the clk90 posedge
     // (centres the eye at nominal flight delay); 1 = pre-sample on the clk90 negedge (half-clk90 earlier
     // sampling point) for on-hardware read-eye tuning. Realised in silicon by an input-delay tap.
-    parameter bit          CAPTURE_PHASE = 1'b0
+    parameter bit          CAPTURE_PHASE = 1'b0,
+    // Read-strobe PREAMBLE skip (non-frozen, defaulted 0). A real HyperRAM (Winbond W957D8NB on the
+    // AXC3000) toggles RWDS for RD_PREAMBLE_SKIP CK cycles with DQ Hi-Z (=0x00) BEFORE the first read
+    // data byte — a turn-around preamble the ideal model does not emit. Those leading RWDS rising
+    // edges would otherwise pair into PHANTOM {0x00,0x00} words and mis-align the whole read (the
+    // AXC3000 bring-up hang: STATUS never `done`). Ignore the first RD_PREAMBLE_SKIP rwds rising edges
+    // after the receiver arms, so byte pairing begins on the REAL read-data window. 0 = no preamble
+    // (spec-ideal model / all existing TBs) — the pairing then starts on the very first edge as before.
+    parameter int unsigned RD_PREAMBLE_SKIP = 0
 ) (
     input  logic                clk,       // CK-rate WORD clock (controller domain); hb_ck runs at this rate
     input  logic                clk90,     // REPURPOSED: 2x BYTE clock (single PLL, 0deg) — the periphery clock
@@ -275,7 +283,9 @@ module hyperbus_phy_sdr
 
   // Elastic FIFO (write side = clk90 byte domain, read side = clk word domain). Gray-pointer async
   // FIFO — the designated CDC of the read path (DESIGN.md §2).
-  localparam int unsigned RXF_DEPTH = 8;
+  localparam int unsigned RXF_DEPTH = 32;   // elastic read FIFO (byte->word). Deepened from 8 so a full
+                                            // board read burst (16 words) plus the clk90->clk gray-pointer
+                                            // hand-off latency never laps the pointer / stalls the drain.
   localparam int unsigned RXF_AW    = $clog2(RXF_DEPTH);
 
   logic [PHYW-1:0]     rxf_mem [RXF_DEPTH];
@@ -284,6 +294,12 @@ module hyperbus_phy_sdr
   logic                rwds_cap_q;                // previous RWDS sample (edge detect)
   logic [RXF_AW:0]     wptr_bin;                  // clk90-domain binary write pointer (extra MSB)
   logic [RXF_AW:0]     rptr_bin;                  // clk-domain binary read pointer
+
+  // Leading rwds-rise edges still to be discarded as read-strobe preamble for this burst. Loaded to
+  // RD_PREAMBLE_SKIP each time the receiver is disarmed, so every read transaction (each CS# / each
+  // ST_LAT->ST_READ arm) re-skips its own preamble.
+  localparam int unsigned SKIPW = (RD_PREAMBLE_SKIP == 0) ? 1 : $clog2(RD_PREAMBLE_SKIP + 1);
+  logic [SKIPW-1:0]    pre_skip;
 
   wire rwds_rise = rwds_cap & ~rwds_cap_q;        // start of byte A
   wire rwds_fall = ~rwds_cap & rwds_cap_q;        // start of byte B (word complete)
@@ -294,15 +310,28 @@ module hyperbus_phy_sdr
       have_a     <= 1'b0;
       rwds_cap_q <= 1'b0;
       wptr_bin   <= '0;
+      pre_skip   <= SKIPW'(RD_PREAMBLE_SKIP);
     end else begin
       rwds_cap_q <= rwds_cap;
       if (!rdarm_s2) begin
-        // Not in a read-data phase: clear the pairing pipeline so a fresh burst starts clean.
-        have_a <= 1'b0;
+        // Not in a read-data phase: clear the pairing pipeline, re-arm the preamble skip, and flush
+        // the elastic-FIFO write side so a fresh burst starts clean and discards its own turn-around
+        // preamble edges AND any trailing words the device streamed past the master's burst count
+        // (which would otherwise leak into the next read). Paired with the read-side rptr reset below.
+        have_a   <= 1'b0;
+        pre_skip <= SKIPW'(RD_PREAMBLE_SKIP);
+        wptr_bin <= '0;
       end else begin
         if (rwds_rise) begin
-          rx_byte_a <= dq_cap;      // byte A (mid byte-A eye)
-          have_a    <= 1'b1;
+          if (pre_skip != '0) begin
+            // Preamble rising edge: discard it (DQ is Hi-Z here). Do NOT start a word so the
+            // following falling edge cannot complete a phantom {0x00,0x00} pair.
+            pre_skip <= pre_skip - 1'b1;
+            have_a   <= 1'b0;
+          end else begin
+            rx_byte_a <= dq_cap;      // byte A (mid byte-A eye)
+            have_a    <= 1'b1;
+          end
         end else if (rwds_fall && have_a) begin
           rxf_mem[wptr_bin[RXF_AW-1:0]] <= {rx_byte_a, dq_cap};  // {byte A (hi), byte B (lo)}
           wptr_bin                       <= wptr_bin + 1'b1;
@@ -334,7 +363,11 @@ module hyperbus_phy_sdr
   wire [RXF_AW:0] wptr_bin_s = gray2bin(wgray_s2);
   wire            rxf_empty  = (rptr_bin == wptr_bin_s);
 
-  // Read side (clk word domain): one recovered word + valid per FIFO entry.
+  // Read side (clk word domain): one recovered word + valid per FIFO entry. While the receiver is
+  // disarmed (phy_rd_arm Low, i.e. between read bursts) hold the read pointer at 0 so the elastic
+  // FIFO is flushed to empty — the write side (wptr_bin) is likewise reset to 0 in the clk90 domain
+  // when rdarm_s2 falls. Both sides therefore start every read burst at 0, discarding any trailing
+  // over-streamed words from the previous burst (the multi-burst hang on the AXC3000).
   always_ff @(posedge clk) begin
     if (rst) begin
       rptr_bin       <= '0;
@@ -342,7 +375,9 @@ module hyperbus_phy_sdr
       phy_dq_i_valid <= 1'b0;
     end else begin
       phy_dq_i_valid <= 1'b0;
-      if (!rxf_empty) begin
+      if (!phy_rd_arm) begin
+        rptr_bin <= '0;
+      end else if (!rxf_empty) begin
         phy_dq_i       <= rxf_mem[rptr_bin[RXF_AW-1:0]];
         phy_dq_i_valid <= 1'b1;
         rptr_bin       <= rptr_bin + 1'b1;

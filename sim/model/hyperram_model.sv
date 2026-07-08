@@ -56,6 +56,13 @@ module hyperram_model
     parameter int unsigned STALL_CLOCKS   = 0,                        //   read burst at which to hold RWDS Low
                                                                       //   for STALL_CLOCKS CK cycles (0=never).
                                                                       //   Models the >=32-clk error stall.
+    parameter int unsigned RD_PREAMBLE_CLOCKS = 0,                    // read-strobe PREAMBLE (CK cycles): before
+                                                                      //   the first real read byte the device
+                                                                      //   toggles RWDS (=CK) with DQ Hi-Z (reads
+                                                                      //   as 0x00). Reproduces the real Winbond
+                                                                      //   W957D8NB read turnaround captured on the
+                                                                      //   AXC3000 board (cap idx85-88). 0 = none
+                                                                      //   (spec-ideal; keeps existing TBs aligned).
     parameter logic [15:0] ID0_RESET      = HB_ID0_RESET,             // read-only device ID (mfr nibble)
     parameter logic [15:0] ID1_RESET      = HB_ID1_RESET,             // read-only device ID (type nibble)
     parameter logic [15:0] CR0_RESET      = HB_CR0_RESET,             // config register 0 reset image
@@ -331,9 +338,17 @@ module hyperram_model
         hb_rwds_o  = collide | (fixed_active & FIXED_2X);
       end else if (cur_rw) begin
         if (beat < first_data_beat) begin
-          // Read initial access latency: DQ Hi-Z (turn-around), RWDS driven Low by the slave.
+          // Read initial access latency: DQ Hi-Z (turn-around), RWDS driven by the slave.
           hb_rwds_oe = 1'b1;
-          hb_rwds_o  = 1'b0;
+          // Read PREAMBLE (SPEC-real device): for the final RD_PREAMBLE_CLOCKS CK cycles of the
+          // turn-around window the device already toggles RWDS (= CK) while DQ is still Hi-Z (reads
+          // 0x00). This is the AXC3000-captured W957D8NB behaviour (cap idx85-88): RWDS edges appear
+          // BEFORE the first real data byte. DQ stays Hi-Z (hb_dq_oe=0 => resolves to 0 on the bus).
+          if ((RD_PREAMBLE_CLOCKS != 0) &&
+              (beat >= (first_data_beat - 16'(2*RD_PREAMBLE_CLOCKS))))
+            hb_rwds_o = hb_ck;      // preamble strobe: RWDS toggles like CK, DQ = 0
+          else
+            hb_rwds_o = 1'b0;       // plain turn-around: RWDS held Low
         end else begin
           // Read data: source-synchronous strobe + data, edge-aligned.
           hb_dq_oe   = 1'b1;

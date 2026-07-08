@@ -223,7 +223,13 @@ module top (
     .POR_DELAY_CYCLES (0),
     .INIT_CR0         (16'h8F1F),      // latency code 6, fixed
     .PHY_VARIANT      ("SDR"),         // portable single-clock-phase SDR PHY (unblocks 24403/24404)
-    .DIFF_CK          (1'b0)           // single-ended CK on AXC3000 (no hb_ck_n pin)
+    .DIFF_CK          (1'b0),          // single-ended CK on AXC3000 (no hb_ck_n pin)
+    // Winbond W957D8NB drives a read-strobe PREAMBLE: RWDS toggles with DQ Hi-Z (=0x00) for ONE CK
+    // cycle before the first real read byte (on-silicon capture cap_sample_dump.txt: preamble pulse
+    // at idx85/86, then the first data word at idx87..). The SDR PHY discards that one leading RWDS
+    // rising edge so byte pairing starts on the real read data — without it, the preamble edge paired
+    // into a phantom {0x00,0x00} word and the bandwidth test hung (STATUS never reached done).
+    .RD_PREAMBLE_SKIP (1)
   ) u_hyperram (
     .clk               (clk),
     .clk90             (clk2x),  // 100 MHz 2x byte clock (SDR PHY repurposes clk90 as the byte clock)

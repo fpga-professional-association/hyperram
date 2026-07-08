@@ -30,7 +30,9 @@ module hyperram_avalon
   parameter logic [15:0] INIT_CR0          = HB_CR0_RESET,               // CR0 image written at init
   // ---- PHY (hyperbus_phy) -------------------------------------------------
   parameter              PHY_VARIANT       = "GENERIC",                  // GENERIC | INTEL | XILINX
-  parameter bit          DIFF_CK           = 1'b1                        // drive hb_ck_n
+  parameter bit          DIFF_CK           = 1'b1,                       // drive hb_ck_n
+  parameter int unsigned RD_PREAMBLE_SKIP  = 0                           // SDR PHY: read-strobe preamble
+                                                                         // rwds-rise edges to ignore
 ) (
   // ---- clocking / reset ---------------------------------------------------
   input  logic                        clk,       // system + bus word clock
@@ -210,7 +212,8 @@ module hyperram_avalon
     .ADDR_WIDTH   (ADDR_WIDTH),
     .LEN_WIDTH    (LEN_WIDTH),
     .PHY_VARIANT  (PHY_VARIANT),
-    .DIFF_CK      (DIFF_CK)
+    .DIFF_CK      (DIFF_CK),
+    .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP)
   ) u_phy (
     .clk            (clk),
     .clk90          (clk90),
