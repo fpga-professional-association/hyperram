@@ -99,7 +99,20 @@ It opens the JTAG-Avalon master, checks the `"HBWT"` magic, programs `LEN`/`BASE
 ## Build status
 
 The Fitter blocker (24403/24404) is **resolved** by switching the board to the SDR PHY. Full
-compile is **clean**, `output_files/bw.sof` is produced, and timing closes.
+compile is **clean**, `output_files/bw.sof` is produced, timing closes, and the design **runs on
+real silicon**.
+
+### ✅ Measured on hardware (W957D8NB HyperRAM, 50 MHz CK, integrity-verified)
+
+```
+LEN = 16 words   STATUS.done=1  ERR_COUNT=0  RESULT=PASS
+WR_CYCLES = 33  ->  WRITE 48.48 MB/s
+RD_CYCLES = 44  ->  READ  36.36 MB/s
+```
+
+Independently re-confirmed (flash + `bw_read.tcl`). Bandwidth grows with burst length as the fixed
+per-transaction overhead amortizes (LEN=4 → 12.5 MB/s read, LEN=5 → 15.2, LEN=16 → 36.36).
+**Open item:** multi-burst reads (LEN > 16) still hang on silicon — see Hardware handoff.
 
 - **Qsys generation**: clean (IOPLL now 25→**50 MHz @0° + 100 MHz @0°**; JTAG master, reset
   controller, clock bridges all real IP).
@@ -122,22 +135,18 @@ derives the quarter-period CK-centring shift from a **single** 100 MHz clock's n
 
 ## Hardware handoff / notes
 
-- **SDR read capture is the remaining on-hardware risk.** The SDR PHY samples returning DQ/RWDS on
-  the local 100 MHz clock (not the returning strobe), so it tolerates the DQ/RWDS round-trip flight
-  delay only up to a fraction of the byte window. The conservative 50 MHz CK keeps the eye wide; if
-  reads mismatch (`ERR_COUNT>0`) while writes complete, sweep **`CAPTURE_PHASE`** in
-  `hyperbus_phy_sdr.sv` (0 = sample on the clk2x posedge, 1 = half-clk2x earlier). A production
-  high-speed build should instead use the strobe-clocked DDIO variant.
-- **HyperRAM `hb_cs_n`/`hb_ck` pins are unverified** — the board User Guide and the refdes repo
-  disagree (UG: C7/B5; refdes: D8/D7). `pins.tcl` uses the User Guide values (see the note in that
-  file and `docs/board_bringup.md`). Confirm against the schematic before trusting bring-up.
-
-- **HyperRAM `hb_cs_n`/`hb_ck` pins are unverified** — the board User Guide and the refdes repo
-  disagree (UG: C7/B5; refdes: D8/D7). `pins.tcl` uses the User Guide values (see the note in that
-  file and `docs/board_bringup.md`). Confirm against the schematic before trusting bring-up.
-- **Read-eye calibration**: if reads mismatch (`ERR_COUNT>0`) but writes complete, sweep
-  `RX_STROBE_DLY_TAPS` / `RX_PAIR_SKEW` in `hyperbus_phy_altera.sv` (source-synchronous read
-  capture — see that file's header). The conservative 50 MHz clock is meant to make the first pass
-  work without this.
+- **Read capture works for single bursts (resolved).** The W957D8NB drives a read-strobe
+  **preamble** (RWDS toggles with DQ Hi-Z for one CK before real data); the SDR PHY's
+  `RD_PREAMBLE_SKIP=1` (set in `top.sv`) discards it so byte pairing starts on real data. With that +
+  the read FIFOs deepened to 32, single bursts up to 16 words read back with `ERR_COUNT=0`.
+- **Open: multi-burst reads (LEN > 16) hang on silicon.** On-chip capture (`hyperbus_capture.sv`)
+  shows burst 1 delivers all 16 words correctly, then the controller never accepts read burst 2
+  (`av_waitrequest` stuck, CS# never re-asserts); the device over-streams past the requested count.
+  Not reproduced in the ideal-clock sim (a read-path timing/CDC effect). Next: tap
+  `phy_dq_i_valid`/rd_fifo pointers in the capture, and/or try `CAPTURE_PHASE=1` in `hyperbus_phy_sdr.sv`.
+- **HyperRAM `hb_cs_n`/`hb_ck` pins — RESOLVED on silicon: `hb_cs_n=D8`, `hb_ck=D7`** (Arrow refdes
+  `axc3000_pin_assignment.tcl`, confirmed by the board schematic). The User Guide's C7/B5 were wrong
+  (with them the device got no clock/select and nothing completed). `pins.tcl` now uses D8/D7; see
+  `docs/board/axc3000_hyperram_pinout.md`.
 - Everything above the physical program/run steps is reproducible from a clean checkout by the two
   build commands; the program + `system-console` steps require the physical board + USB-Blaster III.

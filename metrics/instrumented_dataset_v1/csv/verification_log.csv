@@ -6,3 +6,4 @@ id,testbench,checks,assertions,method,outcome,coverage_notes
 5,tb_bw,1,3,Verilator 5.020 --binary --timing (self-checking),PASS,"bandwidth harness: integrity clean (ERR_COUNT=0), WR=126/RD=151 clk @LEN=64, cycle counts sane"
 6,(formal),0,0,none,N/A,No formal verification performed
 7,(hardware),0,0,AXC3000 on-board bandwidth,BLOCKED,No bitstream (PNR blocker); on-hardware read/write MB/s not obtained
+8,(hardware AXC3000),1,1,on-board bw_read.tcl over JTAG-Avalon (integrity-checked),PASS,"W957D8NB @50MHz CK, 16-word burst: WRITE 48.48 MB/s, READ 36.36 MB/s, ERR_COUNT=0, integrity PASS, independently re-confirmed. Open: multi-burst (LEN>16) reads hang."

@@ -236,11 +236,38 @@ each datasheet.
 
 ---
 
+## Performance (measured on AXC3000 silicon)
+
+Real, integrity-verified HyperRAM bandwidth on the Arrow **AXC3000** (Agilex 3
+`A3CY100BM16AE7S` + Winbond **W957D8NB** HyperRAM), via the **SDR PHY** at a
+conservative **50 MHz** HyperBus clock (100 MHz fabric byte clock), read back over
+JTAG-Avalon with on-chip cycle counters (`fpga/axc3000/`). Independently re-confirmed.
+
+| Metric | Value | Conditions |
+|---|---|---|
+| **Write bandwidth** | **48.48 MB/s** | 16-word burst · `STATUS.done`, `ERR_COUNT=0`, integrity PASS |
+| **Read bandwidth**  | **36.36 MB/s** | 16-word burst · `STATUS.done`, `ERR_COUNT=0`, integrity PASS |
+| HyperBus CK | **50 MHz** (×8 SDR, 1 byte / 100 MHz fabric cycle; ~100 MB/s/dir theoretical peak) | overhead amortizes with burst length |
+| SDR-PHY system fit (A3CY100) | fmax 169.6 MHz `clk` / 373 MHz byte clock · **1,006 ALM / 1,393 reg / 2 M20K / 0 DSP** | Quartus Pro 26.1, timing met |
+
+Bandwidth scales with burst length as the fixed per-transaction overhead (6-beat CA
++ initial latency) amortizes: LEN=4 → 12.5 MB/s read, LEN=5 → 15.2, LEN=16 → 36.36.
+
+**Scope of the measurement:** single bursts up to 16 words complete with verified
+data integrity. Multi-burst reads (LEN > 16) currently hang on silicon — a read-path
+timing effect *not* reproduced in the ideal-clock sim; captured + documented in
+`fpga/axc3000/README.md` (on-chip logic analyzer `hyperbus_capture.sv`). The
+DDIO/high-speed PHY (toward the device's 250 MHz DDR spec) is future work.
+
 ## Status & scope
 
-- **Simulation-validated.** The controller, both front-ends, and the **generic**
-  PHY are verified against a behavioral HyperRAM model under Verilator 5.020. This
-  covers *protocol* correctness, not electrical/timing behavior.
+- **Simulation-validated.** The controller, both front-ends, and the **generic** and
+  **SDR** PHYs are verified against a behavioral HyperRAM model (incl. the real read
+  preamble) under Verilator 5.020 — protocol correctness, not electrical timing.
+- **Hardware-validated (AXC3000).** The SDR-PHY build is timing-closed, programmed,
+  and **measured on real silicon** (see Performance above): single-burst HyperRAM
+  read/write with verified integrity. This is the first on-silicon bandwidth for
+  this controller.
 - **The generic PHY is simulation-oriented.** It uses plain clocked registers and
   behavioral DDR muxes (and a modeled RWDS strobe delay). It will *infer* on any
   FPGA but is not tuned for a specific device's I/O timing.
@@ -251,7 +278,9 @@ each datasheet.
   timing-closed. Real board bring-up — primitive instantiation, RWDS strobe
   delay/DPA calibration, and static timing closure against a device datasheet — is
   per-target hardware work. See [`docs/PHY_PORTING.md`](docs/PHY_PORTING.md).
-- **No hardware measurements** are claimed anywhere in this repo.
+- **Hardware measurement** is limited to the AXC3000 SDR-PHY single-burst result in
+  **Performance** above; the generic/vendor PHY variants and multi-burst reads are
+  not yet hardware-validated.
 
 ---
 
