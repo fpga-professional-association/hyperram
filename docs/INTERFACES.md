@@ -81,9 +81,16 @@ Additional parameters: `LATENCY_CLOCKS` (default `HB_LATENCY_CLOCKS_DEFAULT`=6),
 
 ## `hyperbus_phy` — DDR SERDES + I/O (ctrl-facing slave ⇄ device pins)
 
-Parameters: common + `PHY_VARIANT` (string: `"GENERIC"` | `"INTEL"` | `"XILINX"`, default
+Parameters: common + `PHY_VARIANT` (string: `"GENERIC"` | `"SDR"` | `"INTEL"` | `"XILINX"`, default
 `"GENERIC"`), `DIFF_CK` (default 1: drive `hb_ck_n`; 0 = single-ended, `hb_ck_n` tied). All variants
 share this exact port list.
+
+**`"SDR"` variant clock note (does not change the port list):** the portable single-clock-phase SDR
+PHY (`hyperbus_phy_sdr.sv`, for FPGAs/fits where two clock phases cannot reach the I/O periphery)
+**repurposes the `clk90` port as a 2× byte-serialisation clock** (same PLL, 0°) rather than a
+90°-shifted `clk`. `clk` stays the CK-rate word clock (drives the controller); `clk90` = 2×`clk`
+drives the SDR output/capture registers and generates `hb_ck = clk90/2`. Port names/directions/widths
+are unchanged, so the frozen contract holds; only this variant's interpretation of `clk90` differs.
 
 | Port | Dir | Width | Notes |
 |---|---|---|---|
@@ -297,3 +304,10 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   `hyperbus_phy_generic` variant additionally exposes a non-frozen behavioural-only parameter
   `RX_STROBE_DELAY` (models the read-strobe eye-centring delay; realised by a primitive in the vendor
   PHY variants) — internal, defaulted, not part of the frozen port list.
+- **v3 (2026-07-08):** new `hyperbus_phy` variant `PHY_VARIANT="SDR"` (`hyperbus_phy_sdr.sv`) — a
+  portable, single-clock-phase, normal-I/O (no DDR/no primitives) PHY that unblocks the AXC3000 fit
+  (Quartus 24403/24404: two IOPLL phases could not reach the Bank-3A I/O). **No frozen port name,
+  direction, or width changes.** The SDR variant reinterprets the existing `clk90` input as a 2×`clk`
+  byte clock (0°, same PLL) instead of a 90° phase — see the "SDR variant clock note" above. It adds
+  a non-frozen, defaulted read-eye tuning parameter `CAPTURE_PHASE`. Controller, front-ends, model,
+  and all other module boundaries are unchanged.

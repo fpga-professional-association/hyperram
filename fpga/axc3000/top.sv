@@ -1,23 +1,30 @@
 // top — AXC3000 board top level for the HyperBus bandwidth test (Agilex-3 A3CY100BM16AE7S).
 //
-// Data path (all on the IOPLL 50 MHz word clock):
+// Data path:
 //   bw_sys (Qsys)                              fpga/axc3000/qsys/
-//     * IOPLL: clk (50 MHz, 0deg) + clk90 (50 MHz, +90deg) from the 25 MHz board XO
-//     * reset controller -> synchronous active-high fabric reset
+//     * IOPLL: clk (50 MHz, 0deg = HyperBus CK word clock) + clk2x (100 MHz, 0deg = SDR byte clock),
+//       both from the 25 MHz board XO. (The Qsys export is still named "clk90"; for the SDR PHY it
+//       now carries the 100 MHz 2x byte clock — NOT a 90deg phase. See make_bw_sys.tcl.)
+//     * reset controller -> synchronous active-high fabric reset (clk / 50 MHz domain)
 //     * JTAG-to-Avalon-MM master bridge  --- exported Avalon-MM master (byte addressed)
 //         |
 //         v  (byte->word CSR adapter below)
 //   hyperram_bw_top  (rtl/bench/)  = hyperram_bw_test (traffic gen + scoreboard, CSR slave)
-//                                    -> hyperram_avalon (Avalon-MM slave -> ctrl -> Agilex PHY)
+//                                    -> hyperram_avalon (Avalon-MM slave -> ctrl -> SDR PHY)
 //         |  split HyperBus device pins (hb_*_o / hb_*_oe / hb_*_i)
 //         v
-//   hyperbus_pads_altera (fpga/axc3000/)  = tennm_ph2 I/O buffers -> real inout board pads
+//   hyperbus_pads_altera (fpga/axc3000/)  = inferred tri-state I/O -> real inout board pads
 //
 // The measured WR_CYCLES/RD_CYCLES cover only the on-chip Avalon datapath; JTAG is control plane
 // only (PLAN §8 method E compliant). Read back with sysconsole/bw_read.tcl.
 //
-// CONSERVATIVE CLOCK PLAN: 50 MHz HyperBus word clock => DDR hb_ck ~50 MHz, ~100 MB/s/direction
-// theoretical on the x8 bus. Deliberately low so the un-calibrated Agilex read eye is wide.
+// CLOCK PLAN (SDR PHY — unblocks the Fitter err 24403/24404 by using ONE clock in the I/O periphery
+// instead of two IOPLL phases): the frozen controller is WORD-per-clk, so the fabric byte engine must
+// run at 2x the CK rate (see rtl/phy/hyperbus_phy_sdr.sv). clk = 50 MHz drives the controller/fabric;
+// clk2x = 100 MHz (single PLL, 0deg) is the ONLY clock at the Bank-3A SDR I/O registers + hb_ck
+// generator. hb_ck = clk2x/2 = 50 MHz => 1 byte per clk2x cycle = ~100 MB/s/direction on the x8 bus
+// (same peak as the DDR plan; the 90deg CK-centring phase is now derived from clk2x's negedge, from
+// ONE clock). Deliberately low so the un-calibrated read eye is wide.
 //
 // Board signal names below match quartus/constraints/axc3000_board.tcl (sourced via pins.tcl).
 
@@ -44,10 +51,10 @@ module top (
   // =========================================================================
   // Qsys backbone: clocks, reset, JTAG-Avalon master
   // =========================================================================
-  wire        clk;          // 50 MHz word clock
-  wire        clk90;        // 50 MHz, +90 deg
+  wire        clk;          // 50 MHz HyperBus CK word clock (controller + fabric)
+  wire        clk2x;        // 100 MHz SDR byte clock (single PLL, 0 deg) — feeds PHY clk90 port
   wire        pll_locked;
-  wire        sys_rst;      // synchronous, active-high fabric reset
+  wire        sys_rst;      // synchronous, active-high fabric reset (clk domain)
 
   // Exported (byte-addressed) Avalon-MM master from the JTAG bridge
   wire [31:0] m_address;
@@ -63,7 +70,7 @@ module top (
     .clk_25_clk           (CLK_25M_C),
     .reset_reset          (~USER_BTN),      // button pressed (low) => assert active-high reset
     .clk_clk              (clk),
-    .clk90_clk            (clk90),
+    .clk90_clk            (clk2x),          // Qsys export "clk90" now = 100 MHz 2x byte clock (0 deg)
     .locked_export        (pll_locked),
     .sys_reset_reset      (sys_rst),
     .master_address       (m_address),
@@ -146,12 +153,12 @@ module top (
   wire        init_done;
 
   hyperram_bw_top #(
-    .PHY_VARIANT ("ALTERA"),   // Agilex-3 tennm_ph2 DDR-IO PHY
+    .PHY_VARIANT ("SDR"),      // portable single-clock-phase SDR PHY (unblocks Fitter 24403/24404)
     .DIFF_CK     (1'b0)        // single-ended CK on AXC3000 (no hb_ck_n pin)
   ) u_bw (
-    .clk             (clk),
-    .clk90           (clk90),
-    .clk_ref         (clk),     // calibration ref unused for functional correctness in the PHY
+    .clk             (clk),     // 50 MHz CK word clock (controller)
+    .clk90           (clk2x),   // 100 MHz 2x byte clock (SDR PHY repurposes clk90 as the byte clock)
+    .clk_ref         (clk),     // unused by the SDR PHY (tie-off)
     .rst             (sys_rst),
     // CSR slave (word addressed) — driven by the JTAG-Avalon master through the adapter above
     .csr_address     (csr_address),

@@ -2,8 +2,12 @@
 #
 # The on-chip control/clock backbone for the AXC3000 HyperBus bandwidth test:
 #   * 25 MHz board clock in  (CLK_25M_C)
-#   * Agilex-3 IOPLL: outclk0 = clk (~50 MHz, 0 deg), outclk1 = clk90 (~50 MHz, +90 deg)
-#   * reset bridge + reset controller (synchronous, active-high fabric reset)
+#   * Agilex-3 IOPLL: outclk0 = clk (~50 MHz, 0 deg = HyperBus CK word clock),
+#                     outclk1 = clk2x (~100 MHz, 0 deg = SDR byte clock).
+#     (The export interface is still named "clk90"; for the SDR PHY it carries the 100 MHz 2x byte
+#      clock, NOT a 90 deg phase — that phase is what the OLD DDIO PHY could not route into Bank 3A,
+#      Fitter err 24403/24404. The SDR PHY needs only ONE clock in the I/O periphery.)
+#   * reset bridge + reset controller (synchronous, active-high fabric reset, 50 MHz domain)
 #   * Altera JTAG-to-Avalon-MM master bridge — its Avalon-MM master is EXPORTED to top.sv,
 #     where it drives the hyperram_bw_test CSR slave (LEN/BASE/CTRL/STATUS/…).
 #
@@ -12,9 +16,10 @@
 #   qsys-generate qsys/bw_sys.qsys --synthesis=VERILOG --family="Agilex 3" \
 #       --part=A3CY100BM16AE7S --output-directory=qsys/bw_sys
 #
-# CONSERVATIVE clock plan: 50 MHz HyperBus word clock (20 ns), quarter-period write centring on
-# clk90 => hb_ck ~= 50 MHz DDR = ~100 MB/s theoretical per direction on the x8 bus. Chosen low on
-# purpose so the un-calibrated Agilex PHY read eye is wide and bring-up does not need a tap sweep.
+# CLOCK PLAN (SDR): the frozen controller is WORD-per-clk, so the fabric byte engine runs at 2x CK.
+# clk = 50 MHz drives the controller/fabric/Qsys backbone; clk2x = 100 MHz (0 deg) is the ONLY clock
+# at the Bank-3A SDR I/O registers + hb_ck generator. hb_ck = clk2x/2 = 50 MHz => ~100 MB/s per
+# direction on the x8 bus. Chosen low on purpose so the un-calibrated read eye is wide.
 
 package require -exact qsys 26.1
 
@@ -31,7 +36,10 @@ set_instance_parameter_value clk_in EXPLICIT_CLOCK_RATE {25000000.0}
 set_instance_parameter_value clk_in NUM_CLOCK_OUTPUTS   {1}
 
 # ===========================================================================
-# IOPLL: 25 MHz ref -> outclk0 = 50 MHz @0deg (clk), outclk1 = 50 MHz @90deg (clk90)
+# IOPLL: 25 MHz ref -> outclk0 = 50 MHz @0deg (clk, CK word clock),
+#                      outclk1 = 100 MHz @0deg (clk2x, SDR byte clock — exported as "clk90")
+# Both outputs are 0 deg: there is NO second PLL phase into the I/O periphery (the SDR PHY derives
+# the CK-centring quarter-period shift from clk2x's own negedge). This is the 24403/24404 fix.
 # ===========================================================================
 add_instance iopll altera_iopll
 set_instance_parameter_value iopll gui_reference_clock_frequency {25.0}
@@ -40,8 +48,8 @@ set_instance_parameter_value iopll gui_use_locked                {1}
 set_instance_parameter_value iopll gui_number_of_clocks          {2}
 set_instance_parameter_value iopll gui_output_clock_frequency0   {50.0}
 set_instance_parameter_value iopll gui_phase_shift_deg0          {0.0}
-set_instance_parameter_value iopll gui_output_clock_frequency1   {50.0}
-set_instance_parameter_value iopll gui_phase_shift_deg1          {90.0}
+set_instance_parameter_value iopll gui_output_clock_frequency1   {100.0}
+set_instance_parameter_value iopll gui_phase_shift_deg1          {0.0}
 
 # Clock bridges: an IOPLL output clock that is BOTH exported AND fanned to internal sinks loses its
 # internal connections on save (the export wins). So the internal fabric (rst_ctrl, jtag_master)
@@ -51,7 +59,7 @@ add_instance clkbr0 altera_clock_bridge
 set_instance_parameter_value clkbr0 EXPLICIT_CLOCK_RATE {50000000.0}
 set_instance_parameter_value clkbr0 NUM_CLOCK_OUTPUTS   {1}
 add_instance clkbr1 altera_clock_bridge
-set_instance_parameter_value clkbr1 EXPLICIT_CLOCK_RATE {50000000.0}
+set_instance_parameter_value clkbr1 EXPLICIT_CLOCK_RATE {100000000.0}
 set_instance_parameter_value clkbr1 NUM_CLOCK_OUTPUTS   {1}
 
 # ===========================================================================

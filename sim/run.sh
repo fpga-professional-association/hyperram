@@ -18,6 +18,7 @@ COMMON_SRCS=(
   "$RTL/if/hyperbus_avalon.sv"
   "$RTL/if/hyperbus_axi.sv"
   "$RTL/phy/hyperbus_phy_generic.sv"
+  "$RTL/phy/hyperbus_phy_sdr.sv"
   "$RTL/phy/hyperbus_phy_altera.sv"
   "$RTL/phy/hyperbus_phy_xilinx.sv"
   "$RTL/phy/hyperbus_phy.sv"
@@ -69,6 +70,7 @@ run_one() {
 }
 
 run_one tb_avalon.sv  tb_avalon
+run_one tb_sdr.sv     tb_sdr
 run_one tb_axi.sv     tb_axi
 run_one tb_fixed2x.sv tb_fixed2x
 run_one tb_timeout.sv tb_timeout
