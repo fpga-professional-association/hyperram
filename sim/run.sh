@@ -26,6 +26,12 @@ COMMON_SRCS=(
   "$SIM/model/hyperram_model.sv"
 )
 
+# Bandwidth-test harness RTL — only needed by tb_bw (bench engine + sim/board top).
+BENCH_SRCS=(
+  "$RTL/bench/hyperram_bw_test.sv"
+  "$RTL/bench/hyperram_bw_top.sv"
+)
+
 # -Wall as required; a handful of benign lint classes are waived (vendor-PHY skeleton tie-offs,
 # testbench-only unused status/ID signals, timescale-on-some-modules, empty status pin taps).
 VFLAGS=(--binary --timing -Wall
@@ -37,6 +43,8 @@ overall=0
 
 run_one() {
   local tb="$1" top="$2"
+  shift 2
+  local extra_srcs=("$@")       # optional extra RTL sources (e.g. bench harness for tb_bw)
   echo "=================================================================="
   echo "== Building $top"
   echo "=================================================================="
@@ -44,7 +52,7 @@ run_one() {
   rm -rf "$odir"
   mkdir -p "$odir"
   if ! verilator "${VFLAGS[@]}" --top-module "$top" --Mdir "$odir" -o "$top" \
-        "${COMMON_SRCS[@]}" "$SIM/$tb" > "$odir/build.log" 2>&1; then
+        "${COMMON_SRCS[@]}" "${extra_srcs[@]}" "$SIM/$tb" > "$odir/build.log" 2>&1; then
     echo "-- build FAILED; log follows --"
     cat "$odir/build.log"
     echo "TB_RESULT: FAIL ($top build error)"
@@ -64,6 +72,7 @@ run_one tb_avalon.sv  tb_avalon
 run_one tb_axi.sv     tb_axi
 run_one tb_fixed2x.sv tb_fixed2x
 run_one tb_timeout.sv tb_timeout
+run_one tb_bw.sv      tb_bw      "${BENCH_SRCS[@]}"
 
 echo "=================================================================="
 if [ "$overall" -eq 0 ]; then
