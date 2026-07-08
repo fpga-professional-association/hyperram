@@ -37,6 +37,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/bench/hyperram_bw_top.s
 
 # ---- board files ----
 set_global_assignment -name SYSTEMVERILOG_FILE hyperbus_pads_altera.sv
+set_global_assignment -name SYSTEMVERILOG_FILE hyperbus_capture.sv
 set_global_assignment -name SYSTEMVERILOG_FILE top.sv
 
 # ---- timing + pins ----

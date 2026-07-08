@@ -9,8 +9,10 @@
 //     * JTAG-to-Avalon-MM master bridge  --- exported Avalon-MM master (byte addressed)
 //         |
 //         v  (byte->word CSR adapter below)
-//   hyperram_bw_top  (rtl/bench/)  = hyperram_bw_test (traffic gen + scoreboard, CSR slave)
-//                                    -> hyperram_avalon (Avalon-MM slave -> ctrl -> SDR PHY)
+//   hyperram_bw_test (traffic gen + scoreboard, CSR slave @ base 0x000)
+//     -> hyperram_avalon (Avalon-MM slave -> ctrl -> SDR PHY)
+//   (the two are wired here directly — the pure-structural rtl/bench/hyperram_bw_top.sv inlined —
+//    so the av_* Avalon handshake is visible to the hyperbus_capture DEBUG module, CSR @ base 0x100)
 //         |  split HyperBus device pins (hb_*_o / hb_*_oe / hb_*_i)
 //         v
 //   hyperbus_pads_altera (fpga/axc3000/)  = inferred tri-state I/O -> real inout board pads
@@ -84,21 +86,37 @@ module top (
   );
 
   // =========================================================================
-  // Byte-address (JTAG master)  ->  word-address CSR slave adapter
-  //   The bw_test CSR slave is word-addressed (csr_address = byte_offset>>2), reads combinational,
-  //   0 wait states. The JTAG-Avalon master is byte-addressed and pipelined (expects readdatavalid).
-  //   8 registers (0x00..0x1C) => 3 word-address bits = m_address[4:2].
+  // Byte-address (JTAG master)  ->  word-address CSR slave adapter + 2-slave address decode
+  //   Two CSR slaves hang off the single JTAG-Avalon master, decoded on byte-address bit [8]:
+  //     m_address[8] == 0  ->  hyperram_bw_test CSR   (base 0x000, regs 0x00..0x1C)
+  //     m_address[8] == 1  ->  hyperbus_capture CSR   (base 0x100, regs 0x100..0x10C)
+  //   Both slaves are word-addressed (csr_address = byte_offset>>2), read combinationally, and tie
+  //   waitrequest low. The JTAG-Avalon master is byte-addressed, pipelined (expects readdatavalid),
+  //   and single-outstanding, so a combinational readdata/waitrequest mux on the decode bit is safe.
   // =========================================================================
   localparam int CSR_AW = 3;
 
+  wire              sel_cap        = m_address[8];    // 0x100 window = capture CSR
+
+  // hyperram_bw_test CSR: 8 registers (0x00..0x1C) => 3 word-address bits = m_address[4:2]
   wire [CSR_AW-1:0] csr_address    = m_address[CSR_AW+1:2];
-  wire              csr_read       = m_read;
-  wire              csr_write      = m_write;
+  wire              csr_read       = m_read  & ~sel_cap;
+  wire              csr_write      = m_write & ~sel_cap;
   wire [31:0]       csr_writedata  = m_writedata;
   wire [31:0]       csr_readdata;
   wire              csr_waitrequest;
 
-  assign m_waitrequest = csr_waitrequest;   // tied low inside the slave (0 wait states)
+  // hyperbus_capture CSR: 4 registers (0x100..0x10C) => 2 word-address bits = m_address[3:2]
+  wire [1:0]        cap_address    = m_address[3:2];
+  wire              cap_read       = m_read  & sel_cap;
+  wire              cap_write      = m_write & sel_cap;
+  wire [31:0]       cap_readdata;
+  wire              cap_waitrequest;
+
+  wire [31:0] mux_readdata    = sel_cap ? cap_readdata    : csr_readdata;
+  wire        mux_waitrequest = sel_cap ? cap_waitrequest : csr_waitrequest;
+
+  assign m_waitrequest = mux_waitrequest;   // tied low inside both slaves (0 wait states)
 
   // Pipeline the combinational CSR read to the Avalon read-latency-1 contract the JTAG master expects:
   // capture readdata on the accept cycle, present it with readdatavalid the next cycle.
@@ -109,8 +127,8 @@ module top (
       rd_hold <= 32'd0;
       rdv_q   <= 1'b0;
     end else begin
-      rd_hold <= csr_readdata;                       // csr_readdata is combinational off csr_address
-      rdv_q   <= csr_read & ~csr_waitrequest;        // accepted this cycle (waitrequest is 0)
+      rd_hold <= mux_readdata;                       // both slaves read combinationally off the address
+      rdv_q   <= m_read & ~mux_waitrequest;          // accepted this cycle (waitrequest is 0)
     end
   end
   assign m_readdata      = rd_hold;
@@ -152,13 +170,28 @@ module top (
   wire        hb_rwds_i_int;
   wire        init_done;
 
-  hyperram_bw_top #(
-    .PHY_VARIANT ("SDR"),      // portable single-clock-phase SDR PHY (unblocks Fitter 24403/24404)
-    .DIFF_CK     (1'b0)        // single-ended CK on AXC3000 (no hb_ck_n pin)
+  // ---- bench master <-> HyperBus IP slave Avalon-MM link, hoisted to the top --------------------
+  // DEBUG TAP: this inlines the pure-structural rtl/bench/hyperram_bw_top.sv (identical parameters
+  // and wiring — the core modules are NOT modified) so the hyperbus_capture debug module below can
+  // observe the av_* handshake alongside the HyperBus pins.
+  wire [31:0] av_address;
+  wire [15:0] av_burstcount;
+  wire        av_read;
+  wire        av_write;
+  wire [15:0] av_writedata;
+  wire [15:0] av_readdata;
+  wire        av_readdatavalid;
+  wire        av_waitrequest;
+
+  hyperram_bw_test #(
+    .DATA_WIDTH     (16),
+    .ADDR_WIDTH     (32),
+    .LEN_WIDTH      (16),
+    .BURST_WORDS    (16),              // hyperram_bw_top default (HB_BURST_WORDS_DEFAULT)
+    .CSR_ADDR_WIDTH (CSR_AW),
+    .VERSION_MAGIC  (32'h4842_5754)    // "HBWT"
   ) u_bw (
     .clk             (clk),     // 50 MHz CK word clock (controller)
-    .clk90           (clk2x),   // 100 MHz 2x byte clock (SDR PHY repurposes clk90 as the byte clock)
-    .clk_ref         (clk),     // unused by the SDR PHY (tie-off)
     .rst             (sys_rst),
     // CSR slave (word addressed) — driven by the JTAG-Avalon master through the adapter above
     .csr_address     (csr_address),
@@ -167,18 +200,91 @@ module top (
     .csr_write       (csr_write),
     .csr_writedata   (csr_writedata),
     .csr_waitrequest (csr_waitrequest),
+    // Avalon-MM master -> hyperram_avalon slave (tapped by hyperbus_capture)
+    .m_address       (av_address),
+    .m_burstcount    (av_burstcount),
+    .m_read          (av_read),
+    .m_write         (av_write),
+    .m_writedata     (av_writedata),
+    .m_readdata      (av_readdata),
+    .m_readdatavalid (av_readdatavalid),
+    .m_waitrequest   (av_waitrequest)
+  );
+
+  hyperram_avalon #(
+    .DQ_WIDTH         (8),
+    .DATA_WIDTH       (16),
+    .ADDR_WIDTH       (32),
+    .LEN_WIDTH        (16),
+    .LATENCY_CLOCKS   (6),             // hyperram_bw_top defaults (mirror sim/tb_avalon.sv)
+    .FIXED_LATENCY    (1'b1),
+    .MAX_BURST_WORDS  (0),
+    .PROGRAM_CR       (1'b1),
+    .POR_DELAY_CYCLES (0),
+    .INIT_CR0         (16'h8F1F),      // latency code 6, fixed
+    .PHY_VARIANT      ("SDR"),         // portable single-clock-phase SDR PHY (unblocks 24403/24404)
+    .DIFF_CK          (1'b0)           // single-ended CK on AXC3000 (no hb_ck_n pin)
+  ) u_hyperram (
+    .clk               (clk),
+    .clk90             (clk2x),  // 100 MHz 2x byte clock (SDR PHY repurposes clk90 as the byte clock)
+    .clk_ref           (clk),    // unused by the SDR PHY (tie-off)
+    .rst               (sys_rst),
+    // Avalon-MM slave (driven by the bench master above); full-word writes only
+    .avs_address       (av_address),
+    .avs_read          (av_read),
+    .avs_write         (av_write),
+    .avs_writedata     (av_writedata),
+    .avs_byteenable    (2'b11),
+    .avs_burstcount    (av_burstcount),
+    .avs_readdata      (av_readdata),
+    .avs_readdatavalid (av_readdatavalid),
+    .avs_waitrequest   (av_waitrequest),
     // split HyperBus device pins
-    .hb_ck           (hb_ck_int),
-    .hb_ck_n         (hb_ck_n_int),
-    .hb_cs_n         (hb_cs_n_int),
-    .hb_rst_n        (hb_rst_n_int),
-    .hb_dq_o         (hb_dq_o_int),
-    .hb_dq_oe        (hb_dq_oe_int),
-    .hb_dq_i         (hb_dq_i_int),
-    .hb_rwds_o       (hb_rwds_o_int),
-    .hb_rwds_oe      (hb_rwds_oe_int),
-    .hb_rwds_i       (hb_rwds_i_int),
-    .init_done       (init_done)
+    .hb_ck             (hb_ck_int),
+    .hb_ck_n           (hb_ck_n_int),
+    .hb_cs_n           (hb_cs_n_int),
+    .hb_rst_n          (hb_rst_n_int),
+    .hb_dq_o           (hb_dq_o_int),
+    .hb_dq_oe          (hb_dq_oe_int),
+    .hb_dq_i           (hb_dq_i_int),
+    .hb_rwds_o         (hb_rwds_o_int),
+    .hb_rwds_oe        (hb_rwds_oe_int),
+    .hb_rwds_i         (hb_rwds_i_int),
+    // status
+    .init_done         (init_done)
+  );
+
+  // =========================================================================
+  // On-chip logic analyzer (DEBUG): records the HyperBus pin-side signals + the av_* handshake at
+  // 100 MHz from the first hb_cs_n low after arming. CSR at base 0x100 (decode above). See
+  // hyperbus_capture.sv for the sample bit map and sysconsole/cap_dump.tcl for the host dump flow.
+  // =========================================================================
+  hyperbus_capture #(
+    .DEPTH (1024)
+  ) u_cap (
+    .clk              (clk),
+    .rst              (sys_rst),
+    .cap_clk          (clk2x),
+    // probes
+    .hb_cs_n          (hb_cs_n_int),
+    .hb_ck            (hb_ck_int),
+    .hb_dq_oe         (hb_dq_oe_int),
+    .hb_dq_o          (hb_dq_o_int),
+    .hb_dq_i          (hb_dq_i_int),
+    .hb_rwds_oe       (hb_rwds_oe_int),
+    .hb_rwds_o        (hb_rwds_o_int),
+    .hb_rwds_i        (hb_rwds_i_int),
+    .av_read          (av_read),
+    .av_write         (av_write),
+    .av_waitrequest   (av_waitrequest),
+    .av_readdatavalid (av_readdatavalid),
+    // CSR slave (base 0x100)
+    .csr_address      (cap_address),
+    .csr_read         (cap_read),
+    .csr_readdata     (cap_readdata),
+    .csr_write        (cap_write),
+    .csr_writedata    (m_writedata),
+    .csr_waitrequest  (cap_waitrequest)
   );
 
   // =========================================================================
