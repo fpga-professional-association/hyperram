@@ -1,3 +1,4 @@
 id,design,stage,tool,tool_version,seed,result,alm,alut,reg,dsp,m20k,fmax_mhz,wns_ns,notes
 1,hyperram_bw on AXC3000 (top),SYNTH,Quartus Prime Pro,26.1.0 b110,1,PASS (0 err),2600,1461,1122,0,1,,,"Analysis&Synthesis estimate; ~2600 ALM, 1461 ALUT, 1122 reg, 1 M20K (JTAG-Avalon FIFO), 0 DSP"
 2,hyperram_bw on AXC3000 (top),PNR,Quartus Prime Pro,26.1.0 b110,1,FAIL,,,,,,,,Fitter Err 24403/24404: IOPLL clk+clk90 cannot both route to I/O DDIO region. No .sof; no Fmax/WNS. Blocker is physical floorplan (see defects.constraint-timing).
+3,"hyperram_bw AXC3000 (SDR PHY, D7/D8 pins)",PNR,Quartus Prime Pro,26.1.0 b110,1,PASS,1006,,1393,0,2,169.6,8.73,"SDR single-clock PHY: Fitter 0 err (no 24403/24404), STA closes (+8.73ns @50MHz clk), bw.sof produced + flashed. fmax outclk0=169.6MHz. This is the fit that the SDR rework unblocked."

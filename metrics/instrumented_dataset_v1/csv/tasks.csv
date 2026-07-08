@@ -27,3 +27,4 @@ id,date,project,stage,origin,agent_tool,wallclock_min,iterations,notes
 26,2026-07-08,infra-hyperram,RTL,agent,claude,48,19,hw:board-integration
 27,2026-07-08,infra-hyperram,RTL,agent,claude,8,3,hw:agilex-phy
 28,2026-07-08,infra-hyperram,PNR,agent,claude,9,5,hw:fit-attempt
+29,2026-07-08,infra-hyperram,LAB,agent,claude,75,4,"on-board bring-up: SDR PHY re-fit (unblocked PNR), flash bw.sof over JTAG, JTAG-Avalon bandwidth readback (System Console), diagnose no-response, fix CK/CS pins, re-fit, re-test"

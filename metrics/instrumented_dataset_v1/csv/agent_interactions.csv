@@ -27,3 +27,4 @@ id,task_id,invocations,context_tokens,prompt_tokens,prompt_complexity,accepted_w
 26,26,267,280043,1115,3,0,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/4575e435-34e5-4a49-84f3-e5d26a110cce/workflows/scripts/hyperram-axc3000-bw-hw-wf_66c8719c-410.js#board-integration
 27,27,34,92522,877,3,1,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/4575e435-34e5-4a49-84f3-e5d26a110cce/workflows/scripts/hyperram-axc3000-bw-hw-wf_66c8719c-410.js#agilex-phy
 28,28,67,80157,773,2,0,/home/tcovert/.claude/projects/-home-tcovert-projects-agilex-3-ai-benchmarks/4575e435-34e5-4a49-84f3-e5d26a110cce/workflows/scripts/hyperram-axc3000-bw-hw-wf_66c8719c-410.js#fit-attempt
+29,29,40,120000,2000,4,0,main-loop on-board bring-up (flash/system-console/diag) + SDR-PHY sub-agent a26fa7e4
