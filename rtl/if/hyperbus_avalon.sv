@@ -60,7 +60,10 @@ module hyperbus_avalon
     input  logic                     rd_valid,
     output logic                     rd_ready,
     input  logic [DATA_WIDTH-1:0]    rd_data,
-    input  logic                     rd_last
+    input  logic                     rd_last,
+
+    // -- DEBUG tap (bring-up only; leave unconnected in normal instantiations) --
+    output logic [1:0]               dbg_state       // front-end FSM state (IDLE/WR_DATA/RD_WAIT)
 );
 
     // MSB of the Avalon address selects register space (DESIGN.md §3).
@@ -74,9 +77,23 @@ module hyperbus_avalon
     typedef enum logic [1:0] {IDLE, WR_DATA, RD_WAIT} state_e;
     state_e state;
 
+    assign dbg_state = 2'(state);
+
     // Remaining write words to transfer in the current burst (loaded when the
     // write command is accepted; wr_last asserts on the final word).
     logic [LEN_WIDTH-1:0] wr_words_left;
+
+    // Remaining read words to return in the current burst. avs_burstcount is the AUTHORITATIVE beat
+    // count (Avalon: exactly burstcount readdatavalid beats per read burst), so the burst completes
+    // once exactly that many beats have been returned. The controller's rd_last hint is deliberately
+    // NOT used to terminate the burst: on the AXC3000, under the device's back-to-back over-streamed
+    // read delivery, rd_last proved UNRELIABLE at this boundary (on-chip capture: for one 16-word burst
+    // it never asserted — front-end hung waiting for a burst-end that never came; for the next it
+    // asserted EARLY at ~beat 5 — front-end finished early and the bench then hung waiting for the
+    // missing beats). Counting the requested beats is deterministic and makes multi-burst reads robust.
+    logic [LEN_WIDTH-1:0] rd_words_left;
+    wire                  rd_beat = rd_valid & (state == RD_WAIT);   // a returned read beat this cycle
+    wire                  rd_burst_end = rd_beat & (rd_words_left == LEN_WIDTH'(1));
 
     // ------------------------------------------------------------------------
     // Combinational outputs
@@ -149,13 +166,15 @@ module hyperbus_avalon
         if (rst) begin
             state         <= IDLE;
             wr_words_left <= '0;
+            rd_words_left <= '0;
         end else begin
             unique case (state)
                 IDLE: begin
                     // A command transfers when cmd_valid & cmd_ready; cmd_valid
                     // is asserted combinationally for the pending request.
                     if (avs_read && cmd_ready) begin
-                        state <= RD_WAIT;
+                        state         <= RD_WAIT;
+                        rd_words_left <= avs_burstcount;     // >=1 (authoritative read-beat count)
                     end else if (avs_write && cmd_ready) begin
                         state         <= WR_DATA;
                         wr_words_left <= avs_burstcount;     // >=1
@@ -172,9 +191,10 @@ module hyperbus_avalon
                 end
 
                 RD_WAIT: begin
-                    if (rd_valid && rd_ready && rd_last) begin
-                        state <= IDLE;
-                    end
+                    // Complete on the controller's rd_last OR once avs_burstcount beats have been
+                    // returned (whichever first) — robust to a missing/mistimed rd_last (see above).
+                    if (rd_beat)      rd_words_left <= rd_words_left - LEN_WIDTH'(1);
+                    if (rd_burst_end) state <= IDLE;
                 end
 
                 default: state <= IDLE;

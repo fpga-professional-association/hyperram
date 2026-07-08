@@ -90,7 +90,12 @@ module hyperbus_ctrl
     // -- PHY interface (master) : RX --
     input  logic [2*DQ_WIDTH-1:0]   phy_dq_i,       // recovered read word (byte A in high half)
     input  logic                    phy_dq_i_valid,
-    input  logic                    phy_rwds_i       // synchronized RWDS level
+    input  logic                    phy_rwds_i,      // synchronized RWDS level
+
+    // -- DEBUG taps (bring-up only; leave unconnected in normal instantiations) --
+    output logic [3:0]              dbg_state,      // FSM state (state_e ordinal)
+    output logic [5:0]              dbg_rd_wptr,    // (repurposed) rem_left[5:0]  — words remaining in burst
+    output logic [5:0]              dbg_rd_rptr     // (repurposed) seg_left[5:0]  — words remaining in segment
 );
 
   // ------------------------------------------------------------------------
@@ -101,6 +106,20 @@ module hyperbus_ctrl
   localparam int unsigned RECOVERY_CYCLES  = 4;                    // tCSHI + tRWR gap (SPEC §6)
   localparam int unsigned TAIL_CYCLES      = 2;                    // extra CS# Low after last word (tCSH note)
   localparam int unsigned READ_STALL_LIMIT = 32;                   // RWDS Low >= 32 clk => timeout (SPEC §4/§7)
+  // Read over-stream drain/settle (AXC3000 multi-burst fix). After a read burst the real HyperRAM
+  // keeps driving a few EXTRA source-synchronous words: its read output pipeline drains past the
+  // master's CK-stop (which has flight/pipeline latency), so stray words keep arriving AFTER the master
+  // has counted its burst. If the NEXT read arms its receiver while those stragglers are still arriving,
+  // they are captured as phantom leading words and corrupt / hang the next burst (see tb_multiburst).
+  // ST_RD_DRAIN therefore follows every read burst: CK is stopped (no new device words) but the PHY
+  // receiver is kept ARMED so the over-stream words are drained out (phy_dq_i_valid) and DISCARDED,
+  // until the PHY has been quiet for DRAIN_QUIET_CYCLES consecutive cycles (over-stream ended). Only
+  // then does the transaction recover and re-arm/accept the next read, so no straggler leaks across the
+  // burst boundary. Word-rate (phy_dq_i_valid, one pulse per straggler — no RWDS-level aliasing);
+  // adaptive (robust to a VARIABLE extra-word count, not a hardcoded 7); bounded by DRAIN_MAX_CYCLES so
+  // a stuck receiver can never hang the drain.
+  localparam int unsigned DRAIN_QUIET_CYCLES = 4;                  // consecutive quiet cycles => drained
+  localparam int unsigned DRAIN_MAX_CYCLES   = 128;               // safety bound on the drain wait (cycles)
   localparam int unsigned RD_FIFO_DEPTH    = 32;                   // read holding buffer (rd_ready slack).
                                                                     // Must exceed the largest single read
                                                                     // segment (Avalon burstcount) + the SDR
@@ -122,6 +141,7 @@ module hyperbus_ctrl
     ST_LAT,     // initial latency
     ST_READ,    // read-data phase (RWDS-gated word count)
     ST_RD_ABORT,// read aborted (RWDS timeout): drain remaining beats as flagged filler
+    ST_RD_DRAIN,// post-read: CK stopped, receiver kept armed to absorb+discard over-stream stragglers
     ST_WRITE,   // write-data phase
     ST_TAIL,    // CS# held Low after last word (tCSH note)
     ST_RECOVER  // CS# High, tCSHI/tRWR recovery
@@ -130,6 +150,10 @@ module hyperbus_ctrl
   state_e                  state;
   logic [31:0]             cnt;          // general dwell counter (reset/POR/latency/tail/recovery)
   logic [5:0]              stall_cnt;    // read RWDS-Low stall counter
+
+  // Read over-stream drain/settle (see DRAIN_* localparams above).
+  logic [7:0]              drain_cnt;    // consecutive cycles with no straggler word (quiet detector)
+  logic [7:0]              drain_dwell;  // total cycles spent in ST_RD_DRAIN (safety bound)
 
   // transaction context
   logic                    cur_read;
@@ -169,6 +193,11 @@ module hyperbus_ctrl
   // which likewise samples RWDS-during-CA regardless of the fixed/variable parameter). FIXED_LATENCY
   // now only seeds the CR0[3] image at init (INIT_CR0 default).
   wire                     lat_double = rwds_hi | phy_rwds_i;
+
+  // Read over-stream considered drained once the PHY has stopped delivering straggler words for
+  // DRAIN_QUIET_CYCLES consecutive cycles (the over-stream has ended), or the safety bound is hit.
+  wire                     drain_done = (drain_cnt   >= 8'(DRAIN_QUIET_CYCLES)) |
+                                        (drain_dwell >= 8'(DRAIN_MAX_CYCLES));
 
   wire                     rd_fifo_empty = (rd_wptr == rd_rptr);
   wire                     rd_fifo_full  = (rd_wptr[RD_AW-1:0] == rd_rptr[RD_AW-1:0]) &
@@ -273,6 +302,17 @@ module hyperbus_ctrl
       ST_RECOVER:  busy = ~doing_init;
       ST_RD_ABORT: busy = ~doing_init;   // CS# High (idle bus); draining flagged filler to the FIFO
 
+      ST_RD_DRAIN: begin
+        // Post-read over-stream drain: CS# held Low (still selected, tail window), CK STOPPED so the
+        // device produces no new words, but the PHY receiver stays ARMED so any straggler/over-stream
+        // words the device already launched are recovered (phy_dq_i_valid) and DISCARDED here — not
+        // written to rd_fifo, not counted. Held until the PHY goes quiet, so nothing leaks to the next
+        // read burst.
+        phy_cs_n   = 1'b0;
+        phy_rd_arm = 1'b1;
+        busy       = ~doing_init;
+      end
+
       default: ; // ST_POR, ST_INIT: idle bus
     endcase
 
@@ -291,6 +331,8 @@ module hyperbus_ctrl
       state        <= ST_RESET;
       cnt          <= 32'(RESET_CYCLES - 1);
       stall_cnt    <= '0;
+      drain_cnt    <= '0;
+      drain_dwell  <= '0;
       init_done    <= 1'b0;
       doing_init   <= 1'b0;
       cur_read     <= 1'b0;
@@ -429,8 +471,11 @@ module hyperbus_ctrl
             if (seg_left == LEN_WIDTH'(1)) begin
               if (rem_left != LEN_WIDTH'(1))       // chopped: advance to next linear segment
                 cur_addr <= cur_addr + ADDR_WIDTH'(seg_count);
-              cnt   <= 32'(TAIL_CYCLES - 1);
-              state <= ST_TAIL;
+              // Enter the over-stream drain (CK stops, receiver stays armed) before the CS# tail, so
+              // the device's post-CK-stop stragglers are absorbed and cannot leak into the next read.
+              drain_cnt   <= '0;
+              drain_dwell <= '0;
+              state       <= ST_RD_DRAIN;
             end
           end else if (!phy_rwds_i) begin
             if (stall_cnt == 6'(READ_STALL_LIMIT - 1)) begin
@@ -443,6 +488,23 @@ module hyperbus_ctrl
             end else begin
               stall_cnt <= stall_cnt + 1'b1;
             end
+          end
+        end
+
+        // ---------------- read over-stream drain (post burst) ----------------
+        // CK is stopped (see combinational drive) so the device sources no new words, but the receiver
+        // is held armed: any straggler/over-stream words the device already launched are recovered as
+        // phy_dq_i_valid and DISCARDED here (never written to rd_fifo, never counted). Stay until the
+        // PHY has been quiet for DRAIN_QUIET_CYCLES cycles (over-stream ended), bounded by
+        // DRAIN_MAX_CYCLES. This absorbs a VARIABLE number of extra words so none leak into the next
+        // read burst (the AXC3000 multi-burst hang). Then take the normal CS# tail + recovery.
+        ST_RD_DRAIN: begin
+          drain_dwell <= drain_dwell + 8'd1;
+          if (phy_dq_i_valid) drain_cnt <= '0;             // a straggler arrived: not quiet yet
+          else                drain_cnt <= drain_cnt + 8'd1;
+          if (drain_done) begin
+            cnt   <= 32'(TAIL_CYCLES - 1);
+            state <= ST_TAIL;
           end
         end
 
@@ -518,6 +580,11 @@ module hyperbus_ctrl
   logic _unused_wr_last;
   /* verilator lint_on UNUSEDSIGNAL */
   always_comb _unused_wr_last = wr_last;
+
+  // DEBUG taps.
+  assign dbg_state   = 4'(state);
+  assign dbg_rd_wptr = 6'(rem_left);   // repurposed: rem_left (words remaining in whole burst)
+  assign dbg_rd_rptr = 6'(seg_left);   // repurposed: seg_left (words remaining in current segment)
 
 endmodule
 `endif

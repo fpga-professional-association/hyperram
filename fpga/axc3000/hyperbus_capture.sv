@@ -57,6 +57,7 @@ module hyperbus_capture #(
     input  logic        av_write,
     input  logic        av_waitrequest,
     input  logic        av_readdatavalid,
+    input  logic [31:0] dbg_bus,        // DEBUG: ctrl/front-end/FIFO taps (hyperram_avalon dbg_bus)
 
     // ---- CSR slave (clk domain) ----
     input  logic [1:0]  csr_address,
@@ -67,7 +68,7 @@ module hyperbus_capture #(
     output logic        csr_waitrequest
 );
 
-  localparam int unsigned CAP_WIDTH = 26;            // significant sample bits (see header map)
+  localparam int unsigned CAP_WIDTH = 58;            // 26 pin/av bits + 32 debug-bus bits (see map)
   localparam int unsigned AW        = $clog2(DEPTH); // sample index width
 
   assign csr_waitrequest = 1'b0;                     // single-cycle slave, zero wait states
@@ -139,7 +140,8 @@ module hyperbus_capture #(
   // synchronises the raw hb_dq_i / hb_rwds_i pad inputs (same sampling the PHY itself performs).
   logic [CAP_WIDTH-1:0] samp_q;
   always_ff @(posedge cap_clk) begin
-    samp_q <= {av_readdatavalid, av_waitrequest, av_write, av_read,   // [25:22]
+    samp_q <= {dbg_bus,                                               // [57:26]
+               av_readdatavalid, av_waitrequest, av_write, av_read,   // [25:22]
                hb_rwds_i, hb_rwds_o, hb_rwds_oe,                      // [21:19]
                hb_dq_i,                                               // [18:11]
                hb_dq_o,                                               // [10:3]

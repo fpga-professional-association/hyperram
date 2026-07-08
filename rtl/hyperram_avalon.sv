@@ -64,7 +64,13 @@ module hyperram_avalon
   input  logic                        hb_rwds_i,
 
   // ---- status -------------------------------------------------------------
-  output logic                        init_done
+  output logic                        init_done,
+
+  // ---- DEBUG tap (bring-up only; leave unconnected in normal instantiations) --
+  //   [3:0]=ctrl state  [5:4]=front-end state  [6]=cmd_valid  [7]=cmd_ready
+  //   [8]=phy_dq_i_valid  [9]=rd_valid  [10]=rd_ready  [11]=rd_last
+  //   [17:12]=ctrl rd_fifo wptr  [23:18]=ctrl rd_fifo rptr  [31:24]=0
+  output logic [31:0]                 dbg_bus
 );
 
   // Derived widths (INTERFACES.md common-parameters note).
@@ -92,6 +98,16 @@ module hyperram_avalon
   logic                    rd_ready;
   logic [DATA_WIDTH-1:0]   rd_data;
   logic                    rd_last;
+
+  // ---- DEBUG taps from ctrl / front-end ----
+  logic [3:0]              ctrl_dbg_state;
+  logic [5:0]              ctrl_dbg_rd_wptr;
+  logic [5:0]              ctrl_dbg_rd_rptr;
+  logic [1:0]              fe_dbg_state;
+  // dbg_bus: [3:0]=ctrl_state [5:4]=fe_state [6]=cmd_valid [7]=cmd_ready [8]=phy_dq_i_valid
+  //   [9]=rd_valid [10]=rd_ready [11]=rd_last [17:12]=rem_left [23:18]=seg_left [29:24]=cmd_len [31:30]=0
+  assign dbg_bus = {2'd0, cmd_len[5:0], ctrl_dbg_rd_rptr, ctrl_dbg_rd_wptr, rd_last, rd_ready, rd_valid,
+                    phy_dq_i_valid, cmd_ready, cmd_valid, fe_dbg_state, ctrl_dbg_state};
 
   // ---- ctrl <-> phy DDR-parallel interface --------------------------------
   logic                    phy_cs_n;
@@ -143,7 +159,8 @@ module hyperram_avalon
     .rd_valid          (rd_valid),
     .rd_ready          (rd_ready),
     .rd_data           (rd_data),
-    .rd_last           (rd_last)
+    .rd_last           (rd_last),
+    .dbg_state         (fe_dbg_state)
   );
 
   // -------------------------------------------------------------------------
@@ -200,7 +217,11 @@ module hyperram_avalon
     // PHY RX
     .phy_dq_i       (phy_dq_i),
     .phy_dq_i_valid (phy_dq_i_valid),
-    .phy_rwds_i     (phy_rwds_i)
+    .phy_rwds_i     (phy_rwds_i),
+    // debug taps
+    .dbg_state      (ctrl_dbg_state),
+    .dbg_rd_wptr    (ctrl_dbg_rd_wptr),
+    .dbg_rd_rptr    (ctrl_dbg_rd_rptr)
   );
 
   // -------------------------------------------------------------------------

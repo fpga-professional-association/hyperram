@@ -341,11 +341,18 @@ module hyperbus_phy_sdr
     end
   end
 
-  // Gray-code the write pointer and 2-flop synchronise it into the clk domain.
+  // Gray-code the write pointer and 2-flop synchronise it into the clk domain. While the receiver is
+  // disarmed (phy_rd_arm Low, i.e. between/around read bursts) the write side resets wptr_bin to 0 in
+  // the clk90 domain; that is a MULTI-BIT gray transition (e.g. gray(20)->gray(0)), which a plain
+  // 2-flop synchroniser can mis-sample mid-flight and momentarily present a bogus wptr in the clk
+  // domain — on hardware that stray non-empty read leaks an over-streamed word into the next burst.
+  // So force the synchronised copy directly to 0 while disarmed (the source is 0 anyway): the flush is
+  // then deterministic (rxf_empty is cleanly asserted) with no reliance on the gray-pointer reset
+  // surviving the CDC. Normal +1 gray sync resumes from 0 when the next read arms.
   wire  [RXF_AW:0] wptr_gray = wptr_bin ^ (wptr_bin >> 1);
   logic [RXF_AW:0] wgray_s1, wgray_s2;
   always_ff @(posedge clk) begin
-    if (rst) begin
+    if (rst || !phy_rd_arm) begin
       wgray_s1 <= '0;
       wgray_s2 <= '0;
     end else begin

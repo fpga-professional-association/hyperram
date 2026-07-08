@@ -63,6 +63,17 @@ module hyperram_model
                                                                       //   W957D8NB read turnaround captured on the
                                                                       //   AXC3000 board (cap idx85-88). 0 = none
                                                                       //   (spec-ideal; keeps existing TBs aligned).
+    parameter int unsigned RD_OVERSTREAM_WORDS = 0,                   // READ over-stream (CK-stop pipeline latency):
+                                                                      //   after the master STOPS CK ending a read burst
+                                                                      //   the real W957D8NB keeps pushing this many EXTRA
+                                                                      //   source-synchronous words (RWDS + DQ) before its
+                                                                      //   read output pipeline drains — the master's CK-stop
+                                                                      //   has flight/pipeline latency, so the device over-runs
+                                                                      //   the master's word count (AXC3000: ~23 words seen for
+                                                                      //   a 16-word request). The ideal edge-driven data phase
+                                                                      //   below stops the instant CK stops and never exercised
+                                                                      //   this; the SELF-TIMED tail below reproduces it.
+                                                                      //   0 = ideal device (keeps all existing TBs aligned).
     parameter logic [15:0] ID0_RESET      = HB_ID0_RESET,             // read-only device ID (mfr nibble)
     parameter logic [15:0] ID1_RESET      = HB_ID1_RESET,             // read-only device ID (type nibble)
     parameter logic [15:0] CR0_RESET      = HB_CR0_RESET,             // config register 0 reset image
@@ -122,6 +133,13 @@ module hyperram_model
   logic [DATA_WIDTH-1:0]   out_word;        // read word currently being driven onto DQ
   logic [DQ_WIDTH-1:0]     wr_hi;           // captured byte A during a register write
   logic                    stall_done;      // read-stall (STALL_CLOCKS) already injected this txn
+
+  // ---- read over-stream tail (self-timed; models the CK-stop pipeline latency) ----
+  realtime                 os_half;         // measured read-data CK half-period (tail cadence)
+  realtime                 os_last_edge;    // $realtime of the most recent read-data CK edge (0 = none)
+  logic                    os_run;          // 1 while the device drives the over-stream tail
+  logic                    os_rwds_o;       // tail RWDS drive
+  logic [DQ_WIDTH-1:0]     os_dq_o;         // tail DQ byte drive
 
   // ------------------------------------------------------------------------
   // Combinational helpers.
@@ -319,6 +337,56 @@ module hyperram_model
   end
 
   // ------------------------------------------------------------------------
+  // Read over-stream tail (self-timed) — models the on-silicon CK-stop pipeline latency.
+  //
+  // Physical effect (AXC3000 W957D8NB): after the master stops CK to end a read burst the device
+  // keeps driving a few more source-synchronous words before its read output pipeline empties, so
+  // the master's CK-stop over-runs its word count. The edge-driven data phase above stops the instant
+  // hb_ck stops (ideal device) and never reproduced this. Here a self-timed generator, armed once the
+  // master stops clocking mid-read, drives RD_OVERSTREAM_WORDS extra {RWDS-rise, RWDS-fall} word
+  // strobes at the measured CK cadence — exactly the stray words the master's read FIFOs must discard.
+  //
+  // os_last_edge tracks the most recent read-data CK edge (cleared to 0 when CS# is High / between
+  // read bursts and after a tail is emitted, so the tail arms exactly once per read burst).
+  // ------------------------------------------------------------------------
+  always @(hb_ck or hb_cs_n) begin
+    if (hb_cs_n) begin
+      os_last_edge = 0.0;                                  // idle: disarm the tail watchdog
+    end else if (cur_rw && (beat >= first_data_beat)) begin
+      if (os_last_edge != 0.0) os_half = $realtime - os_last_edge;  // half-period between CK edges
+      os_last_edge = $realtime;
+    end
+  end
+
+  initial begin
+    os_run = 1'b0; os_rwds_o = 1'b0; os_dq_o = '0;
+    os_half = 10ns; os_last_edge = 0.0;
+  end
+
+  // Watchdog: when the gap since the last read-data CK edge exceeds ~1.8 half-periods the master has
+  // stopped clocking mid-read; drive the over-stream tail, then release and re-arm on the next burst.
+  always begin
+    #1;
+    if ((RD_OVERSTREAM_WORDS != 0) && !os_run && hb_rst_n && !hb_cs_n &&
+        cur_rw && (beat >= first_data_beat) && (os_last_edge != 0.0) &&
+        (($realtime - os_last_edge) > (os_half * 1.8))) begin
+      logic [AW-1:0]         os_addr;
+      logic [DATA_WIDTH-1:0] os_word;
+      os_run  = 1'b1;
+      os_addr = addr;                                       // continue from where the data phase left off
+      for (int k = 0; (k < int'(RD_OVERSTREAM_WORDS)) && hb_rst_n; k++) begin
+        os_word = mem[os_addr];
+        os_addr = os_addr + 1'b1;
+        os_rwds_o = 1'b1; os_dq_o = os_word[DATA_WIDTH-1:DQ_WIDTH]; #(os_half);  // byte A (RWDS rise)
+        os_rwds_o = 1'b0; os_dq_o = os_word[DQ_WIDTH-1:0];          #(os_half);  // byte B (RWDS fall)
+      end
+      os_rwds_o    = 1'b0;
+      os_last_edge = 0.0;                                   // consumed: re-arm on the next read burst
+      os_run       = 1'b0;
+    end
+  end
+
+  // ------------------------------------------------------------------------
   // Combinational bus drive. Ownership per interface state, SPEC_DIGEST §4 Table 7.1:
   //   CA period          : model drives RWDS = latency indicator (High => additional count).
   //   Read init latency  : model drives RWDS Low; DQ High-Z (bus turn-around).
@@ -365,6 +433,15 @@ module hyperram_model
         end
       end
       // WRITE (cur_rw==0), beat>=6: model releases DQ and RWDS — the master drives them.
+    end
+    // Over-stream tail overrides the bus: the device keeps driving RWDS+DQ after CK stops (the
+    // read output pipeline drains past the master's CK-stop). Wins over the CK-gated read drive
+    // above (hb_ck is idle here) and over the idle release when CS# has already gone High.
+    if (os_run) begin
+      hb_dq_o    = os_dq_o;
+      hb_dq_oe   = 1'b1;
+      hb_rwds_o  = os_rwds_o;
+      hb_rwds_oe = 1'b1;
     end
   end
 

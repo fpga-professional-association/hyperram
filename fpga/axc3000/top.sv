@@ -182,6 +182,7 @@ module top (
   wire [15:0] av_readdata;
   wire        av_readdatavalid;
   wire        av_waitrequest;
+  wire [31:0] av_dbg;         // DEBUG: ctrl/front-end/FIFO taps (see hyperram_avalon dbg_bus map)
 
   hyperram_bw_test #(
     .DATA_WIDTH     (16),
@@ -257,7 +258,9 @@ module top (
     .hb_rwds_oe        (hb_rwds_oe_int),
     .hb_rwds_i         (hb_rwds_i_int),
     // status
-    .init_done         (init_done)
+    .init_done         (init_done),
+    // debug taps -> capture
+    .dbg_bus           (av_dbg)
   );
 
   // =========================================================================
@@ -284,6 +287,7 @@ module top (
     .av_write         (av_write),
     .av_waitrequest   (av_waitrequest),
     .av_readdatavalid (av_readdatavalid),
+    .dbg_bus          (av_dbg),
     // CSR slave (base 0x100)
     .csr_address      (cap_address),
     .csr_read         (cap_read),
