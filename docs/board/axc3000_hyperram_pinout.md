@@ -1,5 +1,12 @@
 # AXC3000 HyperRAM pinout — from the board schematic (authoritative)
 
+> **CORRECTION (2026-07-08, resolved on real silicon):** the CS/CK dispute below is settled —
+> the correct balls are **`hb_cs_n = D8`, `hb_ck = D7`** (Arrow refdes `axc3000_pin_assignment.tcl`),
+> **NOT** the User Guide's C7/B5 (which the table below still lists). With C7/B5 the on-board test
+> confirmed the HyperRAM received no clock/select and no transaction completed. `pins.tcl` now uses
+> D8/D7. Note: this fixed the pinout but did **not** by itself make the HyperRAM respond — a second
+> HyperBus timing/init issue remains (see repo status).
+
 Source: Arrow/Trenz **AXC3000 schematic** `SCH-TEI0131-01-P001.PDF` (Rev A, 2025-05-28),
 page 7 (FPGA `A3CY100BM16AE7S`, sheet "FPGA2") + page 13 (HyperRAM `W957D8NBRA4I`, U5).
 Download: <https://github.com/ArrowElectronics/Agilex-3/blob/main/images/AXC3000/SCH-TEI0131-01-P001.PDF>

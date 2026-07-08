@@ -5,9 +5,11 @@
 # (Arrow "AXC3000 Evaluation Board: User Guide" v1.2.1, cross-checked vs refdes-agilex3), for ONLY
 # the ports top.sv actually uses. Sourced from bw.qsf after FAMILY/DEVICE are set.
 #
-# NOTE (unresolved, carried from the source file): the User Guide and the refdes repo DISAGREE on
-# hb_cs_n / hb_ck pins (UG: C7/B5 ; refdes: D8/D7). The User Guide values are used here, same as the
-# source. Re-check against the AXC3000 schematic before trusting on silicon (docs handoff).
+# RESOLVED 2026-07-08 on real silicon: hb_cs_n / hb_ck use the Arrow refdes values D8/D7 (NOT the
+# User Guide's C7/B5). With C7/B5 the HyperRAM never received a clock/select and no transaction
+# completed on the board (writes drove into the void, reads hung: STATUS busy+error, never done).
+# Source of truth: ArrowElectronics/refdes-agilex3 axc3000_pin_assignment.tcl (HR_CSn=D8, HR_CLK=D7);
+# both are legal Bank-3A DQ12-group balls per SCH-TEI0131-01-P001.PDF page 7.
 #
 # AXC3000 HyperRAM is SINGLE-ENDED: there is no hb_ck_n board pin, so top.sv does not expose one.
 
@@ -61,7 +63,7 @@ set_location_assignment PIN_F7 -to hb_rst_n
 set_instance_assignment -name IO_STANDARD "1.2 V" -to hb_rst_n
 
 # CSn / CLK — User Guide values (see discrepancy note above)
-set_location_assignment PIN_C7 -to hb_cs_n
+set_location_assignment PIN_D8 -to hb_cs_n
 set_instance_assignment -name IO_STANDARD "1.2 V" -to hb_cs_n
-set_location_assignment PIN_B5 -to hb_ck
+set_location_assignment PIN_D7 -to hb_ck
 set_instance_assignment -name IO_STANDARD "1.2 V" -to hb_ck
