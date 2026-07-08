@@ -1,0 +1,27 @@
+name: CI
+
+# Build and run the self-checking Verilator testbenches for the HyperBus IP.
+# sim/run.sh uses `verilator --binary --timing`, which requires Verilator >= 5.0.
+# ubuntu-24.04 ships Verilator 5.020 in apt, matching the version used in development.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verilator-sim:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Verilator + toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator build-essential
+          verilator --version
+
+      - name: Run testbenches
+        run: bash sim/run.sh

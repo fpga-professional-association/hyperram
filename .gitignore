@@ -1,0 +1,19 @@
+# Verilator / simulation build artifacts
+obj_dir/
+sim/build/
+*.o
+*.a
+*.d
+
+# Waveforms & sim logs
+*.vcd
+*.fst
+*.fst.hier
+*.wlf
+build.log
+*.log
+
+# Editor / OS junk
+*~
+*.swp
+.DS_Store

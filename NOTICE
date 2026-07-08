@@ -1,0 +1,47 @@
+HyperBus / HyperRAM Controller IP
+Copyright 2026 FPGA Professional Association
+
+Licensed under the Apache License, Version 2.0 (the "License"). See the LICENSE
+file in this repository for the full terms.
+
+-------------------------------------------------------------------------------
+Origin and clean-room statement
+-------------------------------------------------------------------------------
+
+This is an ORIGINAL, CLEAN-ROOM implementation of the publicly published
+Infineon/Cypress HyperBus Specification, document 001-99253 Rev *H (Feb 6, 2019).
+The RTL, testbenches, and documentation in this repository were written from that
+specification. An implementation-oriented digest of the spec used during
+development is included as docs/SPEC_DIGEST.md.
+
+"HyperBus", "HyperRAM", and "HyperFlash" are trademarks of Infineon Technologies
+(formerly Cypress Semiconductor). This project is an independent, unaffiliated
+implementation of the openly published bus specification and is not endorsed by or
+associated with Infineon Technologies. These names are used only to describe the
+interface this IP implements.
+
+-------------------------------------------------------------------------------
+Design references (consulted, NOT copied)
+-------------------------------------------------------------------------------
+
+During development the following open-source HyperRAM controllers were read as
+references for the CORRECTNESS OF APPROACH only. No source code from either project
+was copied, translated, or adapted into this repository; all HDL here is original.
+
+  * MJoergen/HyperRAM
+      Language: VHDL
+      License:  MIT
+      Use here: design reference only (init/latency handling, general structure).
+
+  * OpenHBMC
+      Language: Verilog
+      License:  Apache License 2.0
+      Use here: design reference only (latency-code / burst-chop conventions).
+
+Device register addresses and reset values (ID0/ID1/CR0/CR1) used by the package
+and the behavioral model correspond to the Winbond W957D8NB / HyperRAM device
+family and were cross-checked against a device bus-functional model; the generic
+HyperBus specification defers these values to each device datasheet. They are
+flagged "[device, not generic spec]" throughout docs/SPEC_DIGEST.md.
+
+No warranty is provided. See the LICENSE file, Sections 7 and 8.
