@@ -44,7 +44,18 @@ module hyperbus_ctrl
     // CR0 image programmed at init: [15]=1 normal, [14:12]=000 drive, [11:8]=1111 reserved-as-1,
     // [7:4]=latency code, [3]=fixed-latency, [2]=1 legacy wrap, [1:0]=11 (32B). (SPEC_DIGEST §8.1)
     parameter logic [15:0] INIT_CR0         = {1'b1, 3'b000, 4'b1111, INIT_LATENCY_CODE,
-                                               FIXED_LATENCY, 3'b111}
+                                               FIXED_LATENCY, 3'b111},
+    // -- Device-specific multi-burst work-arounds (Winbond W957D8NB, AXC3000). Both DEFAULT OFF so
+    //    existing instantiations are bit-identical; the board top / bench enable them explicitly. --
+    // A linear segment is chopped so it NEVER crosses a BURST_BOUNDARY_WORDS-aligned WORD boundary
+    // (0 = disabled). The W957D8NB releases the bus ~1.5 CK into a burst that crosses a 0x2000-word
+    // boundary, so everything past it reads as floating junk; chopping at the boundary avoids it
+    // (DESIGN.md §5.6 / issue: 0x2000-word boundary chop).
+    parameter int unsigned BURST_BOUNDARY_WORDS = 0,
+    // After every SPLIT memory-write segment, self-issue an internal COMMIT-READ that spans the last
+    // written word (the device only commits a write burst's final word when the next command is a
+    // read that covers it; a following write drops it). 1 = interpose the commit-read (issue #1).
+    parameter bit          WR_COMMIT_READ       = 1'b0
 ) (
     input  logic                    clk,
     input  logic                    rst,            // synchronous, active high
@@ -130,6 +141,11 @@ module hyperbus_ctrl
                                                                     // words (bursts >=6 hung). 32 covers the
                                                                     // board's 16-word bursts with slack.
   localparam int unsigned RD_AW            = $clog2(RD_FIFO_DEPTH);
+  // Internal commit-read length (WR_COMMIT_READ). Must be >= 2 words (a 1-word dummy read does NOT
+  // trigger the device write-commit; issue #1 approach #3) and small enough to never itself cross a
+  // BURST_BOUNDARY_WORDS boundary (it reads backwards from the just-written last word, which lies in
+  // an un-crossed segment). 4 matches the on-silicon "working read phase" trigger.
+  localparam int unsigned COMMIT_READ_WORDS = 4;
 
   typedef enum logic [3:0] {
     ST_RESET,   // device reset asserted
@@ -169,6 +185,19 @@ module hyperbus_ctrl
   logic                    lat_extra_done; // the additional (2x) latency count has been inserted
   logic                    doing_init;   // current transaction is the internal CR0 write
 
+  // -- Write-commit interpose (WR_COMMIT_READ). A memory-write burst's final word is only committed
+  //    by the device when a subsequent read covers it; between two writes the master interposes an
+  //    internal COMMIT-READ that spans that word. `doing_commit` mirrors `doing_init` for this
+  //    internal read (its data is discarded); `wr_pending_commit` marks that a write segment closed
+  //    and still needs committing; `commit_resume` distinguishes an intra-command split (restore the
+  //    shadow write context afterwards) from a deferred write->write interpose (return to idle). --
+  logic                    doing_commit;
+  logic                    wr_pending_commit;
+  logic                    commit_resume;
+  logic [ADDR_WIDTH-1:0]   last_wr_addr; // last WORD address written in the most recent write segment
+  logic [ADDR_WIDTH-1:0]   sv_addr;      // shadow: write-segment start to resume after a chop commit-read
+  logic [LEN_WIDTH-1:0]    sv_rem;       // shadow: words remaining to resume after a chop commit-read
+
   // read holding FIFO ({last, data})
   logic [DATA_WIDTH:0]     rd_fifo [RD_FIFO_DEPTH];
   logic [RD_AW:0]          rd_wptr, rd_rptr;
@@ -177,6 +206,13 @@ module hyperbus_ctrl
   // Combinational helpers
   // ------------------------------------------------------------------------
   wire                     zlw = ~cur_read & cur_reg;             // zero-latency (register) write
+
+  // Deferred write->write commit interpose (WR_COMMIT_READ): when a NEW memory-write command is
+  // presented while a previous write still needs committing, DON'T accept it — gate cmd_ready and
+  // self-issue the internal commit-read first (launched in ST_IDLE below). A read/register command
+  // is accepted normally (a covering read commits the pending write on silicon).
+  wire                     commit_gate = WR_COMMIT_READ & wr_pending_commit &
+                                         cmd_valid & ~cmd_read & ~cmd_reg;
 
   // write-data source: internal CR0 image during init, else the native write channel
   wire [DATA_WIDTH-1:0]    wsrc_data  = doing_init ? INIT_CR0 : wr_data;
@@ -214,13 +250,34 @@ module hyperbus_ctrl
     endcase
   endfunction
 
-  // segment size for a (remaining) burst: chop linear bursts to MAX_BURST_WORDS (tCSM), never wrapped
-  function automatic logic [LEN_WIDTH-1:0] seg_size(input logic [LEN_WIDTH-1:0] total,
-                                                    input logic                 wrapped);
-    if ((MAX_BURST_WORDS != 0) && !wrapped && (total > LEN_WIDTH'(MAX_BURST_WORDS)))
-      return LEN_WIDTH'(MAX_BURST_WORDS);
+  // segment size for a (remaining) burst starting at `addr`. Linear bursts are chopped so a single
+  // CS# segment never (a) exceeds MAX_BURST_WORDS (tCSM), nor (b) crosses a BURST_BOUNDARY_WORDS-word
+  // aligned boundary (the W957D8NB bus-release quirk). Wrapped bursts stay in their group -> never
+  // chopped. `addr` is the WORD start of the segment (only used for the boundary limit).
+  function automatic logic [LEN_WIDTH-1:0] seg_size(input logic [LEN_WIDTH-1:0]  total,
+                                                    input logic                  wrapped,
+                                                    input logic [ADDR_WIDTH-1:0] addr);
+    logic [LEN_WIDTH-1:0] lim;
+    logic [LEN_WIDTH-1:0] to_bound;
+    lim = total;
+    if ((MAX_BURST_WORDS != 0) && !wrapped && (lim > LEN_WIDTH'(MAX_BURST_WORDS)))
+      lim = LEN_WIDTH'(MAX_BURST_WORDS);
+    if ((BURST_BOUNDARY_WORDS != 0) && !wrapped) begin
+      // words from `addr` to the next boundary = BOUND - (addr mod BOUND); chop `lim` down to it.
+      to_bound = LEN_WIDTH'(BURST_BOUNDARY_WORDS - (32'(addr) % BURST_BOUNDARY_WORDS));
+      if (lim > to_bound) lim = to_bound;
+    end
+    return lim;
+  endfunction
+
+  // Base WORD address for the internal commit-read so that a COMMIT_READ_WORDS-word linear read
+  // [base .. base+COMMIT_READ_WORDS-1] SPANS (ends on) the just-written word `la` (issue #1: the read
+  // must cover the pending address). Clamped at 0 for very low addresses.
+  function automatic logic [ADDR_WIDTH-1:0] commit_base(input logic [ADDR_WIDTH-1:0] la);
+    if (la >= ADDR_WIDTH'(COMMIT_READ_WORDS - 1))
+      return la - ADDR_WIDTH'(COMMIT_READ_WORDS - 1);
     else
-      return total;
+      return '0;
   endfunction
 
   // ------------------------------------------------------------------------
@@ -249,7 +306,7 @@ module hyperbus_ctrl
     unique case (state)
       ST_RESET: phy_rst_n = 1'b0;
 
-      ST_IDLE:  cmd_ready = init_done & rd_fifo_empty;
+      ST_IDLE:  cmd_ready = init_done & rd_fifo_empty & ~commit_gate;
 
       ST_CS: begin
         phy_cs_n  = 1'b0;
@@ -319,6 +376,24 @@ module hyperbus_ctrl
     if (state == ST_TAIL) phy_cs_n = 1'b0;   // hold CS# Low through the tail
   end
 
+  // Launch an internal COMMIT-READ (WR_COMMIT_READ): a linear memory read of COMMIT_READ_WORDS words
+  // based at `base`, marked doing_commit so its recovered data is discarded (never enters rd_fifo).
+  // Drives the transaction context exactly like a user read accepted in ST_IDLE, then enters ST_CS.
+  task automatic launch_commit_read(input logic [ADDR_WIDTH-1:0] base);
+    doing_commit <= 1'b1;
+    cur_read     <= 1'b1;
+    cur_reg      <= 1'b0;
+    cur_wrap     <= 1'b0;
+    cur_addr     <= base;
+    rem_left     <= LEN_WIDTH'(COMMIT_READ_WORDS);
+    seg_count    <= LEN_WIDTH'(COMMIT_READ_WORDS);
+    seg_left     <= LEN_WIDTH'(COMMIT_READ_WORDS);
+    ca_reg       <= hb_pack_ca(1'b1, 1'b0, 1'b1, base);   // read, memory, linear
+    rwds_hi      <= 1'b0;
+    ca_idx       <= 2'd0;
+    state        <= ST_CS;
+  endtask
+
   // ------------------------------------------------------------------------
   // Sequential FSM + datapath state
   // ------------------------------------------------------------------------
@@ -335,6 +410,12 @@ module hyperbus_ctrl
       drain_dwell  <= '0;
       init_done    <= 1'b0;
       doing_init   <= 1'b0;
+      doing_commit <= 1'b0;
+      wr_pending_commit <= 1'b0;
+      commit_resume     <= 1'b0;
+      last_wr_addr <= '0;
+      sv_addr      <= '0;
+      sv_rem       <= '0;
       cur_read     <= 1'b0;
       cur_reg      <= 1'b0;
       cur_wrap     <= 1'b0;
@@ -399,18 +480,29 @@ module hyperbus_ctrl
           // drained (its rd_last was delivered), so clearing the pointers only discards those extras.
           rd_wptr <= '0;
           rd_rptr <= '0;
-          if (cmd_valid & init_done & rd_fifo_empty) begin
-            cur_read  <= cmd_read;
-            cur_reg   <= cmd_reg;
-            cur_wrap  <= cmd_wrap;
-            cur_addr  <= cmd_addr;
-            rem_left  <= cmd_len;
-            seg_count <= seg_size(cmd_len, cmd_wrap);
-            seg_left  <= seg_size(cmd_len, cmd_wrap);
-            ca_reg    <= hb_pack_ca(cmd_read, cmd_reg, ~cmd_wrap, cmd_addr);
-            rwds_hi   <= 1'b0;
-            ca_idx    <= 2'd0;
-            state     <= ST_CS;
+          if (init_done & rd_fifo_empty) begin
+            if (commit_gate) begin
+              // DEFERRED write->write interpose: a new memory write is pending but the previous
+              // write still needs committing. Self-issue the commit-read (spanning last_wr_addr);
+              // the pending write command is NOT accepted (cmd_ready gated) and is taken after the
+              // commit-read completes and returns to ST_IDLE.
+              launch_commit_read(commit_base(last_wr_addr));
+              commit_resume <= 1'b0;               // deferred: return to ST_IDLE afterwards
+            end else if (cmd_valid) begin
+              cur_read  <= cmd_read;
+              cur_reg   <= cmd_reg;
+              cur_wrap  <= cmd_wrap;
+              cur_addr  <= cmd_addr;
+              rem_left  <= cmd_len;
+              seg_count <= seg_size(cmd_len, cmd_wrap, cmd_addr);
+              seg_left  <= seg_size(cmd_len, cmd_wrap, cmd_addr);
+              ca_reg    <= hb_pack_ca(cmd_read, cmd_reg, ~cmd_wrap, cmd_addr);
+              rwds_hi   <= 1'b0;
+              ca_idx    <= 2'd0;
+              wr_pending_commit <= 1'b0;           // a normally-accepted command clears the pending
+                                                   //   flag (a covering read commits the prior write)
+              state     <= ST_CS;
+            end
           end
         end
 
@@ -461,7 +553,9 @@ module hyperbus_ctrl
         // ---------------- read data ----------------
         ST_READ: begin
           if (phy_dq_i_valid) begin
-            if (!rd_fifo_full) begin
+            // Commit-read data is DISCARDED (doing_commit): count the word for burst completion but
+            // never push it to rd_fifo, so it is invisible to the front-end.
+            if (!rd_fifo_full & ~doing_commit) begin
               rd_fifo[rd_wa] <= {(rem_left == LEN_WIDTH'(1)), phy_dq_i[DATA_WIDTH-1:0]};
               rd_wptr        <= rd_wptr + 1'b1;
             end
@@ -483,7 +577,9 @@ module hyperbus_ctrl
               // a bus-idle state) and, so the AXI/Avalon front-end's R channel still terminates with
               // exactly cmd_len beats + a final rd_last (AXI A3.4.1 / Avalon burst completion), drain
               // the remaining rem_left words as flagged filler rather than silently dropping rd_last.
-              err_timeout <= 1'b1;
+              // A commit-read is internal (data discarded); a stall there must NOT surface as a
+              // user-visible error, but it still drains through ST_RD_ABORT to recover cleanly.
+              err_timeout <= ~doing_commit;
               state       <= ST_RD_ABORT;
             end else begin
               stall_cnt <= stall_cnt + 1'b1;
@@ -513,9 +609,12 @@ module hyperbus_ctrl
           if (rem_left == LEN_WIDTH'(0)) begin
             cnt   <= 32'(RECOVERY_CYCLES - 1);
             state <= ST_RECOVER;
-          end else if (!rd_fifo_full) begin
-            rd_fifo[rd_wa] <= {(rem_left == LEN_WIDTH'(1)), {DATA_WIDTH{1'b0}}};
-            rd_wptr        <= rd_wptr + 1'b1;
+          end else if (doing_commit | !rd_fifo_full) begin
+            // Commit-read abort: discard (no fifo write, no back-pressure); else drain flagged filler.
+            if (~doing_commit) begin
+              rd_fifo[rd_wa] <= {(rem_left == LEN_WIDTH'(1)), {DATA_WIDTH{1'b0}}};
+              rd_wptr        <= rd_wptr + 1'b1;
+            end
             rem_left       <= rem_left - 1'b1;
             seg_left       <= (seg_left == LEN_WIDTH'(0)) ? seg_left : seg_left - 1'b1;
             if (rem_left == LEN_WIDTH'(1)) begin
@@ -531,6 +630,9 @@ module hyperbus_ctrl
           seg_left <= seg_left - 1'b1;
           rem_left <= rem_left - 1'b1;
           if (seg_left == LEN_WIDTH'(1)) begin
+            // Last word of this write segment: record its (pre-advance) WORD address so a subsequent
+            // commit-read (WR_COMMIT_READ) can span it.
+            last_wr_addr <= cur_addr + ADDR_WIDTH'(seg_count) - ADDR_WIDTH'(1);
             if (rem_left != LEN_WIDTH'(1))          // chopped: advance to next linear segment
               cur_addr <= cur_addr + ADDR_WIDTH'(seg_count);
             cnt   <= 32'(TAIL_CYCLES - 1);
@@ -551,14 +653,49 @@ module hyperbus_ctrl
         ST_RECOVER: begin
           if (cnt == 32'd0) begin
             if (rem_left != LEN_WIDTH'(0)) begin
-              // open the next (chopped) linear segment at the advanced address
-              seg_count <= seg_size(rem_left, cur_wrap);
-              seg_left  <= seg_size(rem_left, cur_wrap);
-              ca_reg    <= hb_pack_ca(cur_read, cur_reg, ~cur_wrap, cur_addr);
-              rwds_hi   <= 1'b0;
-              ca_idx    <= 2'd0;
-              state     <= ST_CS;
+              // more linear segments remain in THIS transaction (chopped by tCSM / boundary)
+              if (WR_COMMIT_READ & ~cur_read & ~cur_reg & ~doing_commit) begin
+                // tCSM / boundary CHOP interpose: commit the just-closed write segment's last word
+                // with an internal commit-read, remembering where to resume the write afterwards.
+                sv_addr           <= cur_addr;        // next write-segment start (advanced in ST_WRITE)
+                sv_rem            <= rem_left;
+                commit_resume     <= 1'b1;
+                wr_pending_commit <= 1'b1;            // segment closed -> needs committing
+                launch_commit_read(commit_base(last_wr_addr));
+              end else begin
+                // normal reopen (read / reg / commit-read, or WR_COMMIT_READ disabled)
+                seg_count <= seg_size(rem_left, cur_wrap, cur_addr);
+                seg_left  <= seg_size(rem_left, cur_wrap, cur_addr);
+                ca_reg    <= hb_pack_ca(cur_read, cur_reg, ~cur_wrap, cur_addr);
+                rwds_hi   <= 1'b0;
+                ca_idx    <= 2'd0;
+                state     <= ST_CS;
+              end
+            end else if (doing_commit) begin
+              // Internal commit-read finished (its recovered data was discarded).
+              doing_commit      <= 1'b0;
+              wr_pending_commit <= 1'b0;
+              if (commit_resume) begin
+                // Intra-command split write: restore the shadow context, reopen the write segment.
+                commit_resume <= 1'b0;
+                cur_read  <= 1'b0;
+                cur_reg   <= 1'b0;
+                cur_wrap  <= 1'b0;
+                cur_addr  <= sv_addr;
+                rem_left  <= sv_rem;
+                seg_count <= seg_size(sv_rem, 1'b0, sv_addr);
+                seg_left  <= seg_size(sv_rem, 1'b0, sv_addr);
+                ca_reg    <= hb_pack_ca(1'b0, 1'b0, 1'b1, sv_addr);   // write, memory, linear
+                rwds_hi   <= 1'b0;
+                ca_idx    <= 2'd0;
+                state     <= ST_CS;
+              end else begin
+                state <= ST_IDLE;                     // deferred interpose done: take the pending cmd
+              end
             end else begin
+              // Normal user / init transaction complete.
+              if (~cur_read & ~cur_reg & ~doing_init)
+                wr_pending_commit <= 1'b1;            // a memory write closed -> last word pending
               if (doing_init) begin
                 init_done  <= 1'b1;
                 doing_init <= 1'b0;
