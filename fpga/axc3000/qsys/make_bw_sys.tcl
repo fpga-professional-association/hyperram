@@ -44,7 +44,7 @@ set_instance_parameter_value clk_in NUM_CLOCK_OUTPUTS   {1}
 # SPEED-RAMP knob: CK_MHZ = hb_ck target (= clk word clock = outclk0). outclk1 (byte clock) = 2*CK_MHZ.
 # hb_ck = clk2x/2 = CK_MHZ.  Peak throughput ~= 2 bytes * CK_MHZ MB/s per direction.
 #   50 -> ~100 MB/s (bring-up) | 100 -> ~200 | 150 -> ~300 | 200 -> ~400 (W957D8NB device ceiling).
-set CK_MHZ   100.0
+set CK_MHZ   175.0
 set BYTE_MHZ [expr {2.0 * $CK_MHZ}]
 
 add_instance iopll altera_iopll

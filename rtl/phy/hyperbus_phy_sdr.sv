@@ -283,7 +283,7 @@ module hyperbus_phy_sdr
 
   // Elastic FIFO (write side = clk90 byte domain, read side = clk word domain). Gray-pointer async
   // FIFO — the designated CDC of the read path (DESIGN.md §2).
-  localparam int unsigned RXF_DEPTH = 128;  // elastic read FIFO (byte->word). Deepened from 8 so a full
+  localparam int unsigned RXF_DEPTH = 32;   // elastic read FIFO (byte->word). Deepened from 8 so a full
                                             // board read burst (16 words) plus the clk90->clk gray-pointer
                                             // hand-off latency never laps the pointer / stalls the drain.
   localparam int unsigned RXF_AW    = $clog2(RXF_DEPTH);
