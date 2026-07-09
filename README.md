@@ -41,6 +41,35 @@ simulates end-to-end under `verilator --binary` (tested with Verilator 5.020).
 
 ---
 
+## Burst-length limits & the write-commit workaround
+
+HyperBus transfers a **linear burst** under one CS# assertion, auto-incrementing the address. Two limits
+shape how you should drive writes on this device:
+
+- **tCSM — CS# maximum-Low time (spec §6 / §9).** A self-refreshing HyperRAM can only refresh while CS# is
+  High, so the spec **requires** that a single CS# assertion not exceed **tCSM**; longer transfers must be
+  split into multiple bursts. This IP does that automatically via `MAX_BURST_WORDS` (= tCSM / tCK) so the
+  chop is transparent to the caller. Empirically the W957D8NB holds a clean single burst up to ~768 words
+  (≈15 µs) at these clocks; a ≥1024-word single burst overruns tCSM and corrupts.
+
+- **Split-write commit quirk (device — [issue #1](https://github.com/fpga-professional-association/hyperram/issues/1)).**
+  When a *write* transfer is split across CS# boundaries — whether the caller issues several bursts or the
+  tCSM chopper does — the W957D8NB fails to commit the **last word of every non-final write burst** (it
+  reads back `0x0000`). It is deterministic, is *not* reproduced in an ideal-clock model, and the device
+  commits that word only if the **next command is a read**. Multi-burst *reads* are unaffected.
+
+**Is the single-burst workaround spec-compliant? Yes.** Issuing a write as a **single linear burst within
+one CS# assertion (≤ tCSM, ≤512 words with margin)** is not a workaround *around* the spec — it is exactly
+a normal HyperBus write transaction as the spec defines it. The CA, initial latency, DDR data phase, and
+RWDS byte-masking are all unchanged; you simply keep the transfer inside one CS# assertion, which the spec
+already permits up to tCSM. What you cannot yet *rely* on is back-to-back write bursts to a contiguous
+region committing every boundary word — and that is a **device** behavior to design around, not a spec
+feature this IP omits. Transfers that must exceed tCSM (and therefore *must* cross a CS# boundary, per
+spec) are where the quirk bites; [issue #1](https://github.com/fpga-professional-association/hyperram/issues/1)
+tracks the real fix (the device commits a pending write on a subsequent read).
+
+---
+
 ## Features
 
 - **Two host interfaces, one engine.** `hyperram_axi` (AXI4 slave) and
