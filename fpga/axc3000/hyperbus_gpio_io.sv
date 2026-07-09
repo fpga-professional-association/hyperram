@@ -84,7 +84,7 @@ module hyperbus_gpio_io #(
       csn_q  <= phy_cs_n;
       rstn_q <= phy_rst_n;
       dqoe_q <= phy_dq_oe;
-      rwoe_q <= phy_rwds_oe;
+      rwoe_q <= phy_rwds_oe | ck_stretch;   // keep driving the mask through the stretch cycle
       cken_q <= phy_ck_en;
     end
   end
@@ -142,10 +142,19 @@ module hyperbus_gpio_io #(
   //  CK — vendor DDR-out GPIO cell with clock-enable: emits clk on the pin while cke is high.
   //  CK_DIN_HI selects which sub-phase carries the high level (a half-cycle phase knob).
   // ================================================================================================
+  // CK-train stretch: one extra masked cycle after phy_ck_en falls. Writes are open-loop — if the
+  // vendor cell's CKE gating clips the final pulse, the device never latches the burst end and the
+  // whole write is discarded (reads are RWDS-gated and tolerate it, hence the read/write asymmetry
+  // on silicon). The extra cycle is driven with RWDS mask HIGH, which the device provably skips
+  // (issue #1 trailing-masked-edge experiment).
+  logic cken_d1;
+  always_ff @(posedge clk) cken_d1 <= rst ? 1'b0 : cken_q;
+  wire ck_stretch = cken_d1 & ~cken_q;   // exactly the first cycle after enable falls
+
   hbgpio_ck_cell u_ck_cell (
     .ck      (clk),
     .din     (CK_DIN_HI ? 2'b10 : 2'b01),
-    .cke     (cken_q),
+    .cke     (cken_q | ck_stretch),
     .pad_out (hb_ck)
   );
 
@@ -162,8 +171,8 @@ module hyperbus_gpio_io #(
     .ena      (1'b1),
     .areset   (1'b1),   // ACTIVE-LOW reset_n on ph2 atoms
     .sreset   (1'b0),
-    .datainhi (phy_rwds_o[1]),
-    .datainlo (tx_rwds_b),
+    .datainhi (phy_rwds_o[1] | ck_stretch),   // stretch cycle: mask HIGH (device skips it)
+    .datainlo (tx_rwds_b     | ck_stretch),
     .dataout  (rwds_ddr_out),
     .clk      (clk)
   );

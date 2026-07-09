@@ -73,6 +73,7 @@ puts [format "Programming LEN=%d words, BASE_ADDR=0x%08X ..." $LEN_WORDS $BASE_A
 master_write_32 $m $LEN  $LEN_WORDS
 master_write_32 $m $BASE $BASE_ADDR
 if {$BURSTW != 0} { master_write_32 $m $BURSTWR $BURSTW }
+if {$BURSTW != 0} { master_write_32 $m 0x30 $BURSTW }  ;# REG_RBURSTW (issue #2): read burst = write burst
 set burstw_now [rd32 $m $BURSTWR]
 puts [format "BURST_WORDS   = %d (HyperBus burst length)" $burstw_now]
 
