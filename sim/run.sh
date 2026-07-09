@@ -33,6 +33,13 @@ BENCH_SRCS=(
   "$RTL/bench/hyperram_bw_top.sv"
 )
 
+# Xilinx primitive shim — ONLY needed by tb_xilinx (PHY_VARIANT="XILINX"). Deliberately NOT in
+# COMMON_SRCS: every other TB compiles hyperbus_phy_xilinx.sv but never selects the XILINX variant, so
+# its ODDR/IDDR/IDELAYE2/... instances sit in an elaboration-dead generate branch and need no shim.
+XILINX_SIM_SRCS=(
+  "$SIM/model/xilinx_prims_sim.sv"
+)
+
 # -Wall as required; a handful of benign lint classes are waived (vendor-PHY skeleton tie-offs,
 # testbench-only unused status/ID signals, timescale-on-some-modules, empty status pin taps).
 VFLAGS=(--binary --timing -Wall
@@ -77,6 +84,7 @@ run_one tb_timeout.sv  tb_timeout
 run_one tb_preamble.sv tb_preamble
 run_one tb_bw.sv       tb_bw         "${BENCH_SRCS[@]}"
 run_one tb_multiburst.sv tb_multiburst "${BENCH_SRCS[@]}"
+run_one tb_xilinx.sv   tb_xilinx     "${XILINX_SIM_SRCS[@]}"
 
 echo "=================================================================="
 if [ "$overall" -eq 0 ]; then

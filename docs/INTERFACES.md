@@ -311,3 +311,14 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   byte clock (0°, same PLL) instead of a 90° phase — see the "SDR variant clock note" above. It adds
   a non-frozen, defaulted read-eye tuning parameter `CAPTURE_PHASE`. Controller, front-ends, model,
   and all other module boundaries are unchanged.
+- **v4 (2026-07-09):** `PHY_VARIANT="XILINX"` (`hyperbus_phy_xilinx.sv`) is filled in as a real
+  AMD/Xilinx 7-series DDR datapath (`ODDR`/`IDDR`/`IDELAYE2`/`IDELAYCTRL`/`BUFIO`/`BUFR`/`OBUF`/
+  `OBUFDS`) that now **simulates** under Verilator through a compile-guarded shim
+  (`sim/model/xilinx_prims_sim.sv`, `` `ifdef VERILATOR ``) driven by `sim/tb_xilinx.sv`. **No frozen
+  port name, direction, or width changes.** It adds three **non-frozen, defaulted** parameters, so every
+  existing instantiation is bit-identical: `RX_STROBE_DLY_TAPS` (IDELAYE2 FIXED tap), `RX_PAIR_SKEW`
+  (IDDR byte-pairing escape hatch), and `RD_PREAMBLE_SKIP` (read-strobe preamble skip, mirroring the SDR
+  variant). `RD_PREAMBLE_SKIP` was already a wrapper (`hyperbus_phy`) parameter (v3); it is now also
+  threaded to the `g_xilinx` branch. `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW` stay internal to the variant
+  (the wrapper never overrides them, exactly as the Altera variant's `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW`).
+  Controller, front-ends, model, and all other module boundaries are unchanged.
