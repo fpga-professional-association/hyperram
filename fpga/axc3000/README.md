@@ -102,17 +102,30 @@ The Fitter blocker (24403/24404) is **resolved** by switching the board to the S
 compile is **clean**, `output_files/bw.sof` is produced, timing closes, and the design **runs on
 real silicon**.
 
-### ✅ Measured on hardware (W957D8NB HyperRAM, 50 MHz CK, integrity-verified)
+### ✅ Measured on hardware (W957D8NB HyperRAM, single-burst, integrity-verified, ERR_COUNT=0)
 
-```
-LEN = 16 words   STATUS.done=1  ERR_COUNT=0  RESULT=PASS
-WR_CYCLES = 33  ->  WRITE 48.48 MB/s
-RD_CYCLES = 44  ->  READ  36.36 MB/s
-```
+Bandwidth scales with **burst length** (fixed CA+latency overhead amortizes) AND **clock**. The SDR PHY
+runs a `CK_MHZ` word clock + a 2×CK byte clock from one IOPLL (`qsys/make_bw_sys.tcl` `CK_MHZ` knob) — no
+DDIO. The clock ramp (all clean on real silicon, `bw_read.tcl <LEN> <BASE> <BURST> <CK_MHz>`):
 
-Independently re-confirmed (flash + `bw_read.tcl`). Bandwidth grows with burst length as the fixed
-per-transaction overhead amortizes (LEN=4 → 12.5 MB/s read, LEN=5 → 15.2, LEN=16 → 36.36).
-**Open item:** multi-burst reads (LEN > 16) still hang on silicon — see Hardware handoff.
+| hb_ck (MHz) | byte clk | WRITE MB/s | READ MB/s |  (LEN=512 single burst) |
+|-------------|----------|-----------:|----------:|-------------------------|
+| 50          | 100      |  96.8      |  94.8     | original bring-up       |
+| 100         | 200      | 193.6      | 189.3     |                         |
+| 133         | 266      | 258.1      | 252.4     |                         |
+| 150         | 300      | 290.4      | 283.9     |                         |
+| 160         | 320      | 309.7      | 302.9     |                         |
+| **175**     | **350**  | **342.4**  | **337.3** | **SDR ceiling** (LEN=768) |
+
+**Peak = ~342 W / ~337 R MB/s at 175 MHz CK — 3.5× the 50 MHz baseline.** Read eye holds at 350 MHz byte
+clock with `CAPTURE_PHASE=0` (no tuning). **SDR ceiling ~176 MHz CK**: the 2×byte clock (outclk1) hits a
+352.98 MHz min-pulse-width restricted Fmax. Reaching the **200 MHz / 400 MB/s device max** needs the DDIO
+PHY (I/O at 1×CK), still blocked on the 24403/24404 two-clock-phase routing.
+
+**Single bursts commit clean up to ~768 words** (≥1024 hits the tCSM refresh window ≈15 µs). **Open:**
+*split* multi-burst WRITES (LEN>burst) drop the last word of each non-final burst — a W957D8NB write-commit
+quirk (GitHub issue #1); workaround = single bursts ≤512 words. Runtime burst-size + first-error diagnostic
+CSRs added; see `bw_read.tcl`.
 
 - **Qsys generation**: clean (IOPLL now 25→**50 MHz @0° + 100 MHz @0°**; JTAG master, reset
   controller, clock bridges all real IP).
