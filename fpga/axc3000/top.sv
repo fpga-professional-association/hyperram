@@ -288,7 +288,10 @@ module top (
     .MAX_BURST_WORDS   (0),
     .PROGRAM_CR        (1'b1),
     .POR_DELAY_CYCLES  (0),
-    .INIT_CR0          (16'h8F1F)
+    .INIT_CR0          (16'h8F1F),
+    // Silicon findings, now first-class controller features (wave-1 ctrl-cluster):
+    .BURST_BOUNDARY_WORDS (16'h2000),  // W957D8NB releases the bus when a burst crosses 16 KB
+    .WR_COMMIT_READ       (1'b1)       // issue #1: commit-read interposes on write->write splits
   ) u_ctrl (
     .clk            (clk),
     .rst            (sys_rst),
@@ -336,7 +339,7 @@ module top (
   hyperbus_gpio_io #(
     .DQ_WIDTH         (8),
     .RD_PREAMBLE_SKIP (1),
-    .TX_B_DLY         (1'b1),
+    .TX_B_DLY         (1'b0),   // TX-alignment probe: direct byte-B (decode via read-back)
     .CK_DIN_HI        (1'b1)
   ) u_io (
     .clk            (clk),
