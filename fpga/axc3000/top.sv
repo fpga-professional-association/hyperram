@@ -342,10 +342,10 @@ module top (
     .RD_PREAMBLE_SKIP (1),
     .TX_B_DLY         (1'b1),   // proven config (reads+zlw work); CA margin comes from CK pin delay
     .CK_DIN_HI        (1'b1),
-    .CK_GEN           ("FABRIC2X")   // DICHOTOMY BUILD: proven CK generator; isolates the ck_cell
+    .CK_GEN           ("VENDOR")     // 200 MHz: vendor cell, DIN-gated (CKE gating is the proven write-killer)
   ) u_io (
     .clk            (clk),
-    .clk_smp        (clk2x),   // FABRIC2X build: 2x-CK 0-deg core clock (CK gen + RX sampling)
+    .clk_smp        (clk2x),   // VENDOR-CK build: +90deg 1x RX sampling clock (LOCAL1X)
     .rst            (sys_rst),
     .phy_cs_n       (phy_cs_n_w),
     .phy_rst_n      (phy_rst_n_w),

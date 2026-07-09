@@ -42,7 +42,12 @@ module hyperbus_gpio_io #(
     // CK generator select: "VENDOR" = hbgpio_ck_cell at 1x (no 2x clock anywhere; needed for a
     // true 200 MHz build). "FABRIC2X" = the silicon-proven SDR-style fabric generator — REQUIRES
     // clk_smp to carry a 2x-CK 0-deg core clock (caps CK at ~176 MHz via min-pulse, but proven).
-    parameter              CK_GEN           = "VENDOR"
+    parameter              CK_GEN           = "VENDOR",
+    // Vendor-cell gating style: "CKE" = the cell's clock-enable pin (BROKEN for writes on this
+    // silicon: reads fine, writes never commit — likely a truncated/degenerate final pulse).
+    // "DIN" = cke tied 1, gating through the registered din data path (the mechanism the working
+    // FABRIC2X generator uses).
+    parameter              CK_GATE          = "DIN"
 ) (
     input  logic                  clk,          // CK-rate word clock (controller + all launches)
     input  logic                  clk_smp,      // CK-rate RX sampling clock, PLL-phase-shifted (90 deg
@@ -187,8 +192,9 @@ module hyperbus_gpio_io #(
     end else begin : g_ck_vendor
       hbgpio_ck_cell u_ck_cell (
         .ck      (clk),
-        .din     (CK_DIN_HI ? 2'b10 : 2'b01),
-        .cke     (cken_q | ck_stretch),
+        .din     ((CK_GATE == "DIN") ? (cken_q ? (CK_DIN_HI ? 2'b10 : 2'b01) : 2'b00)
+                                     : (CK_DIN_HI ? 2'b10 : 2'b01)),
+        .cke     ((CK_GATE == "DIN") ? 1'b1 : (cken_q | ck_stretch)),
         .pad_out (hb_ck)
       );
     end
