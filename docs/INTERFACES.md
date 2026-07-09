@@ -263,6 +263,7 @@ Same structure as `hyperram_axi` but with the Avalon-MM slave of `hyperbus_avalo
 | *Avalon-MM slave* | | | every `avs_*` port from `hyperbus_avalon`, same names/widths |
 | *device pins* | | | same 10 device-pin ports as `hyperram_axi` |
 | `init_done` | O | 1 | |
+| `err_underrun` | O | 1 | pulse: controller write-data underrun (v4). Avalon has no SLVERR channel, so the controller's `err_underrun` is surfaced here as a top-level status strobe |
 
 ---
 
@@ -311,3 +312,10 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   byte clock (0°, same PLL) instead of a 90° phase — see the "SDR variant clock note" above. It adds
   a non-frozen, defaulted read-eye tuning parameter `CAPTURE_PHASE`. Controller, front-ends, model,
   and all other module boundaries are unchanged.
+- **v4 (2026-07-09):** `hyperram_avalon` gains one output — `err_underrun` — wired straight from the
+  existing `hyperbus_ctrl.err_underrun` pulse (previously left unconnected). The AXI top folds this
+  error into `BRESP=SLVERR`, but Avalon-MM has no response channel, so an Avalon integrator otherwise
+  had no visibility of a controller write-data underrun (issue #4, B6). This is an **additive output**;
+  existing instantiations that leave it unconnected are unaffected (unconnected outputs are legal). No
+  other port name/direction/width changed; `hyperbus_ctrl`, `hyperbus_avalon`, `hyperbus_phy`, and the
+  `hyperram_axi` boundary are unchanged.

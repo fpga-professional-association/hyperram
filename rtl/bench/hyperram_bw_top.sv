@@ -155,7 +155,8 @@ module hyperram_bw_top
         .hb_rwds_oe        (hb_rwds_oe),
         .hb_rwds_i         (hb_rwds_i),
         // status
-        .init_done         (init_done)
+        .init_done         (init_done),
+        .err_underrun      (/* unused: bench engine streams full-rate, never underruns */)
     );
 
 endmodule

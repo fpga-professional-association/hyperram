@@ -77,6 +77,15 @@ run_one tb_timeout.sv  tb_timeout
 run_one tb_preamble.sv tb_preamble
 run_one tb_bw.sv       tb_bw         "${BENCH_SRCS[@]}"
 run_one tb_multiburst.sv tb_multiburst "${BENCH_SRCS[@]}"
+# Spec-coverage TBs (issue #4): chop, native wrapped/legacy/hybrid bursts, byte-masked writes +
+# write-underrun, true variable (alternating 1x/2x) latency, CR1/ID1 + POR dwell + runtime-reset
+# register restore + DIFF_CK, and AXI WRAP-write + AR/AW round-robin arbiter.
+run_one tb_chop.sv     tb_chop
+run_one tb_wrap.sv     tb_wrap
+run_one tb_masked.sv   tb_masked
+run_one tb_varlat.sv   tb_varlat
+run_one tb_reg.sv      tb_reg
+run_one tb_axi_wrap.sv tb_axi_wrap
 
 echo "=================================================================="
 if [ "$overall" -eq 0 ]; then

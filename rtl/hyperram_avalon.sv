@@ -65,6 +65,9 @@ module hyperram_avalon
 
   // ---- status -------------------------------------------------------------
   output logic                        init_done,
+  output logic                        err_underrun,  // pulse: controller write-data underrun (Avalon
+                                                     //   has no SLVERR channel, so this is surfaced as
+                                                     //   a top-level status strobe; see INTERFACES v4)
 
   // ---- DEBUG tap (bring-up only; leave unconnected in normal instantiations) --
   //   [3:0]=ctrl state  [5:4]=front-end state  [6]=cmd_valid  [7]=cmd_ready
@@ -203,7 +206,7 @@ module hyperram_avalon
     // status
     .busy           (/* unused */),
     .init_done      (init_done),
-    .err_underrun   (/* unused */),
+    .err_underrun   (err_underrun),
     .err_timeout    (/* unused */),
     // PHY TX
     .phy_cs_n       (phy_cs_n),

@@ -89,7 +89,7 @@ module tb_preamble;
     .hb_ck (b_hb_ck), .hb_ck_n (b_hb_ck_n), .hb_cs_n (b_hb_cs_n), .hb_rst_n (b_hb_rst_n),
     .hb_dq_o (b_phy_dq_o), .hb_dq_oe (b_phy_dq_oe), .hb_dq_i (b_dq_dly),
     .hb_rwds_o (b_phy_rwds_o), .hb_rwds_oe (b_phy_rwds_oe), .hb_rwds_i (b_rwds_dly),
-    .init_done (b_init_done)
+    .init_done (b_init_done), .err_underrun (/* unused */)
   );
   hyperram_model #(
     .DQ_WIDTH (DQ_WIDTH), .MEM_WORDS (1 << 16), .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),
@@ -127,7 +127,7 @@ module tb_preamble;
     .hb_ck (f_hb_ck), .hb_ck_n (f_hb_ck_n), .hb_cs_n (f_hb_cs_n), .hb_rst_n (f_hb_rst_n),
     .hb_dq_o (f_phy_dq_o), .hb_dq_oe (f_phy_dq_oe), .hb_dq_i (f_dq_dly),
     .hb_rwds_o (f_phy_rwds_o), .hb_rwds_oe (f_phy_rwds_oe), .hb_rwds_i (f_rwds_dly),
-    .init_done (f_init_done)
+    .init_done (f_init_done), .err_underrun (/* unused */)
   );
   hyperram_model #(
     .DQ_WIDTH (DQ_WIDTH), .MEM_WORDS (1 << 16), .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),
