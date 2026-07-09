@@ -12,6 +12,35 @@ simulates end-to-end under `verilator --binary` (tested with Verilator 5.020).
 
 ---
 
+## ⚡ Performance & test status (at a glance)
+
+**Tested on real silicon:** Arrow **AXC3000** dev board — Intel **Agilex 3 `A3CY100BM16AE7S`** FPGA
++ Winbond **W957D8NB** HyperRAM (128 Mb, ×8, 1.2 V), Quartus Prime Pro 26.1, **SDR PHY**.
+
+**Measured HyperRAM bandwidth** (single burst, data-integrity-verified on every row, `ERR_COUNT=0`):
+
+| HyperBus CK | Byte clock | Write | Read |
+|------------:|-----------:|------:|-----:|
+| 50 MHz  | 100 MHz | 96.8  | 94.8  MB/s |
+| 100 MHz | 200 MHz | 193.6 | 189.3 |
+| 150 MHz | 300 MHz | 290.4 | 283.9 |
+| **175 MHz** | **350 MHz** | **342.4** | **337.3 MB/s** |
+
+- **Peak ~342 / ~337 MB/s at 175 MHz CK — 3.5× the bring-up baseline.** Change the clock with the
+  single `CK_MHZ` knob in [`fpga/axc3000/qsys/make_bw_sys.tcl`](fpga/axc3000/qsys/make_bw_sys.tcl).
+- **175 MHz is the SDR-PHY ceiling** (its 2×-byte clock hits a min-pulse-width limit). The device's
+  **200 MHz / 400 MB/s** maximum needs the DDIO PHY — tracked in
+  [issue #3](https://github.com/fpga-professional-association/hyperram/issues/3).
+- **Single bursts commit clean up to ~768 words** (≥1024 hits the device refresh window, tCSM ≈15 µs).
+  *Split* multi-burst **writes** (LEN > burst size) drop the last word of each non-final burst — a
+  W957D8NB write-commit quirk ([issue #1](https://github.com/fpga-professional-association/hyperram/issues/1));
+  workaround: drive writes as single bursts ≤512 words.
+- **Vendor-neutral core:** the controller + AXI4/Avalon front-ends contain no vendor primitives and
+  simulate end-to-end under Verilator; only the PHY is device-specific. See
+  **[Porting to your device](#porting-to-your-device)**.
+
+---
+
 ## Features
 
 - **Two host interfaces, one engine.** `hyperram_axi` (AXI4 slave) and
@@ -204,6 +233,43 @@ primitives.
 
 ---
 
+## Porting to your device
+
+The controller (`hyperbus_ctrl`), the AXI4/Avalon front-ends, and the generic PHY are
+**device-independent** and simulate on any toolchain. Bringing this IP up on a new FPGA + HyperRAM is
+almost entirely a **PHY + board** job:
+
+1. **Pick a PHY** (`hyperbus_phy` selects by `PHY_VARIANT`):
+   - `"GENERIC"` — inferrable DDR; simulation + any FPGA (not I/O-timing-tuned).
+   - `"SDR"` (`hyperbus_phy_sdr`) — **portable, ONE clock in the I/O periphery**: runs the byte engine at
+     2×CK and derives CK-centring from that clock's negedge. This is the variant proven to **~342 MB/s**
+     on the AXC3000. Best first target on any device — no vendor DDR primitives, no per-bit calibration.
+   - `"INTEL"` / `"XILINX"` (`hyperbus_phy_altera` / `_xilinx`) — hard DDR-I/O skeletons for the highest
+     speed (I/O at 1×CK); fill in the vendor DDIO/IDELAY primitives (see `docs/PHY_PORTING.md`).
+2. **Clock plan** (one PLL, phase-related):
+   - *SDR PHY* — `clk` = HyperBus CK word rate; `clk90` is **repurposed** as the 2×CK byte clock (0°). Only
+     one clock reaches the I/O. Scale both together (the `CK_MHZ` knob) to trade clock for bandwidth.
+   - *DDIO PHY* — `clk` (0°) + `clk90` (90°, CK-centring); **both** phases enter the I/O, so the device/bank
+     must route two periphery phases (the AXC3000 could not → the SDR PHY is the workaround).
+3. **Board wrapper.** The PHY exposes **split** `hb_*_o` / `_oe` / `_i` (no `inout`, stays Verilator-shaped);
+   add the tri-state pad ring in a board wrapper (`fpga/axc3000/hyperbus_pads_altera.sv`,
+   [`docs/INTEGRATION.md`](docs/INTEGRATION.md)).
+4. **Pins + I/O standard** for your HyperRAM (`hb_dq[7:0]`, `hb_rwds`, `hb_cs_n`, `hb_ck`, `hb_rst_n`;
+   `hb_ck_n` only if `DIFF_CK=1`). Get `hb_ck` / `hb_cs_n` right — wrong pins = the device never responds.
+5. **Timing (`.sdc`).** For bring-up, `false_path` the off-chip HyperBus pins and close on the internal
+   fabric; production high-speed needs real source-synchronous input/output-delay closure.
+6. **Device specifics from your datasheet:** `LATENCY_CLOCKS`, `FIXED_LATENCY`, `INIT_CR0` (CR0
+   latency/drive/burst fields), and `MAX_BURST_WORDS` (= tCSM / tCK, so CS# never exceeds the device's max
+   Low time). Register/ID addresses default to W957D8NB-family values.
+7. **Read-eye calibration on hardware.** SDR PHY: sweep `CAPTURE_PHASE` (and `RD_PREAMBLE_SKIP` if your
+   device drives a read preamble). DDIO PHY: sweep the input delay taps / DPA. Write a known pattern, sweep,
+   pick the widest passing window.
+
+The AXC3000 build in [`fpga/axc3000/`](fpga/axc3000/) is a complete worked example of all of the above
+(SDR PHY, IOPLL clock plan, pins, `.sdc`, and the JTAG bandwidth-test harness).
+
+---
+
 ## Spec-compliance summary
 
 Against **Infineon/Cypress HyperBus Specification 001-99253 Rev \*H**. "Simulated"
@@ -239,25 +305,36 @@ each datasheet.
 ## Performance (measured on AXC3000 silicon)
 
 Real, integrity-verified HyperRAM bandwidth on the Arrow **AXC3000** (Agilex 3
-`A3CY100BM16AE7S` + Winbond **W957D8NB** HyperRAM), via the **SDR PHY** at a
-conservative **50 MHz** HyperBus clock (100 MHz fabric byte clock), read back over
-JTAG-Avalon with on-chip cycle counters (`fpga/axc3000/`). Independently re-confirmed.
+`A3CY100BM16AE7S` + Winbond **W957D8NB** HyperRAM), via the **SDR PHY**, read back over
+JTAG-Avalon with on-chip cycle counters (`fpga/axc3000/`). The SDR PHY runs a `CK_MHZ` word
+clock plus a 2×CK byte clock from one IOPLL, so bandwidth scales directly with the clock:
 
-| Metric | Value | Conditions |
-|---|---|---|
-| **Write bandwidth** | **48.48 MB/s** | 16-word burst · `STATUS.done`, `ERR_COUNT=0`, integrity PASS |
-| **Read bandwidth**  | **36.36 MB/s** | 16-word burst · `STATUS.done`, `ERR_COUNT=0`, integrity PASS |
-| HyperBus CK | **50 MHz** (×8 SDR, 1 byte / 100 MHz fabric cycle; ~100 MB/s/dir theoretical peak) | overhead amortizes with burst length |
-| SDR-PHY system fit (A3CY100) | fmax 169.6 MHz `clk` / 373 MHz byte clock · **1,006 ALM / 1,393 reg / 2 M20K / 0 DSP** | Quartus Pro 26.1, timing met |
+| HyperBus CK | Byte clk | Write (LEN=512) | Read (LEN=512) | Notes |
+|------------:|---------:|----------------:|---------------:|-------|
+| 50 MHz  | 100 MHz | 96.8  | 94.8  MB/s | original bring-up |
+| 100 MHz | 200 MHz | 193.6 | 189.3 | |
+| 133 MHz | 266 MHz | 258.1 | 252.4 | |
+| 150 MHz | 300 MHz | 290.4 | 283.9 | |
+| 160 MHz | 320 MHz | 309.7 | 302.9 | |
+| **175 MHz** | **350 MHz** | **342.4** | **337.3 MB/s** | **SDR ceiling** (LEN=768) |
 
-Bandwidth scales with burst length as the fixed per-transaction overhead (6-beat CA
-+ initial latency) amortizes: LEN=4 → 12.5 MB/s read, LEN=5 → 15.2, LEN=16 → 36.36.
+Every row is `STATUS.done`, `ERR_COUNT=0`, integrity PASS, re-confirmed on repeats. Bandwidth also
+grows with **burst length** as the fixed per-transaction overhead (6-beat CA + initial latency)
+amortizes. The read eye holds all the way to the 350 MHz byte clock with `CAPTURE_PHASE=0` (no tuning).
 
-**Scope of the measurement:** single bursts up to 16 words complete with verified
-data integrity. Multi-burst reads (LEN > 16) currently hang on silicon — a read-path
-timing effect *not* reproduced in the ideal-clock sim; captured + documented in
-`fpga/axc3000/README.md` (on-chip logic analyzer `hyperbus_capture.sv`). The
-DDIO/high-speed PHY (toward the device's 250 MHz DDR spec) is future work.
+- **Fit** (A3CY100, Quartus Pro 26.1, timing closed at 175 MHz CK): outclk0 (fabric) Fmax 189 MHz,
+  outclk1 (byte) restricted Fmax **352.98 MHz** — the min-pulse-width limit that caps this 2×-byte SDR
+  architecture at **~176 MHz CK**. ~1 k ALM / ~1.4 k reg / few M20K / 0 DSP / 1 PLL.
+- **Reaching the 200 MHz / 400 MB/s device max** requires the DDIO PHY (I/O at 1×CK), still blocked on
+  the Fitter's 24403/24404 two-clock-phase routing —
+  [issue #3](https://github.com/fpga-professional-association/hyperram/issues/3).
+
+**Scope / open items.** Single bursts commit clean up to ~768 words (≥1024 hits tCSM refresh, ≈15 µs).
+Multi-burst *reads* complete correctly (over-stream drain). Multi-burst (split) *writes* drop the last
+word of each non-final burst — a W957D8NB write-commit quirk
+([issue #1](https://github.com/fpga-professional-association/hyperram/issues/1); workaround: single
+bursts ≤512 words). The board build adds runtime burst-size + first-error diagnostic CSRs and an
+on-chip logic analyzer (`fpga/axc3000/hyperbus_capture.sv`); details in `fpga/axc3000/README.md`.
 
 ## Status & scope
 
@@ -278,9 +355,10 @@ DDIO/high-speed PHY (toward the device's 250 MHz DDR spec) is future work.
   timing-closed. Real board bring-up — primitive instantiation, RWDS strobe
   delay/DPA calibration, and static timing closure against a device datasheet — is
   per-target hardware work. See [`docs/PHY_PORTING.md`](docs/PHY_PORTING.md).
-- **Hardware measurement** is limited to the AXC3000 SDR-PHY single-burst result in
-  **Performance** above; the generic/vendor PHY variants and multi-burst reads are
-  not yet hardware-validated.
+- **Hardware measurement** is the AXC3000 SDR-PHY result in **Performance** above: single-burst
+  read/write clean and integrity-verified from 50 up to **175 MHz CK (~342/337 MB/s)**, and multi-burst
+  *reads* validated. Open on hardware: split multi-burst *writes* (issue #1) and the 200 MHz DDIO PHY
+  (issue #3). The generic/vendor DDIO PHY variants are not yet hardware-validated.
 
 ---
 
