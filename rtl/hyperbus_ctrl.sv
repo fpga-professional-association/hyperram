@@ -56,10 +56,11 @@ module hyperbus_ctrl
     // written word (the device only commits a write burst's final word when the next command is a
     // read that covers it; a following write drops it). 1 = interpose the commit-read (issue #1).
     parameter bit          WR_COMMIT_READ       = 1'b0,
-    // Write-latency trim (board-calibration): subtract this many CK from the SECOND (2x) latency
+    // Write-latency extension (board-calibration): ADD this many CK to the SECOND (2x) latency
     // count for WRITES only. Reads are RWDS-gated and self-align, so they never need it; on the
-    // AXC3000 GPIO-I/O 200 MHz bring-up the device's write window opens exactly 3 CK before the
-    // spec-anchored wait ends (silicon-measured: mem[k] = pat(k+3) uniformly). Default 0 = spec.
+    // AXC3000 GPIO-I/O bring-up the device's write window opens exactly 3 CK after the
+    // spec-anchored wait ends (silicon-measured: mem[k]=pat(k+3) at trim 0, pat(k+6) at trim -3 —
+    // the offset tracks the knob 1:1). Default 0 = spec behavior.
     parameter int unsigned WR_LAT_TRIM          = 0
 ) (
     input  logic                    clk,
@@ -545,7 +546,7 @@ module hyperbus_ctrl
               lat_extra_done <= 1'b1;
               // WR_LAT_TRIM: writes only — see the parameter note (board write-window calibration)
               cnt            <= cur_read ? 32'(LATENCY_CLOCKS - 1)
-                                         : 32'(LATENCY_CLOCKS - 1 - WR_LAT_TRIM);
+                                         : 32'(LATENCY_CLOCKS - 1 + WR_LAT_TRIM);
             end else if (cur_read) begin
               stall_cnt <= '0;
               state     <= ST_READ;
