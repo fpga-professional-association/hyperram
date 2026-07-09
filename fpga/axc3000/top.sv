@@ -339,7 +339,7 @@ module top (
   hyperbus_gpio_io #(
     .DQ_WIDTH         (8),
     .RD_PREAMBLE_SKIP (1),
-    .TX_B_DLY         (1'b0),   // TX-alignment probe: direct byte-B (decode via read-back)
+    .TX_B_DLY         (1'b1),   // proven config (reads+zlw work); CA margin comes from CK pin delay
     .CK_DIN_HI        (1'b1)
   ) u_io (
     .clk            (clk),
