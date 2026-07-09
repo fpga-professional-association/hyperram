@@ -55,7 +55,12 @@ module hyperbus_ctrl
     // After every SPLIT memory-write segment, self-issue an internal COMMIT-READ that spans the last
     // written word (the device only commits a write burst's final word when the next command is a
     // read that covers it; a following write drops it). 1 = interpose the commit-read (issue #1).
-    parameter bit          WR_COMMIT_READ       = 1'b0
+    parameter bit          WR_COMMIT_READ       = 1'b0,
+    // Write-latency trim (board-calibration): subtract this many CK from the SECOND (2x) latency
+    // count for WRITES only. Reads are RWDS-gated and self-align, so they never need it; on the
+    // AXC3000 GPIO-I/O 200 MHz bring-up the device's write window opens exactly 3 CK before the
+    // spec-anchored wait ends (silicon-measured: mem[k] = pat(k+3) uniformly). Default 0 = spec.
+    parameter int unsigned WR_LAT_TRIM          = 0
 ) (
     input  logic                    clk,
     input  logic                    rst,            // synchronous, active high
@@ -538,7 +543,9 @@ module hyperbus_ctrl
           if (cnt == 32'd0) begin
             if (lat_double & ~lat_extra_done) begin
               lat_extra_done <= 1'b1;
-              cnt            <= 32'(LATENCY_CLOCKS - 1);   // insert the additional (2x) latency count
+              // WR_LAT_TRIM: writes only — see the parameter note (board write-window calibration)
+              cnt            <= cur_read ? 32'(LATENCY_CLOCKS - 1)
+                                         : 32'(LATENCY_CLOCKS - 1 - WR_LAT_TRIM);
             end else if (cur_read) begin
               stall_cnt <= '0;
               state     <= ST_READ;

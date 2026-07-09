@@ -291,7 +291,8 @@ module top (
     .INIT_CR0          (16'h8F1F),
     // Silicon findings, now first-class controller features (wave-1 ctrl-cluster):
     .BURST_BOUNDARY_WORDS (16'h2000),  // W957D8NB releases the bus when a burst crosses 16 KB
-    .WR_COMMIT_READ       (1'b1)       // issue #1: commit-read interposes on write->write splits
+    .WR_COMMIT_READ       (1'b1),      // issue #1: commit-read interposes on write->write splits
+    .WR_LAT_TRIM          (3)          // silicon-measured: device write window opens 3 CK early
   ) u_ctrl (
     .clk            (clk),
     .rst            (sys_rst),
