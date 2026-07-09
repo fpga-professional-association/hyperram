@@ -31,8 +31,10 @@ module hyperram_avalon
   // ---- PHY (hyperbus_phy) -------------------------------------------------
   parameter              PHY_VARIANT       = "GENERIC",                  // GENERIC | INTEL | XILINX
   parameter bit          DIFF_CK           = 1'b1,                       // drive hb_ck_n
-  parameter int unsigned RD_PREAMBLE_SKIP  = 0                           // SDR PHY: read-strobe preamble
-                                                                         // rwds-rise edges to ignore
+  parameter int unsigned RD_PREAMBLE_SKIP  = 0,                          // SDR/INTEL PHY: read-strobe
+                                                                         // preamble rwds-rise edges to ignore
+  parameter              CK_SCHEME         = "CLK90"                     // INTEL PHY only: "CLK90" |
+                                                                         // "CLK_DLY" (issue #8)
 ) (
   // ---- clocking / reset ---------------------------------------------------
   input  logic                        clk,       // system + bus word clock
@@ -234,7 +236,8 @@ module hyperram_avalon
     .LEN_WIDTH    (LEN_WIDTH),
     .PHY_VARIANT  (PHY_VARIANT),
     .DIFF_CK      (DIFF_CK),
-    .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP)
+    .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP),
+    .CK_SCHEME    (CK_SCHEME)
   ) u_phy (
     .clk            (clk),
     .clk90          (clk90),
