@@ -28,6 +28,10 @@ module hyperram_axi
   parameter int unsigned LATENCY_CLOCKS    = HB_LATENCY_CLOCKS_DEFAULT,  // CA1->data, clocks
   parameter bit          FIXED_LATENCY     = HB_FIXED_LATENCY_DEFAULT,   // 1 = fixed (POR default)
   parameter int unsigned MAX_BURST_WORDS   = 0,                         // 0 = no chop; else tCSM/tCK
+  parameter int unsigned BURST_BOUNDARY_WORDS = 0,                       // 0 = off; else chop at this
+                                                                         //   WORD boundary (W957D8NB)
+  parameter bit          WR_COMMIT_READ    = 1'b0,                       // interpose commit-read after
+                                                                         //   each split memory write
   parameter bit          PROGRAM_CR        = 1'b1,                       // program CR0 at init
   parameter int unsigned POR_DELAY_CYCLES  = 0,                         // POR init delay (sim: 0)
   parameter logic [3:0]  INIT_LATENCY_CODE = hb_clocks_to_latency_code(LATENCY_CLOCKS),
@@ -221,6 +225,8 @@ module hyperram_axi
     .LATENCY_CLOCKS    (LATENCY_CLOCKS),
     .FIXED_LATENCY     (FIXED_LATENCY),
     .MAX_BURST_WORDS   (MAX_BURST_WORDS),
+    .BURST_BOUNDARY_WORDS (BURST_BOUNDARY_WORDS),
+    .WR_COMMIT_READ    (WR_COMMIT_READ),
     .PROGRAM_CR        (PROGRAM_CR),
     .POR_DELAY_CYCLES  (POR_DELAY_CYCLES),
     .INIT_LATENCY_CODE (INIT_LATENCY_CODE),

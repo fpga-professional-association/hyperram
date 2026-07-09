@@ -74,6 +74,19 @@ module hyperram_model
                                                                       //   below stops the instant CK stops and never exercised
                                                                       //   this; the SELF-TIMED tail below reproduces it.
                                                                       //   0 = ideal device (keeps all existing TBs aligned).
+    parameter bit          WR_COMMIT_QUIRK = 1'b0,                     // W957D8NB SPLIT-WRITE commit quirk (issue #1):
+                                                                      //   when 1, the FINAL word of every memory WRITE
+                                                                      //   burst is held pending (NOT committed to mem[])
+                                                                      //   and is committed only when a subsequent READ
+                                                                      //   transaction covers that address and delivers
+                                                                      //   >=2 words; a subsequent WRITE drops it. 0 =
+                                                                      //   ideal device (immediate commit; keeps TBs aligned).
+    parameter int unsigned BURST_BOUNDARY_WORDS = 0,                  // W957D8NB 0x2000-WORD boundary quirk: when a
+                                                                      //   single burst crosses this WORD-aligned boundary
+                                                                      //   the device RELEASES the bus (stops driving on
+                                                                      //   reads / stops capturing on writes) for the rest
+                                                                      //   of that CS#; reads past it return floating junk.
+                                                                      //   0 = disabled (keeps existing TBs aligned).
     parameter logic [15:0] ID0_RESET      = HB_ID0_RESET,             // read-only device ID (mfr nibble)
     parameter logic [15:0] ID1_RESET      = HB_ID1_RESET,             // read-only device ID (type nibble)
     parameter logic [15:0] CR0_RESET      = HB_CR0_RESET,             // config register 0 reset image
@@ -133,6 +146,23 @@ module hyperram_model
   logic [DATA_WIDTH-1:0]   out_word;        // read word currently being driven onto DQ
   logic [DQ_WIDTH-1:0]     wr_hi;           // captured byte A during a register write
   logic                    stall_done;      // read-stall (STALL_CLOCKS) already injected this txn
+
+  // ---- split-write commit quirk (WR_COMMIT_QUIRK) ----
+  // `hold` = the most recent memory-write word within the CURRENT burst (delayed one word so the
+  // burst's LAST word is never committed here); at CS# deassert it moves to `pend`. `pend` = the last
+  // burst's held word, awaiting a covering read (commit) or the next write (drop).
+  logic                    hold_valid;
+  logic [AW-1:0]           hold_addr;
+  logic [DATA_WIDTH-1:0]   hold_word;
+  logic [1:0]              hold_we;         // per-byte write-enable {A,B} (unmasked bytes)
+  logic                    whi_we;          // byte-A write-enable, captured on the rising edge
+  logic                    pend_valid;
+  logic [AW-1:0]           pend_addr;
+  logic [DATA_WIDTH-1:0]   pend_word;
+  logic [1:0]              pend_we;
+
+  // ---- 0x2000-word boundary release quirk (BURST_BOUNDARY_WORDS) ----
+  logic                    bnd_rel;         // this transaction crossed a boundary -> bus released
 
   // ---- read over-stream tail (self-timed; models the CK-stop pipeline latency) ----
   realtime                 os_half;         // measured read-data CK half-period (tail cadence)
@@ -212,6 +242,9 @@ module hyperram_model
       pen_pending <= '0;
       wcnt        <= '0;
       stall_done  <= 1'b0;
+      hold_valid  <= 1'b0;
+      pend_valid  <= 1'b0;
+      bnd_rel     <= 1'b0;
       cs_q        <= 1'b1;
       ck_q        <= hb_ck;
       txn_cnt     <= '0;
@@ -229,6 +262,16 @@ module hyperram_model
       wcnt  <= '0;
       cs_q  <= 1'b1;
       ck_q  <= hb_ck;
+      bnd_rel <= 1'b0;                         // boundary-release latch is per-transaction
+      // Split-write quirk: the word still held at CS# deassert is this burst's UNCOMMITTED last word.
+      // Move it to `pend` to await a covering read (commit) or the next write (drop). Idempotent.
+      if (WR_COMMIT_QUIRK && hold_valid) begin
+        pend_valid <= 1'b1;
+        pend_addr  <= hold_addr;
+        pend_word  <= hold_word;
+        pend_we    <= hold_we;
+        hold_valid <= 1'b0;
+      end
     end else if (cs_q) begin
       // CS# just fell: start of transaction. Decide the refresh-collision for this transaction
       // now, so the RWDS latency indicator is stable throughout the whole CA period.
@@ -272,6 +315,17 @@ module hyperram_model
           //   edge index = 6 + 2*eff + 1 = 7 + 2*eff.
           first_data_beat <= 16'd7 + (eff << 1);
 
+          // Split-write quirk: a NEW memory WRITE drops any pending (uncommitted) word from the
+          // previous write burst (models "a following WRITE leaves the pending word uncommitted").
+          // The array location then reads back 0x0000 on the W957D8NB (issue #1: the lost word
+          // "reads back as 0x0000"), so zero it here — this reproduces the exact silicon fingerprint
+          // AND is robust to any prior committed value at that address. A read (incl. the master's
+          // commit-read) does NOT drop it — it commits it below.
+          if (WR_COMMIT_QUIRK && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca)) begin
+            if (pend_valid) mem[pend_addr] <= '0;
+            pend_valid <= 1'b0;
+          end
+
           // Data-phase address / burst setup.
           addr         <= start_addr;
           wcnt         <= '0;
@@ -298,7 +352,24 @@ module hyperram_model
             pen        <= 16'(2 * STALL_CLOCKS);
             stall_done <= 1'b1;
           end else if (hb_ck) begin                // rising edge: start of a word
-            out_word <= cur_as ? reg_val : mem[addr];
+            // Boundary-release quirk: stepping ONTO a BURST_BOUNDARY_WORDS-aligned address past the
+            // first word crosses the boundary -> the device releases the bus for the rest of this
+            // CS# (see the drive block). Sticky until CS# deassert.
+            if ((BURST_BOUNDARY_WORDS != 0) && (wcnt != 32'd0) &&
+                ((32'(addr) % BURST_BOUNDARY_WORDS) == 32'd0))
+              bnd_rel <= 1'b1;
+            // Split-write quirk: reading the pending address returns the held (uncommitted) value;
+            // if the read delivers >=2 words (this is at least the 2nd, wcnt>=1) it COMMITS it.
+            if (WR_COMMIT_QUIRK && pend_valid && !cur_as && (addr == pend_addr)) begin
+              out_word <= pend_word;
+              if (wcnt >= 32'd1) begin
+                if (pend_we[1]) mem[pend_addr][DATA_WIDTH-1:DQ_WIDTH] <= pend_word[DATA_WIDTH-1:DQ_WIDTH];
+                if (pend_we[0]) mem[pend_addr][DQ_WIDTH-1:0]          <= pend_word[DQ_WIDTH-1:0];
+                pend_valid <= 1'b0;
+              end
+            end else begin
+              out_word <= cur_as ? reg_val : mem[addr];
+            end
             addr     <= next_addr(addr, wcnt);
             wcnt     <= wcnt + 32'd1;
           end else begin                           // falling edge: byte B just delivered
@@ -311,9 +382,17 @@ module hyperram_model
           if (hb_ck) begin                         // rising edge: byte A (word[15:8])
             if (cur_as)
               wr_hi <= hb_dq_i;
-            else if (!hb_rwds_i)
+            else if (WR_COMMIT_QUIRK) begin
+              wr_hi  <= hb_dq_i;                    // delayed-commit: buffer byte A + its mask
+              whi_we <= ~hb_rwds_i;
+            end else if (!hb_rwds_i && !bnd_rel)
               mem[addr][DATA_WIDTH-1:DQ_WIDTH] <= hb_dq_i;
           end else begin                           // falling edge: byte B (word[7:0])
+            // Boundary-release quirk (writes): once the burst steps onto a boundary the device stops
+            // capturing for the rest of this CS# -> post-boundary words are never stored.
+            if ((BURST_BOUNDARY_WORDS != 0) && (wcnt != 32'd0) &&
+                ((32'(addr) % BURST_BOUNDARY_WORDS) == 32'd0))
+              bnd_rel <= 1'b1;
             if (cur_as) begin
               if (cur_reg_addr == HB_REG_CR0) begin
                 cr0         <= {wr_hi, hb_dq_i};    // big-endian: A=high, B=low
@@ -322,7 +401,18 @@ module hyperram_model
                 cr1 <= {wr_hi, hb_dq_i};
               end
               // ID0/ID1 are read-only: writes ignored.
-            end else if (!hb_rwds_i) begin
+            end else if (WR_COMMIT_QUIRK) begin
+              // Commit the PREVIOUS held word (never the current), so this burst's LAST word stays in
+              // `hold` at CS# deassert (-> pend). Honor per-byte masks; skip stores once bus-released.
+              if (hold_valid && !bnd_rel) begin
+                if (hold_we[1]) mem[hold_addr][DATA_WIDTH-1:DQ_WIDTH] <= hold_word[DATA_WIDTH-1:DQ_WIDTH];
+                if (hold_we[0]) mem[hold_addr][DQ_WIDTH-1:0]          <= hold_word[DQ_WIDTH-1:0];
+              end
+              hold_addr  <= addr;
+              hold_word  <= {wr_hi, hb_dq_i};
+              hold_we    <= {whi_we, ~hb_rwds_i};
+              hold_valid <= 1'b1;
+            end else if (!hb_rwds_i && !bnd_rel) begin
               mem[addr][DQ_WIDTH-1:0] <= hb_dq_i;
             end
             addr <= next_addr(addr, wcnt);
@@ -417,6 +507,11 @@ module hyperram_model
             hb_rwds_o = hb_ck;      // preamble strobe: RWDS toggles like CK, DQ = 0
           else
             hb_rwds_o = 1'b0;       // plain turn-around: RWDS held Low
+        end else if (bnd_rel) begin
+          // Boundary-release quirk: the device has let go of the bus (DQ + RWDS Hi-Z). The master
+          // sees no strobe -> it reads floating junk and eventually stalls/aborts (SPEC_DIGEST §4/§7).
+          hb_dq_oe   = 1'b0;
+          hb_rwds_oe = 1'b0;
         end else begin
           // Read data: source-synchronous strobe + data, edge-aligned.
           hb_dq_oe   = 1'b1;

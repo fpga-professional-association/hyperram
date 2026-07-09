@@ -96,6 +96,7 @@ run_one tb_varlat.sv   tb_varlat
 run_one tb_reg.sv      tb_reg
 run_one tb_axi_wrap.sv tb_axi_wrap
 run_one tb_xilinx.sv   tb_xilinx     "${XILINX_SIM_SRCS[@]}"
+run_one tb_commit.sv     tb_commit     "${BENCH_SRCS[@]}"
 
 echo "=================================================================="
 if [ "$overall" -eq 0 ]; then

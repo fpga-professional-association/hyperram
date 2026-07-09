@@ -29,6 +29,8 @@ module hyperram_bw_top
     parameter int unsigned LATENCY_CLOCKS   = 6,
     parameter bit          FIXED_LATENCY    = 1'b1,
     parameter int unsigned MAX_BURST_WORDS  = 0,                          // 0 = no controller chop
+    parameter int unsigned BURST_BOUNDARY_WORDS = 0,                      // 0 = off (W957D8NB: 0x2000)
+    parameter bit          WR_COMMIT_READ   = 1'b0,                       // split-write commit-read fix
     parameter bit          PROGRAM_CR       = 1'b1,
     parameter int unsigned POR_DELAY_CYCLES = 0,
     parameter logic [15:0] INIT_CR0         = 16'h8F1F,                    // latency code 6, fixed
@@ -123,6 +125,8 @@ module hyperram_bw_top
         .LATENCY_CLOCKS   (LATENCY_CLOCKS),
         .FIXED_LATENCY    (FIXED_LATENCY),
         .MAX_BURST_WORDS  (MAX_BURST_WORDS),
+        .BURST_BOUNDARY_WORDS (BURST_BOUNDARY_WORDS),
+        .WR_COMMIT_READ   (WR_COMMIT_READ),
         .PROGRAM_CR       (PROGRAM_CR),
         .POR_DELAY_CYCLES (POR_DELAY_CYCLES),
         .INIT_CR0         (INIT_CR0),
