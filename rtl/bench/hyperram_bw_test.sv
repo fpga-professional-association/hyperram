@@ -82,21 +82,23 @@ module hyperram_bw_test
     // ---- derived constants --------------------------------------------------
     localparam int unsigned BYTES_PER_WORD = DATA_WIDTH / 8;   // = 2
 
-    // CSR word-register indices (byte offset >> 2).
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_CTRL   = 3'd0;   // W: CTRL / R: STATUS
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_LEN    = 3'd1;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BASE   = 3'd2;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_WRCYC  = 3'd3;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_RDCYC  = 3'd4;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRCNT = 4'd5;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BYTES  = 4'd6;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_MAGIC  = 4'd7;
+    // CSR word-register indices (byte offset >> 2). Sized with an explicit cast so they are
+    // width-clean at any CSR_ADDR_WIDTH (indices >= 8 alias low registers when CSR_ADDR_WIDTH < 4 —
+    // harmless, those hosts only use the low 8 regs).
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_CTRL    = CSR_ADDR_WIDTH'(0);   // W: CTRL / R: STATUS
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_LEN     = CSR_ADDR_WIDTH'(1);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BASE    = CSR_ADDR_WIDTH'(2);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_WRCYC   = CSR_ADDR_WIDTH'(3);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_RDCYC   = CSR_ADDR_WIDTH'(4);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRCNT  = CSR_ADDR_WIDTH'(5);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BYTES   = CSR_ADDR_WIDTH'(6);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_MAGIC   = CSR_ADDR_WIDTH'(7);
     // First-mismatch diagnostics (latched on the FIRST read mismatch of a run; cleared at start).
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRADDR = 4'd8;  // WORD address of the first mismatch
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRGOT  = 4'd9;  // read data returned at that address
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERREXP  = 4'd10; // expected pattern at that address
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BURSTW  = 4'd11; // R/W: WRITE burst length (words), default BURST_WORDS
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_RBURSTW = 4'd12; // R/W: READ  burst length (words), default BURST_WORDS
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRADDR = CSR_ADDR_WIDTH'(8);   // WORD address of first mismatch
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRGOT  = CSR_ADDR_WIDTH'(9);   // read data at that address
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERREXP  = CSR_ADDR_WIDTH'(10);  // expected pattern there
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BURSTW  = CSR_ADDR_WIDTH'(11);  // R/W: WRITE burst length (words)
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_RBURSTW = CSR_ADDR_WIDTH'(12);  // R/W: READ  burst length (words)
 
     // ------------------------------------------------------------------------
     // Deterministic, address-seeded per-word data pattern (xorshift32 folded to

@@ -317,9 +317,14 @@ module hyperram_model
 
           // Split-write quirk: a NEW memory WRITE drops any pending (uncommitted) word from the
           // previous write burst (models "a following WRITE leaves the pending word uncommitted").
-          // A read (incl. the master's commit-read) does NOT drop it — it commits it below.
-          if (WR_COMMIT_QUIRK && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca))
+          // The array location then reads back 0x0000 on the W957D8NB (issue #1: the lost word
+          // "reads back as 0x0000"), so zero it here — this reproduces the exact silicon fingerprint
+          // AND is robust to any prior committed value at that address. A read (incl. the master's
+          // commit-read) does NOT drop it — it commits it below.
+          if (WR_COMMIT_QUIRK && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca)) begin
+            if (pend_valid) mem[pend_addr] <= '0;
             pend_valid <= 1'b0;
+          end
 
           // Data-phase address / burst setup.
           addr         <= start_addr;

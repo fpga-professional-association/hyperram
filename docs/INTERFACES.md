@@ -32,8 +32,13 @@ Every module below declares these (defaults from `hyperbus_pkg`):
 
 Additional parameters: `LATENCY_CLOCKS` (default `HB_LATENCY_CLOCKS_DEFAULT`=6),
 `FIXED_LATENCY` (default 1), `MAX_BURST_WORDS` (default 0 = no chop; else tCSM/tCK),
-`PROGRAM_CR` (default 1 = program CR0 at init), `POR_DELAY_CYCLES` (default 0 in sim),
-`INIT_LATENCY_CODE` / `INIT_CR0` (CR image written at init).
+`BURST_BOUNDARY_WORDS` (default 0 = off; else a linear segment is chopped so it never crosses this
+WORD-aligned boundary — the W957D8NB bus-release quirk), `WR_COMMIT_READ` (default 0 = off; when 1,
+after each split memory-write segment the controller self-issues an internal commit-read spanning the
+last written word — the W957D8NB write-commit quirk), `PROGRAM_CR` (default 1 = program CR0 at init),
+`POR_DELAY_CYCLES` (default 0 in sim), `INIT_LATENCY_CODE` / `INIT_CR0` (CR image written at init).
+The two device-quirk parameters default OFF so existing instantiations are bit-identical; they are
+threaded (defaulted) through `hyperram_avalon` / `hyperram_axi` / `hyperram_bw_top`.
 
 | Port | Dir | Width | Notes |
 |---|---|---|---|
@@ -311,3 +316,13 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   byte clock (0°, same PLL) instead of a 90° phase — see the "SDR variant clock note" above. It adds
   a non-frozen, defaulted read-eye tuning parameter `CAPTURE_PHASE`. Controller, front-ends, model,
   and all other module boundaries are unchanged.
+- **v4 (2026-07-09):** `hyperbus_ctrl` gains two device-quirk parameters for the Winbond W957D8NB
+  (AXC3000) split-multi-burst work-arounds — `BURST_BOUNDARY_WORDS` (default 0 = off; else chop a
+  linear segment at that WORD boundary) and `WR_COMMIT_READ` (default 0 = off; else interpose an
+  internal commit-read after each split memory-write segment). **Both default OFF, so every existing
+  instantiation is bit-identical; no frozen port name, direction, or width changed.** They are
+  threaded (defaulted) through `hyperram_avalon`, `hyperram_axi`, and `hyperram_bw_top`. The
+  behavioural device model `hyperram_model` gains matching, defaulted, non-frozen knobs
+  `WR_COMMIT_QUIRK` and `BURST_BOUNDARY_WORDS` (simulation-only); `hyperram_bw_test` adds the
+  runtime CSR `REG_RBURSTW` (word 12 / 0x30) for an independent read-phase burst length. Regression:
+  `sim/tb_commit.sv`.

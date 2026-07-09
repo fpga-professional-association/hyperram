@@ -77,6 +77,7 @@ run_one tb_timeout.sv  tb_timeout
 run_one tb_preamble.sv tb_preamble
 run_one tb_bw.sv       tb_bw         "${BENCH_SRCS[@]}"
 run_one tb_multiburst.sv tb_multiburst "${BENCH_SRCS[@]}"
+run_one tb_commit.sv     tb_commit     "${BENCH_SRCS[@]}"
 
 echo "=================================================================="
 if [ "$overall" -eq 0 ]; then
