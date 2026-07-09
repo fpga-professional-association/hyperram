@@ -192,7 +192,7 @@ Altera and sold by Altera or its authorized distributors.-->
                 &lt;consumedSystemInfos&gt;
                     &lt;entry&gt;
                         &lt;key&gt;CLOCK_RATE&lt;/key&gt;
-                        &lt;value&gt;200000000&lt;/value&gt;
+                        &lt;value&gt;175000000&lt;/value&gt;
                     &lt;/entry&gt;
                 &lt;/consumedSystemInfos&gt;
             &lt;/value&gt;
@@ -205,7 +205,7 @@ Altera and sold by Altera or its authorized distributors.-->
                 &lt;consumedSystemInfos&gt;
                     &lt;entry&gt;
                         &lt;key&gt;CLOCK_RATE&lt;/key&gt;
-                        &lt;value&gt;200000000&lt;/value&gt;
+                        &lt;value&gt;350000000&lt;/value&gt;
                     &lt;/entry&gt;
                 &lt;/consumedSystemInfos&gt;
             &lt;/value&gt;
@@ -657,7 +657,7 @@ Altera and sold by Altera or its authorized distributors.-->
                         &lt;/entry&gt;
                         &lt;entry&gt;
                             &lt;key&gt;clockRate&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;175000000&lt;/value&gt;
                         &lt;/entry&gt;
                         &lt;entry&gt;
                             &lt;key&gt;clockRateKnown&lt;/key&gt;
@@ -701,7 +701,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;consumedSystemInfos&gt;
                         &lt;entry&gt;
                             &lt;key&gt;CLOCK_RATE&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;175000000&lt;/value&gt;
                         &lt;/entry&gt;
                     &lt;/consumedSystemInfos&gt;
                 &lt;/value&gt;
@@ -713,7 +713,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;suppliedSystemInfos&gt;
                         &lt;entry&gt;
                             &lt;key&gt;CLOCK_RATE&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;175000000&lt;/value&gt;
                         &lt;/entry&gt;
                     &lt;/suppliedSystemInfos&gt;
                     &lt;consumedSystemInfos/&gt;
@@ -800,7 +800,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;/entry&gt;
                     &lt;entry&gt;
                         &lt;key&gt;clockRate&lt;/key&gt;
-                        &lt;value&gt;200000000&lt;/value&gt;
+                        &lt;value&gt;175000000&lt;/value&gt;
                     &lt;/entry&gt;
                     &lt;entry&gt;
                         &lt;key&gt;clockRateKnown&lt;/key&gt;
@@ -984,7 +984,7 @@ Altera and sold by Altera or its authorized distributors.-->
                         &lt;/entry&gt;
                         &lt;entry&gt;
                             &lt;key&gt;clockRate&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;350000000&lt;/value&gt;
                         &lt;/entry&gt;
                         &lt;entry&gt;
                             &lt;key&gt;clockRateKnown&lt;/key&gt;
@@ -1028,7 +1028,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;consumedSystemInfos&gt;
                         &lt;entry&gt;
                             &lt;key&gt;CLOCK_RATE&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;350000000&lt;/value&gt;
                         &lt;/entry&gt;
                     &lt;/consumedSystemInfos&gt;
                 &lt;/value&gt;
@@ -1040,7 +1040,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;suppliedSystemInfos&gt;
                         &lt;entry&gt;
                             &lt;key&gt;CLOCK_RATE&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;350000000&lt;/value&gt;
                         &lt;/entry&gt;
                     &lt;/suppliedSystemInfos&gt;
                     &lt;consumedSystemInfos/&gt;
@@ -1127,7 +1127,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;/entry&gt;
                     &lt;entry&gt;
                         &lt;key&gt;clockRate&lt;/key&gt;
-                        &lt;value&gt;200000000&lt;/value&gt;
+                        &lt;value&gt;350000000&lt;/value&gt;
                     &lt;/entry&gt;
                     &lt;entry&gt;
                         &lt;key&gt;clockRateKnown&lt;/key&gt;
@@ -1393,7 +1393,7 @@ Altera and sold by Altera or its authorized distributors.-->
                         &lt;/entry&gt;
                         &lt;entry&gt;
                             &lt;key&gt;clockRate&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;175000000&lt;/value&gt;
                         &lt;/entry&gt;
                         &lt;entry&gt;
                             &lt;key&gt;clockRateKnown&lt;/key&gt;
@@ -1439,7 +1439,7 @@ Altera and sold by Altera or its authorized distributors.-->
                         &lt;/entry&gt;
                         &lt;entry&gt;
                             &lt;key&gt;clockRate&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;350000000&lt;/value&gt;
                         &lt;/entry&gt;
                         &lt;entry&gt;
                             &lt;key&gt;clockRateKnown&lt;/key&gt;
@@ -1508,7 +1508,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;suppliedSystemInfos&gt;
                         &lt;entry&gt;
                             &lt;key&gt;CLOCK_RATE&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;175000000&lt;/value&gt;
                         &lt;/entry&gt;
                     &lt;/suppliedSystemInfos&gt;
                     &lt;consumedSystemInfos/&gt;
@@ -1521,7 +1521,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;suppliedSystemInfos&gt;
                         &lt;entry&gt;
                             &lt;key&gt;CLOCK_RATE&lt;/key&gt;
-                            &lt;value&gt;200000000&lt;/value&gt;
+                            &lt;value&gt;350000000&lt;/value&gt;
                         &lt;/entry&gt;
                     &lt;/suppliedSystemInfos&gt;
                     &lt;consumedSystemInfos/&gt;
@@ -1690,7 +1690,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;/entry&gt;
                     &lt;entry&gt;
                         &lt;key&gt;clockRate&lt;/key&gt;
-                        &lt;value&gt;200000000&lt;/value&gt;
+                        &lt;value&gt;175000000&lt;/value&gt;
                     &lt;/entry&gt;
                     &lt;entry&gt;
                         &lt;key&gt;clockRateKnown&lt;/key&gt;
@@ -1736,7 +1736,7 @@ Altera and sold by Altera or its authorized distributors.-->
                     &lt;/entry&gt;
                     &lt;entry&gt;
                         &lt;key&gt;clockRate&lt;/key&gt;
-                        &lt;value&gt;200000000&lt;/value&gt;
+                        &lt;value&gt;350000000&lt;/value&gt;
                     &lt;/entry&gt;
                     &lt;entry&gt;
                         &lt;key&gt;clockRateKnown&lt;/key&gt;

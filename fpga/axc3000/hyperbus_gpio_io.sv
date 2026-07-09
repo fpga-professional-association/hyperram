@@ -38,7 +38,11 @@ module hyperbus_gpio_io #(
     // effective arm keeps the receiver blind through the float window; data arrives >= 2x-latency
     // (24 CK at latency 6x2) after the controller arms, so 16 leaves >= 6 CK of margin ahead of
     // the real preamble. Sweepable; 0 = arm immediately (the original exposure).
-    parameter int unsigned ARM_DELAY_CYCLES = 16
+    parameter int unsigned ARM_DELAY_CYCLES = 16,
+    // CK generator select: "VENDOR" = hbgpio_ck_cell at 1x (no 2x clock anywhere; needed for a
+    // true 200 MHz build). "FABRIC2X" = the silicon-proven SDR-style fabric generator — REQUIRES
+    // clk_smp to carry a 2x-CK 0-deg core clock (caps CK at ~176 MHz via min-pulse, but proven).
+    parameter              CK_GEN           = "VENDOR"
 ) (
     input  logic                  clk,          // CK-rate word clock (controller + all launches)
     input  logic                  clk_smp,      // CK-rate RX sampling clock, PLL-phase-shifted (90 deg
@@ -151,12 +155,44 @@ module hyperbus_gpio_io #(
   always_ff @(posedge clk) cken_d1 <= rst ? 1'b0 : cken_q;
   wire ck_stretch = cken_d1 & ~cken_q;   // exactly the first cycle after enable falls
 
-  hbgpio_ck_cell u_ck_cell (
-    .ck      (clk),
-    .din     (CK_DIN_HI ? 2'b10 : 2'b01),
-    .cke     (cken_q | ck_stretch),
-    .pad_out (hb_ck)
-  );
+  generate
+    if (CK_GEN == "FABRIC2X") begin : g_ck_fab2x
+      // Verbatim port of the silicon-proven SDR/altera-PHY CK generator. clk_smp = 2x CK, 0 deg,
+      // CORE-ONLY. Edges land at T/4 and 3T/4 of the word cycle by construction.
+      logic rst2x_meta, rst2x;
+      always_ff @(posedge clk_smp) begin
+        rst2x_meta <= rst;
+        rst2x      <= rst2x_meta;
+      end
+      logic tgl;
+      always_ff @(posedge clk) tgl <= rst ? 1'b0 : ~tgl;
+      logic tgl_s1, tgl_s2, tgl_s3;
+      always_ff @(posedge clk_smp) begin
+        if (rst2x) begin tgl_s1 <= 1'b0; tgl_s2 <= 1'b0; tgl_s3 <= 1'b0; end
+        else       begin tgl_s1 <= tgl;  tgl_s2 <= tgl_s1; tgl_s3 <= tgl_s2; end
+      end
+      wire beat_a = tgl_s2 ^ tgl_s3;
+      logic beat_a_d1;
+      always_ff @(posedge clk_smp) beat_a_d1 <= rst2x ? 1'b0 : beat_a;
+      logic cken_w;
+      always_ff @(posedge clk_smp) begin
+        if (rst2x)       cken_w <= 1'b0;
+        else if (beat_a) cken_w <= cken_q;
+      end
+      logic ck_r;
+      /* verilator lint_off SYNCASYNCNET */
+      always_ff @(negedge clk_smp) ck_r <= rst2x ? 1'b0 : (cken_w & beat_a_d1);
+      /* verilator lint_on SYNCASYNCNET */
+      assign hb_ck = ck_r;
+    end else begin : g_ck_vendor
+      hbgpio_ck_cell u_ck_cell (
+        .ck      (clk),
+        .din     (CK_DIN_HI ? 2'b10 : 2'b01),
+        .cke     (cken_q | ck_stretch),
+        .pad_out (hb_ck)
+      );
+    end
+  endgenerate
 
   // ================================================================================================
   //  RWDS — bring-up-proven path: tennm TX atom for the DDR write mask + inferred tristate pad;
@@ -196,14 +232,18 @@ module hyperbus_gpio_io #(
   // Both-edge sampling on clk_smp (phase-shifted): with +90 deg the two sample points land at
   // T/4 and 3T/4 of each clk cycle, and both are stable by the next clk posedge (related-clock
   // paths, STA-timed). s0 = the posedge-clk_smp sample (older), s1 = the negedge sample (newer).
+  // RX sampling clock: the LOCAL1X pairing is sample-phase-free (proven across all 20 phases in
+  // tb_local1x), so under CK_GEN="FABRIC2X" — where clk_smp carries the 2x CK-generator clock —
+  // the sampler falls back to clk itself (2 samples per word cycle either way).
+  wire rx_smp_clk = (CK_GEN == "FABRIC2X") ? clk : clk_smp;
   logic [DQ_WIDTH-1:0] dq_s0_q, dq_s1_q;
   logic                rwds_s0_q, rwds_s1_q;
-  always_ff @(posedge clk_smp) begin
+  always_ff @(posedge rx_smp_clk) begin
     dq_s0_q   <= dq_raw;
     rwds_s0_q <= rwds_raw;
   end
   /* verilator lint_off SYNCASYNCNET */
-  always_ff @(negedge clk_smp) begin
+  always_ff @(negedge rx_smp_clk) begin
     dq_s1_q   <= dq_raw;
     rwds_s1_q <= rwds_raw;
   end
