@@ -75,8 +75,10 @@ run_one tb_axi.sv      tb_axi
 run_one tb_fixed2x.sv  tb_fixed2x
 run_one tb_timeout.sv  tb_timeout
 run_one tb_preamble.sv tb_preamble
+run_one tb_preamble_generic.sv tb_preamble_generic
 run_one tb_bw.sv       tb_bw         "${BENCH_SRCS[@]}"
 run_one tb_multiburst.sv tb_multiburst "${BENCH_SRCS[@]}"
+run_one tb_multiburst_generic.sv tb_multiburst_generic "${BENCH_SRCS[@]}"
 
 echo "=================================================================="
 if [ "$overall" -eq 0 ]; then
