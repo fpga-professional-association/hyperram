@@ -310,16 +310,19 @@ a claim of silicon timing closure (see *Status & scope*).
 | 48-bit CA encoding (R/W#, AS, burst type, word address) | §2/§3 | Implemented, simulated | `hyperbus_pkg::hb_pack_ca`; `tb_axi`/`tb_avalon` |
 | DDR data phase, byte A / byte B ordering, big-endian registers | §4 | Implemented, simulated | `hyperbus_phy_generic`; all TBs |
 | Initial latency code table (3–16 clks, codes 1110/1111 = 3/4) | §3 | Implemented | `hb_latency_code_to_clocks` / `_to_latency_code` |
-| Fixed vs variable latency; RWDS-during-CA 1×/2× select | §3.2/§5.2.4 | Implemented, simulated | `hyperbus_ctrl`; `tb_fixed2x` |
+| Fixed latency + RWDS-during-CA 2× select | §3.2/§5.2.4 | Implemented; only the *constant* fixed-2× case simulated | `hyperbus_ctrl`; `tb_fixed2x`. True **variable** latency (alternating 1×/2×) not simulated — [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
 | RWDS-gated read completion; row/page latency gaps absorbed | §3.2/§7 | Implemented, simulated | `hyperbus_ctrl`; `hyperram_model` row penalty |
 | Read RWDS-stall ≥ 32 clks → abort + error | §3.2/§4 | Implemented, simulated | `err_timeout`; `tb_timeout` |
-| Byte-masked writes (RWDS = ~strobe, High = mask) | §4 | Implemented, simulated | `hyperbus_ctrl`; `tb_axi` write path |
+| Byte-masked writes (RWDS = ~strobe, High = mask) | §4 | Implemented; **not** simulated (all TBs write full-word) | `hyperbus_ctrl:295` — [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
 | Zero-latency register/config writes (no mask, full word) | §5/§6 | Implemented, simulated | `hyperbus_ctrl`; `tb_axi` CR0 write |
-| Linear + wrapped bursts (CA[45]) | §7 | Implemented, simulated | `tb_axi` WRAP read; wrap tables in `hyperbus_pkg` |
-| Wrap boundary from CR0[1:0] (128/64/16/32 B) | §7 | Table implemented | `hb_wrap_words` |
-| Burst chopping to tCSM (MAX_BURST_WORDS) | §6 | Implemented | `hyperbus_ctrl` (`MAX_BURST_WORDS`) |
-| CR0/CR1/ID0/ID1 register access | §5/§8 | Implemented, simulated | `tb_axi` CR0 + ID0; `tb_avalon` |
-| POR init + CR programming, `init_done` gating | §8/§9 | Implemented, simulated | `hyperbus_ctrl` init; all TBs wait `init_done` |
+| Linear bursts (CA[45]=1) | §7 | Implemented, simulated | all TBs |
+| Wrapped/hybrid bursts (CA[45]=0) | §7 | Implemented; **not** simulated — front-ends tie `cmd_wrap=0`; `tb_axi` "WRAP" is AXI-wrap decomposed to *linear* native segments | ctrl wrap path; [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
+| Wrap boundary from CR0[1:0] (128/64/16/32 B) | §7 | Table implemented; **not** exercised (no wrapped CA; only 32 B configured) | `hb_wrap_words` — [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
+| Burst chopping to tCSM (MAX_BURST_WORDS) | §6 | Implemented; **not** simulated (all TBs set `MAX_BURST_WORDS=0` → chop/re-open FSM never runs) | `hyperbus_ctrl` — [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
+| CR0 / ID0 register access | §5/§8 | Implemented, simulated | `tb_axi` CR0 rw + ID0 rd; `tb_avalon` |
+| CR1 / ID1 register access | §8.2/§8.3 | Decoded in model; **not** simulated (no CR1/ID1 access in any TB). CR1 also **not** programmed at init | [#4](https://github.com/fpga-professional-association/hyperram/issues/4), [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
+| POR init + CR0 programming, `init_done` gating | §8/§9 | Implemented, simulated (CR0 only) | `hyperbus_ctrl` init; all TBs wait `init_done`. CR1 init + tRP/tRPH/tRH/tVCS timing not done — [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
+| Deep Power-Down, active clock-stop | §5.2.1/§8.7, §1 | **Not** implemented | [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
 | Differential vs single-ended CK (`DIFF_CK`) | §1 | Parameterized | `hb_ck_n` driven when `DIFF_CK` |
 | AC timing (tRWR, tCSHI, tCSS, tACC…) closure | §9 | **Not** provided in RTL | device/board `.sdc` — hardware work, see below |
 | CR1 bit layout, latency↔frequency map | §8.2 | Device-specific, not hard-coded | pull from W957D8NB datasheet |
