@@ -35,10 +35,9 @@ module hyperram_axi
   // ---- PHY (hyperbus_phy) -------------------------------------------------
   parameter              PHY_VARIANT       = "GENERIC",                  // GENERIC | INTEL | XILINX
   parameter bit          DIFF_CK           = 1'b1,                       // drive hb_ck_n
-  parameter int unsigned RD_PREAMBLE_SKIP  = 0,                          // SDR/INTEL PHY: read-strobe
-                                                                         // preamble rwds-rise edges to ignore
-  parameter              CK_SCHEME         = "CLK90"                     // INTEL PHY only: "CLK90" |
-                                                                         // "CLK_DLY" (issue #8)
+  parameter int unsigned RD_PREAMBLE_SKIP  = 0,                          // SDR/GENERIC/INTEL PHY:
+                                                                         // preamble rwds-rise edges to skip
+  parameter              CK_SCHEME         = "CLK90"                     // INTEL PHY only (issue #8)
 ) (
   // ---- clocking / reset ---------------------------------------------------
   input  logic                        clk,       // aclk = system + bus word clock
@@ -278,8 +277,12 @@ module hyperram_axi
     .LEN_WIDTH    (LEN_WIDTH),
     .PHY_VARIANT  (PHY_VARIANT),
     .DIFF_CK      (DIFF_CK),
+<<<<<<< HEAD
     .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP),
     .CK_SCHEME    (CK_SCHEME)
+=======
+    .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP)
+>>>>>>> issue6-generic-parity
   ) u_phy (
     .clk            (clk),
     .clk90          (clk90),

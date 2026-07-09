@@ -21,9 +21,12 @@
 //         small gray-coded elastic FIFO — the single true CDC of the system lives here (DESIGN §2),
 //       * synchronises the RWDS level into clk for the controller's CA latency-select / stall watch.
 //
-// The RWDS-domain receiver is held cleared whenever a read is not armed (phy_rd_arm low): this is the
-// designated CDC-boundary reset and is the only place an async clear appears — the synthesised
-// controller/front-end datapath remains synchronous-reset / Hyperflex-clean per DESIGN §2.
+// The RWDS-domain receiver is held cleared whenever a read is not armed (phy_rd_arm low) and on rst:
+// these async clears are confined to the CDC boundary (the RX capture + write-pointer / preamble-skip
+// pairing registers) and are the only async resets in the design — the synthesised controller/front-
+// end datapath remains synchronous-reset / Hyperflex-clean per DESIGN §2. phy_rd_arm reloads the
+// preamble-skip / byte-pairing pair ASYNCHRONOUSLY once per read burst (a second class of async use
+// beyond rst; see the RX capture blocks), which is why those registers carry explicit initializers.
 //
 // clk90 is used (TX CK centring); clk_ref is unused by the generic variant (tie-off, kept so all PHY
 // variants share one port list). Board tristate lives outside the IP (split hb_dq_o/oe/i pins).
@@ -45,7 +48,15 @@ module hyperbus_phy_generic
     // the GENERIC variant models it with a delay element so read capture is source-synchronous to RWDS
     // and therefore TOLERANT of the DQ/RWDS round-trip flight delay (unlike a fixed local-clock phase).
     // Units follow the module timescale (ns); default 2.5 ns ~= tCK/4 at 100 MHz.
-    parameter realtime     RX_STROBE_DELAY = 2.5
+    parameter realtime     RX_STROBE_DELAY = 2.5,
+    // Read-strobe PREAMBLE skip (non-frozen, defaulted 0). A real HyperRAM (Winbond W957D8NB on the
+    // AXC3000) toggles RWDS for RD_PREAMBLE_SKIP CK cycles with DQ Hi-Z (=0x00) BEFORE the first read
+    // data byte — a turn-around preamble the ideal model does not emit. Those leading RWDS rising
+    // edges would otherwise pair into PHANTOM {0x00,0x00} words and mis-align the whole read (the
+    // AXC3000 bring-up hang: STATUS never `done`). Ignore the first RD_PREAMBLE_SKIP rwds rising edges
+    // after the receiver arms, so byte pairing begins on the REAL read-data window. 0 = no preamble
+    // (spec-ideal model / all existing TBs) — the pairing then starts on the very first edge as before.
+    parameter int unsigned RD_PREAMBLE_SKIP = 0
 ) (
     input  logic                clk,       // system + bus word clock
     input  logic                clk90,     // 90-degree shifted clk; centres CK on the DQ eye
@@ -152,9 +163,13 @@ module hyperbus_phy_generic
   //  pointer 2-flop-synchronised across the boundary and presents one clk-synchronous word + valid per
   //  entry to the controller. Capture is gated by phy_rd_arm (High only across read latency + data,
   //  when RWDS is a real strobe); during CA the slave-driven RWDS latency indicator is NOT captured.
-  //  Reset of the strobe-domain write pointer is the single designated async clear (DESIGN §2).
+  //  The strobe-domain write pointer + preamble-skip/have_a pairing take the designated async clears
+  //  (rst, and per-burst !phy_rd_arm) at this CDC boundary (DESIGN §2).
   // ------------------------------------------------------------------
-  localparam int unsigned RXF_DEPTH = 8;
+  localparam int unsigned RXF_DEPTH = 32;   // elastic read FIFO (byte->word). Deepened from 8 so a full
+                                            // board read burst (16 words) plus the device read over-stream
+                                            // tail and the rwds_dly->clk gray-pointer hand-off latency
+                                            // never laps the pointer / stalls the drain.
   localparam int unsigned RXF_AW    = $clog2(RXF_DEPTH);
 
   // Eye-centring: RWDS delayed ~90 degrees (quarter bit). Behavioural; vendor variants use a primitive.
@@ -167,31 +182,70 @@ module hyperbus_phy_generic
   logic [RXF_AW:0]     wptr_bin;                  // strobe-domain binary write pointer (extra MSB)
   logic [RXF_AW:0]     rptr_bin;                  // clk-domain binary read pointer
 
-  // Byte A on the delayed-strobe RISING edge (mid byte-A eye).
-  always_ff @(posedge rwds_dly) begin
-    if (phy_rd_arm) rx_byte_a <= hb_dq_i;
+  // Leading rwds-rise edges still to be discarded as read-strobe preamble for this burst, plus the
+  // "byte A captured, awaiting its byte B" flag. BOTH need explicit SV initializers — NOT style,
+  // correctness: unlike the SDR variant (whose RX section is clocked by FREE-RUNNING clk90, so a
+  // first-activation reload miss self-corrects on the next tick), this variant's RX pairing is clocked
+  // DIRECTLY off rwds_dly with no free-running fallback, and pre_skip/have_a are reloaded
+  // ASYNCHRONOUSLY by `negedge phy_rd_arm` (see the byte-A block below). Verilator's 2-state sim can
+  // EXERCISE but not PROVE the first async-reset edge; without these initializers the first read burst
+  // after reset mis-reads even with RD_PREAMBLE_SKIP set. (DESIGN §2 documents the one CDC pattern;
+  // this is the second, per-burst async use — the initializers are its reset-safety guarantee.)
+  localparam int unsigned SKIPW = (RD_PREAMBLE_SKIP == 0) ? 1 : $clog2(RD_PREAMBLE_SKIP + 1);
+  logic [SKIPW-1:0]    pre_skip = SKIPW'(RD_PREAMBLE_SKIP);   // MUST have an initializer (reset-safe)
+  logic                have_a   = 1'b0;                       // defensive; also initialize
+
+  // Byte A on the delayed-strobe RISING edge (mid byte-A eye), with read-strobe PREAMBLE skip. This is
+  // a SECOND, NEW class of async use beyond the file's one documented CDC pattern (the `rst` write-
+  // pointer clear, DESIGN §2): `phy_rd_arm` ASYNCHRONOUSLY reloads have_a/pre_skip once per read burst
+  // (each ST_LAT->ST_READ arm), not once per power-up, so every transaction re-skips its own turn-
+  // around preamble and starts byte pairing on the real read-data window. Verilator's 2-state sim can
+  // EXERCISE but not PROVE there is no first-edge race here — which is exactly why pre_skip/have_a
+  // carry explicit initializers above (a literal SDR port without them reproducibly mis-reads the
+  // first post-reset read burst even with RD_PREAMBLE_SKIP set).
+  /* verilator lint_off SYNCASYNCNET */
+  always_ff @(posedge rwds_dly or posedge rst or negedge phy_rd_arm) begin
+    if (rst || !phy_rd_arm) begin
+      have_a <= 1'b0; pre_skip <= SKIPW'(RD_PREAMBLE_SKIP);
+    end else if (pre_skip != '0) begin
+      pre_skip <= pre_skip - 1'b1; have_a <= 1'b0;   // discard preamble edge (DQ Hi-Z here)
+    end else begin
+      rx_byte_a <= hb_dq_i; have_a <= 1'b1;
+    end
   end
+  /* verilator lint_on SYNCASYNCNET */
 
   // Byte B on the delayed-strobe FALLING edge; assemble {A,B} and push. The write pointer takes the
-  // ONE designated async clear of the system (DESIGN §2: the CDC boundary is the only place an async
-  // reset appears); `rst` is otherwise synchronous everywhere, so the intentional sync+async use of
-  // `rst` here is expected (waive SYNCASYNCNET locally).
+  // designated async clear of the CDC boundary (DESIGN §2) — now extended: it is FLUSHED to 0 not only
+  // on `rst` but also whenever the receiver is disarmed (`!phy_rd_arm`), so any words the device over-
+  // streamed past the master's burst count are discarded and cannot leak into the next burst (paired
+  // with the read-side rptr reset below). The push is gated on `have_a` so a falling edge that follows
+  // a DISCARDED (preamble) rising edge — or a stray falling edge before any byte A — cannot complete a
+  // phantom {0x00,0x00} pair. Both `rst` and `!phy_rd_arm` are async triggers here (waive SYNCASYNCNET
+  // locally; the controller/front-end datapath stays synchronous-reset per DESIGN §2).
   /* verilator lint_off SYNCASYNCNET */
-  always_ff @(negedge rwds_dly or posedge rst) begin
-    if (rst) begin
+  always_ff @(negedge rwds_dly or posedge rst or negedge phy_rd_arm) begin
+    if (rst || !phy_rd_arm) begin
       wptr_bin <= '0;
-    end else if (phy_rd_arm) begin
+    end else if (have_a) begin
       rxf_mem[wptr_bin[RXF_AW-1:0]] <= {rx_byte_a, hb_dq_i};  // {byte A (hi), byte B (lo)}
       wptr_bin                       <= wptr_bin + 1'b1;
     end
   end
   /* verilator lint_on SYNCASYNCNET */
 
-  // Gray-code the write pointer and 2-flop-synchronise it into the clk domain.
+  // Gray-code the write pointer and 2-flop-synchronise it into the clk domain. While the receiver is
+  // disarmed (phy_rd_arm Low, between/around read bursts) the write side resets wptr_bin to 0 in the
+  // rwds_dly domain; that is a MULTI-BIT gray transition (e.g. gray(20)->gray(0)) which a plain 2-flop
+  // synchroniser can mis-sample mid-flight and momentarily present a bogus wptr in the clk domain — on
+  // hardware that stray non-empty read leaks an over-streamed word into the next burst. So force the
+  // synchronised copy directly to 0 while disarmed (the source is 0 anyway): the flush is then
+  // deterministic (rxf_empty cleanly asserted) with no reliance on the gray-pointer reset surviving the
+  // CDC. Normal +1 gray sync resumes from 0 when the next read arms.
   wire  [RXF_AW:0] wptr_gray = wptr_bin ^ (wptr_bin >> 1);
   logic [RXF_AW:0] wgray_s1, wgray_s2;
   always_ff @(posedge clk) begin
-    if (rst) begin
+    if (rst || !phy_rd_arm) begin
       wgray_s1 <= '0;
       wgray_s2 <= '0;
     end else begin
@@ -210,7 +264,11 @@ module hyperbus_phy_generic
   wire [RXF_AW:0] wptr_bin_s = gray2bin(wgray_s2);
   wire            rxf_empty  = (rptr_bin == wptr_bin_s);
 
-  // Read side (clk domain): one recovered word + valid per FIFO entry.
+  // Read side (clk domain): one recovered word + valid per FIFO entry. While the receiver is disarmed
+  // (phy_rd_arm Low, between read bursts) hold the read pointer at 0 so the elastic FIFO is flushed to
+  // empty — the write side (wptr_bin) is likewise reset to 0 in the rwds_dly domain when phy_rd_arm
+  // falls. Both sides therefore start every read burst at 0, discarding any trailing over-streamed
+  // words from the previous burst (the multi-burst over-stream leak on the AXC3000).
   always_ff @(posedge clk) begin
     if (rst) begin
       rptr_bin       <= '0;
@@ -218,7 +276,9 @@ module hyperbus_phy_generic
       phy_dq_i_valid <= 1'b0;
     end else begin
       phy_dq_i_valid <= 1'b0;
-      if (!rxf_empty) begin
+      if (!phy_rd_arm) begin
+        rptr_bin <= '0;
+      end else if (!rxf_empty) begin
         phy_dq_i       <= rxf_mem[rptr_bin[RXF_AW-1:0]];
         phy_dq_i_valid <= 1'b1;
         rptr_bin       <= rptr_bin + 1'b1;
