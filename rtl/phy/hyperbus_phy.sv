@@ -92,7 +92,8 @@ module hyperbus_phy
     end else if (PHY_VARIANT == "XILINX") begin : g_xilinx
       hyperbus_phy_xilinx #(
         .DQ_WIDTH(DQ_WIDTH), .DATA_WIDTH(DATA_WIDTH), .ADDR_WIDTH(ADDR_WIDTH),
-        .LEN_WIDTH(LEN_WIDTH), .PHY_VARIANT(PHY_VARIANT), .DIFF_CK(DIFF_CK)
+        .LEN_WIDTH(LEN_WIDTH), .PHY_VARIANT(PHY_VARIANT), .DIFF_CK(DIFF_CK),
+        .RD_PREAMBLE_SKIP(RD_PREAMBLE_SKIP)
       ) u_var (
         .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
         .phy_cs_n(phy_cs_n), .phy_rst_n(phy_rst_n), .phy_ck_en(phy_ck_en),

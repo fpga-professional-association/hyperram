@@ -12,11 +12,15 @@ vendor-primitive variant for a real board.
 - Clocking/CDC rationale: [`DESIGN.md §2 / §4`](DESIGN.md).
 
 > **Status.** `hyperbus_phy_generic` is complete and simulation-validated.
-> `hyperbus_phy_altera` and `hyperbus_phy_xilinx` are **skeletons**: they present
-> the exact port list and mark each primitive site with `TODO(vendor)`, but they do
-> not simulate and are not timing-closed. Completing them, calibrating the RWDS
-> strobe, and closing static timing against a device datasheet is per-target
-> hardware work.
+> `hyperbus_phy_xilinx` is a **real 7-series datapath** (`ODDR`/`IDDR`/`IDELAYE2`/
+> `IDELAYCTRL`/`BUFIO`/`BUFR`/`OBUF`/`OBUFDS`) that **simulates via a Verilator-only
+> primitive shim** (`sim/model/xilinx_prims_sim.sv`, `tb_xilinx`) — but is **still
+> not hardware-proven or timing-closed**: the read-eye taps (`RX_STROBE_DLY_TAPS`),
+> byte-pairing polarity (`RX_PAIR_SKEW`) and preamble skip (`RD_PREAMBLE_SKIP`) are
+> bring-up knobs to sweep on real silicon. `hyperbus_phy_altera` wraps Quartus/Agilex
+> hard-IP primitives and is **not** Verilator-simulable (validated by the fitter +
+> hardware). For either, calibrating the RWDS strobe and closing static timing
+> against a device datasheet is per-target hardware work.
 
 ---
 
@@ -28,8 +32,8 @@ inside a `generate` guarded by the string parameter `PHY_VARIANT`:
 | `PHY_VARIANT` | Variant instantiated | Simulates | Purpose |
 |---|---|---|---|
 | `"GENERIC"` (default) | `hyperbus_phy_generic` | yes | simulation + inference on any FPGA |
-| `"INTEL"` / `"ALTERA"` | `hyperbus_phy_altera` | no (skeleton) | Intel/Altera board build |
-| `"XILINX"` | `hyperbus_phy_xilinx` | no (skeleton) | AMD/Xilinx board build |
+| `"INTEL"` / `"ALTERA"` | `hyperbus_phy_altera` | no (Quartus-only prims) | Intel/Altera board build |
+| `"XILINX"` | `hyperbus_phy_xilinx` | yes (via primitive shim) | AMD/Xilinx 7-series board build |
 
 All three share one port list, so switching is a single parameter change on the top
 (`hyperram_axi` / `hyperram_avalon`). You do **not** touch the controller or

@@ -98,8 +98,9 @@ tracks the real fix (the device commits a pending write on a subsequent read).
 - **Register / ID access is first-class**, routed through the same native
   interface (CR0/CR1/ID0/ID1), not a side channel.
 - **Swappable PHY** behind one frozen port list: a **generic inferrable-DDR**
-  variant (simulation + any FPGA) plus **Intel/Altera** and **AMD/Xilinx**
-  vendor-primitive skeletons for board bring-up (see *Status & scope*).
+  variant (simulation + any FPGA), an **AMD/Xilinx** 7-series DDR variant that
+  simulates via a Verilator-only primitive shim (still not hardware-proven), and an
+  **Intel/Altera** DDIO variant for board bring-up (see *Status & scope*).
 - **Hyperflex-friendly RTL:** single clock domain in the controller/front-ends,
   synchronous active-high reset for architectural state, no async reset and no
   datapath clock gating. The one true CDC (RWDS → `clk`) is isolated inside the PHY.
@@ -136,7 +137,7 @@ architecture in [`docs/DESIGN.md`](docs/DESIGN.md)):
 | `hyperbus_phy` | PHY wrapper; selects one variant by `PHY_VARIANT` | — | — |
 | `hyperbus_phy_generic` | inferrable DDR I/O + RWDS→clk CDC | **no** | **yes** |
 | `hyperbus_phy_altera` | Intel/Altera DDR-IO variant | yes | skeleton |
-| `hyperbus_phy_xilinx` | AMD/Xilinx ODDR/IDDR variant | yes | skeleton |
+| `hyperbus_phy_xilinx` | AMD/Xilinx 7-series ODDR/IDDR variant | yes | yes (via primitive shim) |
 | `hyperbus_avalon` | Avalon-MM slave → native (thin) | no | yes |
 | `hyperbus_axi` | AXI4 slave → native (thin) | no | yes |
 | `hyperram_axi` / `hyperram_avalon` | tops = front-end + ctrl + phy | per PHY variant | yes (generic) |
@@ -281,8 +282,10 @@ almost entirely a **PHY + board** job:
    - `"SDR"` (`hyperbus_phy_sdr`) — **portable, ONE clock in the I/O periphery**: runs the byte engine at
      2×CK and derives CK-centring from that clock's negedge. This is the variant proven to **~342 MB/s**
      on the AXC3000. Best first target on any device — no vendor DDR primitives, no per-bit calibration.
-   - `"INTEL"` / `"XILINX"` (`hyperbus_phy_altera` / `_xilinx`) — hard DDR-I/O skeletons for the highest
-     speed (I/O at 1×CK); fill in the vendor DDIO/IDELAY primitives (see `docs/PHY_PORTING.md`).
+   - `"XILINX"` (`hyperbus_phy_xilinx`) — real 7-series ODDR/IDDR/IDELAYE2 DDR-I/O (I/O at 1×CK);
+     **simulates via a Verilator-only primitive shim, still not hardware-proven or timing-closed**.
+   - `"INTEL"` (`hyperbus_phy_altera`) — hard DDR-I/O for the highest speed (I/O at 1×CK); vendor
+     DDIO/IDELAY primitives (see `docs/PHY_PORTING.md`).
 2. **Clock plan** (one PLL, phase-related):
    - *SDR PHY* — `clk` = HyperBus CK word rate; `clk90` is **repurposed** as the 2×CK byte clock (0°). Only
      one clock reaches the I/O. Scale both together (the `CK_MHZ` knob) to trade clock for bandwidth.
@@ -388,13 +391,16 @@ on-chip logic analyzer (`fpga/axc3000/hyperbus_capture.sv`); details in `fpga/ax
 - **The generic PHY is simulation-oriented.** It uses plain clocked registers and
   behavioral DDR muxes (and a modeled RWDS strobe delay). It will *infer* on any
   FPGA but is not tuned for a specific device's I/O timing.
-- **Vendor PHY variants are skeletons.** `hyperbus_phy_altera` and
-  `hyperbus_phy_xilinx` present the frozen port list and mark every spot that must
-  become a hard-IO primitive (`ODDR`/`IDDR`, `ALTDDIO`/DDIO, IDELAY/DPA, input
-  FIFO) with `TODO(vendor)`. They are **not** expected to simulate and are **not**
-  timing-closed. Real board bring-up — primitive instantiation, RWDS strobe
-  delay/DPA calibration, and static timing closure against a device datasheet — is
-  per-target hardware work. See [`docs/PHY_PORTING.md`](docs/PHY_PORTING.md).
+- **The AMD/Xilinx PHY simulates via a primitive shim; the Intel/Altera PHY does not.**
+  `hyperbus_phy_xilinx` is a real 7-series datapath (`ODDR`/`IDDR`/`IDELAYE2`/`IDELAYCTRL`/
+  `BUFIO`/`BUFR`/`OBUF`/`OBUFDS`) that **simulates end-to-end under `verilator --binary --timing`**
+  through a Verilator-only shim (`sim/model/xilinx_prims_sim.sv`, `tb_xilinx`) — but is **still not
+  hardware-proven or timing-closed**: the read-eye taps (`RX_STROBE_DLY_TAPS`), byte-pairing polarity
+  (`RX_PAIR_SKEW`) and preamble skip (`RD_PREAMBLE_SKIP`) are bring-up knobs to sweep on real silicon.
+  `hyperbus_phy_altera` uses Quartus/Agilex hard-IP primitives and is therefore **not** expected to
+  simulate under Verilator (validated by the fitter + on-hardware bring-up). Neither is a drop-in for a
+  new board without pin/XDC constraints and static timing closure. See
+  [`docs/PHY_PORTING.md`](docs/PHY_PORTING.md).
 - **Hardware measurement** is the AXC3000 SDR-PHY result in **Performance** above: single-burst
   read/write clean and integrity-verified from 50 up to **175 MHz CK (~342/337 MB/s)**, and multi-burst
   *reads* validated. Open on hardware: split multi-burst *writes* (issue #1) and the 200 MHz DDIO PHY
@@ -415,11 +421,12 @@ rtl/
   phy/hyperbus_phy.sv       PHY wrapper (selects variant)
   phy/hyperbus_phy_generic.sv   inferrable DDR + RWDS→clk CDC (sim + any FPGA)
   phy/hyperbus_phy_altera.sv    Intel/Altera DDR-IO skeleton
-  phy/hyperbus_phy_xilinx.sv    AMD/Xilinx ODDR/IDDR skeleton
+  phy/hyperbus_phy_xilinx.sv    AMD/Xilinx 7-series ODDR/IDDR DDR-I/O (simulates via primitive shim)
 sim/
-  model/hyperram_model.sv   behavioral golden device
-  tb_avalon / tb_axi / tb_fixed2x / tb_timeout   self-checking testbenches
-  run.sh                    build + run all TBs (Verilator)
+  model/hyperram_model.sv       behavioral golden device
+  model/xilinx_prims_sim.sv     Verilator-only 7-series primitive shim (ODDR/IDDR/IDELAYE2/… ; tb_xilinx)
+  tb_avalon / tb_axi / tb_fixed2x / tb_timeout / tb_xilinx …   self-checking testbenches
+  run.sh                        build + run all TBs (Verilator)
 docs/
   SPEC_DIGEST.md  DESIGN.md  INTERFACES.md  INTEGRATION.md  PHY_PORTING.md
 ```
