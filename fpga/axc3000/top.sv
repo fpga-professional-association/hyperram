@@ -158,7 +158,7 @@ module top (
     if (sys_rst) hb_cnt <= '0;
     else         hb_cnt <= hb_cnt + 1'b1;
   end
-  wire heartbeat = hb_cnt[23];   // ~3 Hz medium blink (compile #4: distinct from #3's slow 0.75 Hz)
+  wire heartbeat = hb_cnt[25];   // SPEED build: ~1.5 Hz at 100 MHz clk (blink rate scales with CK => visible speed marker)
 
   assign LED1 = ~led_done_q;                 // active-low: lit when done
   assign RLED = ~led_error_q;                // active-low: lit when error

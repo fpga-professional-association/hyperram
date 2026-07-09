@@ -22,6 +22,7 @@ set BURSTW    0            ;# HyperBus burst length (words); 0 => leave at bitst
 if {$argc >= 1} { set LEN_WORDS [lindex $argv 0] }
 if {$argc >= 2} { set BASE_ADDR [lindex $argv 1] }
 if {$argc >= 3} { set BURSTW    [lindex $argv 2] }
+if {$argc >= 4} { set F_CLK [expr {double([lindex $argv 3]) * 1.0e6}] }   ;# arg 4 = clk (word) freq in MHz
 
 # CSR byte offsets
 set CTRL   0x00

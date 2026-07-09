@@ -41,14 +41,20 @@ set_instance_parameter_value clk_in NUM_CLOCK_OUTPUTS   {1}
 # Both outputs are 0 deg: there is NO second PLL phase into the I/O periphery (the SDR PHY derives
 # the CK-centring quarter-period shift from clk2x's own negedge). This is the 24403/24404 fix.
 # ===========================================================================
+# SPEED-RAMP knob: CK_MHZ = hb_ck target (= clk word clock = outclk0). outclk1 (byte clock) = 2*CK_MHZ.
+# hb_ck = clk2x/2 = CK_MHZ.  Peak throughput ~= 2 bytes * CK_MHZ MB/s per direction.
+#   50 -> ~100 MB/s (bring-up) | 100 -> ~200 | 150 -> ~300 | 200 -> ~400 (W957D8NB device ceiling).
+set CK_MHZ   100.0
+set BYTE_MHZ [expr {2.0 * $CK_MHZ}]
+
 add_instance iopll altera_iopll
 set_instance_parameter_value iopll gui_reference_clock_frequency {25.0}
 set_instance_parameter_value iopll gui_operation_mode            {direct}
 set_instance_parameter_value iopll gui_use_locked                {1}
 set_instance_parameter_value iopll gui_number_of_clocks          {2}
-set_instance_parameter_value iopll gui_output_clock_frequency0   {50.0}
+set_instance_parameter_value iopll gui_output_clock_frequency0   $CK_MHZ
 set_instance_parameter_value iopll gui_phase_shift_deg0          {0.0}
-set_instance_parameter_value iopll gui_output_clock_frequency1   {100.0}
+set_instance_parameter_value iopll gui_output_clock_frequency1   $BYTE_MHZ
 set_instance_parameter_value iopll gui_phase_shift_deg1          {0.0}
 
 # Clock bridges: an IOPLL output clock that is BOTH exported AND fanned to internal sinks loses its
@@ -56,10 +62,10 @@ set_instance_parameter_value iopll gui_phase_shift_deg1          {0.0}
 # taps iopll.outclkN directly, while a dedicated clock bridge per output carries the SAME clock to
 # the top-level export. Mirrors the reference clock_system.qsys idiom (and the rst_out bridge below).
 add_instance clkbr0 altera_clock_bridge
-set_instance_parameter_value clkbr0 EXPLICIT_CLOCK_RATE {50000000.0}
+set_instance_parameter_value clkbr0 EXPLICIT_CLOCK_RATE [expr {$CK_MHZ   * 1.0e6}]
 set_instance_parameter_value clkbr0 NUM_CLOCK_OUTPUTS   {1}
 add_instance clkbr1 altera_clock_bridge
-set_instance_parameter_value clkbr1 EXPLICIT_CLOCK_RATE {100000000.0}
+set_instance_parameter_value clkbr1 EXPLICIT_CLOCK_RATE [expr {$BYTE_MHZ * 1.0e6}]
 set_instance_parameter_value clkbr1 NUM_CLOCK_OUTPUTS   {1}
 
 # ===========================================================================
