@@ -81,7 +81,7 @@ tracks the real fix (the device commits a pending write on a subsequent read).
 - **Fixed and variable initial latency.** The controller always decodes the
   slave-driven RWDS level during CA and doubles the latency count when the device
   requests 2× — even in fixed-latency mode (spec §3.2 / §5.2.4). Verified by
-  `tb_fixed2x`.
+  `tb_fixed2x` (constant 2×) and `tb_varlat` (device alternating 1×/2× per transaction).
 - **RWDS-gated read completion.** Read words are counted on the source-synchronous
   RWDS strobe, not a free-running clock, so mid-burst row/page latency gaps are
   absorbed transparently (spec §3.2 / §7).
@@ -179,7 +179,9 @@ order for any boundary (WRAP2/4…); **FIXED** → N single-word segments. A nar
 ### HyperBus device pins (both tops, from `hyperbus_phy`)
 
 `hb_ck, hb_ck_n, hb_cs_n, hb_rst_n, hb_dq_o[DQ_WIDTH-1:0], hb_dq_oe,
-hb_dq_i[DQ_WIDTH-1:0], hb_rwds_o, hb_rwds_oe, hb_rwds_i`, plus status `init_done`.
+hb_dq_i[DQ_WIDTH-1:0], hb_rwds_o, hb_rwds_oe, hb_rwds_i`, plus status `init_done` (and,
+on `hyperram_avalon`, an `err_underrun` write-underrun strobe — the AXI top folds the
+same error into `BRESP`=SLVERR instead).
 Pins are **split** (separate `_o`/`_oe`/`_i`); the board wrapper adds the tristate
 buffers (`IOBUF`) — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md). Clocking:
 `clk` (bus word rate), `clk90` (CK centering), `clk_ref` (vendor PHY delay ref;
@@ -249,6 +251,12 @@ ALL TESTBENCHES PASSED
 | `tb_axi` | AXI4 INCR single + burst, WRAP burst read, CR0 write/read-back, ID0 read, B/R = OKAY |
 | `tb_fixed2x` | fixed-latency device that drives RWDS High during CA → controller must use 2× latency for reads *and* writes |
 | `tb_timeout` | mid-burst RWDS stall (40 clocks) → `err_timeout`, clean `rd_last`, SLVERR, no deadlock |
+| `tb_chop` | tCSM burst chopping (`MAX_BURST_WORDS`=4): linear bursts longer than the segment → transparent multi-segment re-open, every word checked |
+| `tb_wrap` | native wrapped CA (`cmd_wrap=1`): legacy + hybrid bursts across all four CR0[1:0] wrap sizes, read + write, vs the device `next_addr` order |
+| `tb_masked` | byte-masked writes (every strobe combo + mixed-strobe burst, read-modify-merge) and the write-underrun path (`err_underrun`, masked-both) |
+| `tb_varlat` | true **variable** initial latency: device alternates 1×/2× per transaction (`REFRESH_EVERY`); byte-exact across the mix (per-transaction `rwds_hi` re-latch) |
+| `tb_reg` | CR1 write/read + ID1 read; non-zero `POR_DELAY_CYCLES` dwell; runtime-reset model register restore; both `DIFF_CK` settings pin-checked |
+| `tb_axi_wrap` | AXI WRAP **write** decomposition (seg0+seg1) and the AR/AW round-robin arbiter (both channels valid at once, grant order verified) |
 
 Each testbench wires the DUT top to the golden `hyperram_model` and checks
 byte-exact read-back; any mismatch raises `$fatal` (non-zero exit).
@@ -310,20 +318,20 @@ a claim of silicon timing closure (see *Status & scope*).
 | 48-bit CA encoding (R/W#, AS, burst type, word address) | §2/§3 | Implemented, simulated | `hyperbus_pkg::hb_pack_ca`; `tb_axi`/`tb_avalon` |
 | DDR data phase, byte A / byte B ordering, big-endian registers | §4 | Implemented, simulated | `hyperbus_phy_generic`; all TBs |
 | Initial latency code table (3–16 clks, codes 1110/1111 = 3/4) | §3 | Implemented | `hb_latency_code_to_clocks` / `_to_latency_code` |
-| Fixed latency + RWDS-during-CA 2× select | §3.2/§5.2.4 | Implemented; only the *constant* fixed-2× case simulated | `hyperbus_ctrl`; `tb_fixed2x`. True **variable** latency (alternating 1×/2×) not simulated — [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
+| Fixed latency + RWDS-during-CA 2× select | §3.2/§5.2.4 | Implemented, simulated | `hyperbus_ctrl`; `tb_fixed2x` (constant fixed-2×) + `tb_varlat` (true **variable**, alternating 1×/2× via `REFRESH_EVERY`; asserts per-transaction re-latch of `rwds_hi`) |
 | RWDS-gated read completion; row/page latency gaps absorbed | §3.2/§7 | Implemented, simulated | `hyperbus_ctrl`; `hyperram_model` row penalty |
 | Read RWDS-stall ≥ 32 clks → abort + error | §3.2/§4 | Implemented, simulated | `err_timeout`; `tb_timeout` |
-| Byte-masked writes (RWDS = ~strobe, High = mask) | §4 | Implemented; **not** simulated (all TBs write full-word) | `hyperbus_ctrl:295` — [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
+| Byte-masked writes (RWDS = ~strobe, High = mask) | §4 | Implemented, simulated | `hyperbus_ctrl:295`; `tb_masked` (every strobe combo + mixed-strobe burst; verifies read-modify-merge keeps masked bytes) |
 | Zero-latency register/config writes (no mask, full word) | §5/§6 | Implemented, simulated | `hyperbus_ctrl`; `tb_axi` CR0 write |
 | Linear bursts (CA[45]=1) | §7 | Implemented, simulated | all TBs |
-| Wrapped/hybrid bursts (CA[45]=0) | §7 | Implemented; **not** simulated — front-ends tie `cmd_wrap=0`; `tb_axi` "WRAP" is AXI-wrap decomposed to *linear* native segments | ctrl wrap path; [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
-| Wrap boundary from CR0[1:0] (128/64/16/32 B) | §7 | Table implemented; **not** exercised (no wrapped CA; only 32 B configured) | `hb_wrap_words` — [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
-| Burst chopping to tCSM (MAX_BURST_WORDS) | §6 | Implemented; **not** simulated (all TBs set `MAX_BURST_WORDS=0` → chop/re-open FSM never runs) | `hyperbus_ctrl` — [#4](https://github.com/fpga-professional-association/hyperram/issues/4) |
+| Wrapped/hybrid bursts (CA[45]=0) | §7 | Implemented, simulated | `tb_wrap` drives a **native** wrapped CA (`cmd_wrap=1`): legacy + hybrid, read + write, checked against the device's `next_addr` order. (Front-ends still tie `cmd_wrap=0`; `tb_axi` "WRAP" = AXI-wrap → linear segments.) |
+| Wrap boundary from CR0[1:0] (128/64/16/32 B) | §7 | Implemented, simulated | `hb_wrap_words`; `tb_wrap` exercises **all four** sizes via CR0[1:0] (00/01/10/11) |
+| Burst chopping to tCSM (MAX_BURST_WORDS) | §6 | Implemented, simulated | `hyperbus_ctrl`; `tb_chop` (`MAX_BURST_WORDS`=4, bursts > it → multi-segment chop/re-open, every word checked) |
 | CR0 / ID0 register access | §5/§8 | Implemented, simulated | `tb_axi` CR0 rw + ID0 rd; `tb_avalon` |
-| CR1 / ID1 register access | §8.2/§8.3 | Decoded in model; **not** simulated (no CR1/ID1 access in any TB). CR1 also **not** programmed at init | [#4](https://github.com/fpga-professional-association/hyperram/issues/4), [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
-| POR init + CR0 programming, `init_done` gating | §8/§9 | Implemented, simulated (CR0 only) | `hyperbus_ctrl` init; all TBs wait `init_done`. CR1 init + tRP/tRPH/tRH/tVCS timing not done — [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
+| CR1 / ID1 register access | §8.2/§8.3 | Implemented, simulated (access) | `tb_reg` CR1 write/read-back + ID1 read (distinct reset image; write-ignored). CR1 still **not** programmed at init — [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
+| POR init + CR0 programming, `init_done` gating | §8/§9 | Implemented, simulated | `hyperbus_ctrl` init; all TBs wait `init_done`; `tb_reg` exercises non-zero `POR_DELAY_CYCLES` dwell + runtime-reset register restore. CR1 init + tRP/tRPH/tRH/tVCS timing not done — [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
 | Deep Power-Down, active clock-stop | §5.2.1/§8.7, §1 | **Not** implemented | [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
-| Differential vs single-ended CK (`DIFF_CK`) | §1 | Parameterized | `hb_ck_n` driven when `DIFF_CK` |
+| Differential vs single-ended CK (`DIFF_CK`) | §1 | Implemented, simulated | `hb_ck_n`; `tb_reg` pin-checks both settings (`DIFF_CK=1` complementary toggle vs `DIFF_CK=0` held High) |
 | AC timing (tRWR, tCSHI, tCSS, tACC…) closure | §9 | **Not** provided in RTL | device/board `.sdc` — hardware work, see below |
 | CR1 bit layout, latency↔frequency map | §8.2 | Device-specific, not hard-coded | pull from W957D8NB datasheet |
 
