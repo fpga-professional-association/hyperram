@@ -18,8 +18,10 @@ set F_CLK      50.0e6       ;# IOPLL clk (outclk0) — the on-chip word clock, M
 set LEN_WORDS  4096         ;# words per phase (override: arg 1)
 set BASE_ADDR  0x00000000   ;# starting WORD address, MSB=0 => memory space (override: arg 2)
 
+set BURSTW    0            ;# HyperBus burst length (words); 0 => leave at bitstream default (override: arg 3)
 if {$argc >= 1} { set LEN_WORDS [lindex $argv 0] }
 if {$argc >= 2} { set BASE_ADDR [lindex $argv 1] }
+if {$argc >= 3} { set BURSTW    [lindex $argv 2] }
 
 # CSR byte offsets
 set CTRL   0x00
@@ -31,6 +33,10 @@ set RDCYC  0x10
 set ERRCNT 0x14
 set BYTES  0x18
 set MAGIC  0x1C
+set ERRADDR 0x20   ;# first-mismatch WORD address
+set ERRGOT  0x24   ;# first-mismatch value returned
+set ERREXP  0x28   ;# first-mismatch value expected
+set BURSTWR 0x2C   ;# R/W HyperBus burst length (words)
 
 # ---- helpers -------------------------------------------------------------
 proc rd32 {m a} {
@@ -65,6 +71,9 @@ if {$bpw == 0} { set bpw 2 }   ;# DATA_BYTES_PER_WORD, constant 2
 puts [format "Programming LEN=%d words, BASE_ADDR=0x%08X ..." $LEN_WORDS $BASE_ADDR]
 master_write_32 $m $LEN  $LEN_WORDS
 master_write_32 $m $BASE $BASE_ADDR
+if {$BURSTW != 0} { master_write_32 $m $BURSTWR $BURSTW }
+set burstw_now [rd32 $m $BURSTWR]
+puts [format "BURST_WORDS   = %d (HyperBus burst length)" $burstw_now]
 
 # ---- pulse CTRL.start (self-clearing strobe) -----------------------------
 master_write_32 $m $CTRL 0x1
@@ -107,7 +116,12 @@ puts [format "ERR_COUNT     = %d" $err_count]
 if {$err_count == 0 && (($status>>2)&1) == 0} {
     puts "RESULT        = PASS (data integrity OK)"
 } else {
-    puts "RESULT        = FAIL (read mismatches — check PHY read-eye calibration, see PHY_PORTING.md)"
+    set eaddr [rd32 $m $ERRADDR]
+    set egot  [rd32 $m $ERRGOT]
+    set eexp  [rd32 $m $ERREXP]
+    puts [format "FIRST ERROR   = word\[0x%08X\]  got=0x%04X  exp=0x%04X  (word %d in burst of 16)" \
+            $eaddr [expr {$egot & 0xffff}] [expr {$eexp & 0xffff}] [expr {$eaddr % 16}]]
+    puts "RESULT        = FAIL (read mismatches — see FIRST ERROR above)"
 }
 puts "---------------------------------------------------------------"
 

@@ -94,11 +94,11 @@ module top (
   //   waitrequest low. The JTAG-Avalon master is byte-addressed, pipelined (expects readdatavalid),
   //   and single-outstanding, so a combinational readdata/waitrequest mux on the decode bit is safe.
   // =========================================================================
-  localparam int CSR_AW = 3;
+  localparam int CSR_AW = 4;   // 16 bw_test regs (0x00..0x3C): STATUS/LEN/BASE/cycles/ERR + first-err diag
 
   wire              sel_cap        = m_address[8];    // 0x100 window = capture CSR
 
-  // hyperram_bw_test CSR: 8 registers (0x00..0x1C) => 3 word-address bits = m_address[4:2]
+  // hyperram_bw_test CSR: 16 registers (0x00..0x3C) => 4 word-address bits = m_address[5:2]
   wire [CSR_AW-1:0] csr_address    = m_address[CSR_AW+1:2];
   wire              csr_read       = m_read  & ~sel_cap;
   wire              csr_write      = m_write & ~sel_cap;
@@ -150,9 +150,19 @@ module top (
     end
   end
 
-  assign LED1 = ~led_done_q;    // active-low: lit when done
-  assign RLED = ~led_error_q;   // active-low: lit when error
-  assign GLED = ~pll_locked;    // active-low: lit when PLL locked
+  // Heartbeat blink so a freshly-flashed bitstream is visually obvious on the board (this build:
+  // GLED BLINKS ~1.5 Hz while the PLL is locked, instead of the previous steady-on). Bump the toggle
+  // bit / LED on each new build to tell successive flashes apart.
+  logic [25:0] hb_cnt;
+  always_ff @(posedge clk) begin
+    if (sys_rst) hb_cnt <= '0;
+    else         hb_cnt <= hb_cnt + 1'b1;
+  end
+  wire heartbeat = hb_cnt[23];   // ~3 Hz medium blink (compile #4: distinct from #3's slow 0.75 Hz)
+
+  assign LED1 = ~led_done_q;                 // active-low: lit when done
+  assign RLED = ~led_error_q;                // active-low: lit when error
+  assign GLED = ~(pll_locked & heartbeat);   // active-low: BLINKS ~1.5 Hz while PLL locked (new build marker)
 
   // =========================================================================
   // Bandwidth harness: bw_test (CSR + Avalon master) -> hyperram_avalon (Agilex PHY) -> split pins
@@ -188,7 +198,8 @@ module top (
     .DATA_WIDTH     (16),
     .ADDR_WIDTH     (32),
     .LEN_WIDTH      (16),
-    .BURST_WORDS    (16),              // hyperram_bw_top default (HB_BURST_WORDS_DEFAULT)
+    .BURST_WORDS    (64),              // EXPERIMENT: larger Avalon burst — writes LEN<=64 as ONE HyperBus
+                                       // burst (no write->write boundary) to confirm the boundary drop
     .CSR_ADDR_WIDTH (CSR_AW),
     .VERSION_MAGIC  (32'h4842_5754)    // "HBWT"
   ) u_bw (

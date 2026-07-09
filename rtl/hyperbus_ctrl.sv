@@ -120,7 +120,7 @@ module hyperbus_ctrl
   // a stuck receiver can never hang the drain.
   localparam int unsigned DRAIN_QUIET_CYCLES = 4;                  // consecutive quiet cycles => drained
   localparam int unsigned DRAIN_MAX_CYCLES   = 128;               // safety bound on the drain wait (cycles)
-  localparam int unsigned RD_FIFO_DEPTH    = 32;                   // read holding buffer (rd_ready slack).
+  localparam int unsigned RD_FIFO_DEPTH    = 128;                  // read holding buffer (rd_ready slack).
                                                                     // Must exceed the largest single read
                                                                     // segment (Avalon burstcount) + the SDR
                                                                     // PHY read-pipeline depth so the final,
