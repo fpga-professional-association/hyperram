@@ -2,31 +2,43 @@
 //
 // The LOCAL1X claim: both-edge fabric sampling on a phase-shifted 1x clock + RWDS edge-detect
 // pairing recovers the read byte stream for ANY flight-delay phase (the property the SDR PHY's
-// 2x scheme demonstrated on silicon). This TB instantiates hyperbus_gpio_io (with the behavioral
-// atom stubs from sim/model/gpio_io_sim_stubs.sv), drives a synthetic device read burst — optional
-// preamble cycle, N data words, over-stream stragglers — onto hb_dq/hb_rwds with a swept launch
-// phase PHI in [0, T), and checks the recovered words for every phase step.
+// 2x scheme demonstrated on silicon). The reusable local1x_harness below instantiates
+// hyperbus_gpio_io (with the behavioral atom stubs from sim/model/gpio_io_sim_stubs.sv), drives a
+// synthetic device read burst — optional preamble cycle, N data words, over-stream stragglers —
+// onto hb_dq/hb_rwds with a swept launch phase PHI in [0, T), and checks the recovered words for
+// every phase step. The controller re-arms per burst; the disarm between phases must flush the
+// over-stream words so the next burst starts clean.
+//
+// tb_local1x drives the harness in TWO configurations from a single run:
+//   * h_hostile : ARM_DELAY_CYCLES=16, HOSTILE window (latency indicator + float-coupling RWDS
+//                 runts) — the 200 MHz silicon hazard the arm-delay must blind.
+//   * h_benign  : ARM_DELAY_CYCLES=0  (arm immediately), benign window (no float runts) — the
+//                 parameter-sweep sanity check that the pairing + arm/disarm path is correct even
+//                 with zero blind delay.
 //
 // Runs under: verilator --binary --timing (5.020).
 
 `timescale 1ns/1ps
-module tb_local1x;
 
-  localparam int unsigned DQW      = 8;
-  localparam realtime     T_CK     = 5.0;   // 200 MHz
-  localparam int unsigned N_WORDS  = 16;
-  localparam int unsigned N_OVER   = 5;     // over-stream words after the master count
-  localparam int unsigned PREAMBLE = 1;     // device preamble CK cycles
-  localparam int unsigned N_PHASES = 20;    // PHI sweep steps across one CK period
-
-  logic clk = 0, clk_smp, rst = 1;
-  always #(T_CK/2.0) clk = ~clk;
-  // +90 deg sampling clock, same frequency
-  initial begin
-    clk_smp = 0;
-    #(T_CK/4.0);
-    forever #(T_CK/2.0) clk_smp = ~clk_smp;
-  end
+// ------------------------------------------------------------------------------------------------
+//  Reusable phase-sweep harness.
+// ------------------------------------------------------------------------------------------------
+module local1x_harness #(
+    parameter int unsigned DQW       = 8,
+    parameter realtime     T_CK      = 5.0,    // 200 MHz
+    parameter int unsigned N_WORDS   = 16,
+    parameter int unsigned N_OVER    = 5,      // over-stream words after the master count
+    parameter int unsigned PREAMBLE  = 1,      // device preamble CK cycles
+    parameter int unsigned N_PHASES  = 20,     // PHI sweep steps across one CK period
+    parameter int unsigned ARM_DELAY = 16,     // hyperbus_gpio_io ARM_DELAY_CYCLES
+    parameter bit          HOSTILE   = 1'b1    // 1 = latency indicator + float runts; 0 = benign
+) (
+    input  logic        clk,
+    input  logic        clk_smp,
+    input  logic        rst,
+    output int unsigned fails,
+    output logic        done
+);
 
   // DUT ctrl-side
   logic        rd_arm;
@@ -40,14 +52,15 @@ module tb_local1x;
   logic           dev_dq_en;
   logic           dev_rwds;
   logic           dev_rwds_en;
-  assign hb_dq   = dev_dq_en   ? dev_dq   : 8'hzz;
+  assign hb_dq   = dev_dq_en   ? dev_dq   : {DQW{1'bz}};
   assign hb_rwds = dev_rwds_en ? dev_rwds : 1'bz;
 
   hyperbus_gpio_io #(
     .DQ_WIDTH         (DQW),
     .RD_PREAMBLE_SKIP (PREAMBLE),
     .TX_B_DLY         (1'b1),
-    .CK_DIN_HI        (1'b1)
+    .CK_DIN_HI        (1'b1),
+    .ARM_DELAY_CYCLES (ARM_DELAY)
   ) dut (
     .clk            (clk),
     .clk_smp        (clk_smp),
@@ -79,42 +92,68 @@ module tb_local1x;
 
   // Drive one device read burst launched at absolute phase offset phi (ns) after a clk edge.
   task automatic drive_burst(input realtime phi);
-    dev_dq_en   = 1'b0;
-    dev_rwds_en = 1'b0;
-    dev_rwds    = 1'b0;
-    @(posedge clk); #phi;
-    // latency indicator: device drives RWDS HIGH for a few CK, then releases
-    dev_rwds_en = 1'b1;
-    dev_rwds    = 1'b1;
-    #(4*T_CK);
-    dev_rwds_en = 1'b0;   // release -> float window
-    // float window with CK-coupling runts on RWDS and junk on DQ (the 200 MHz silicon hazard)
-    dev_dq_en = 1'b1;
-    dev_dq    = 8'haa;
-    repeat (10) begin
-      dev_rwds_en = 1'b1; dev_rwds = 1'b1; #(T_CK/2.0);
-      dev_rwds    = 1'b0; #(T_CK/2.0);
+    if (HOSTILE) begin
+      // -------- hostile: latency indicator + float window with CK-coupling runts --------
+      dev_dq_en   = 1'b0;
       dev_rwds_en = 1'b0;
+      dev_rwds    = 1'b0;
+      @(posedge clk); #phi;
+      // latency indicator: device drives RWDS HIGH for a few CK, then releases
+      dev_rwds_en = 1'b1;
+      dev_rwds    = 1'b1;
+      #(4*T_CK);
+      dev_rwds_en = 1'b0;   // release -> float window
+      // float window with CK-coupling runts on RWDS and junk on DQ (the 200 MHz silicon hazard)
+      dev_dq_en = 1'b1;
+      dev_dq    = 8'haa;
+      repeat (10) begin
+        dev_rwds_en = 1'b1; dev_rwds = 1'b1; #(T_CK/2.0);
+        dev_rwds    = 1'b0; #(T_CK/2.0);
+        dev_rwds_en = 1'b0;
+      end
+      dev_dq_en = 1'b0;
+      #(2*T_CK);
+      // preamble: RWDS toggles, DQ driven 0 (device turnaround)
+      dev_rwds_en = 1'b1;
+      dev_dq_en   = 1'b1;
+      dev_dq      = 8'h00;
+      repeat (PREAMBLE) begin
+        dev_rwds = 1'b1; #(T_CK/2.0);
+        dev_rwds = 1'b0; #(T_CK/2.0);
+      end
+      // data words + over-stream, byte A during RWDS high, byte B during low
+      for (int unsigned k = 0; k < N_WORDS + N_OVER; k++) begin
+        logic [15:0] w;
+        w        = pat(k);
+        dev_dq   = w[15:8];  dev_rwds = 1'b1; #(T_CK/2.0);
+        dev_dq   = w[7:0];   dev_rwds = 1'b0; #(T_CK/2.0);
+      end
+      dev_rwds_en = 1'b0;
+      dev_dq_en   = 1'b0;
+    end else begin
+      // -------- benign: clean window, no float runts, receiver arms immediately --------
+      // dev_*_en are held asserted (see initial) so the bus is always driven — with ARM_DELAY=0
+      // the receiver arms ~1 CK in and must never sample a floating strobe.
+      dev_rwds = 1'b0;
+      dev_dq   = 8'h00;
+      @(posedge clk); #phi;
+      #(2*T_CK);            // brief driven-idle turnaround; the (1 CK) arm delay elapses here
+      // preamble: RWDS toggles, DQ driven 0 (device turnaround)
+      dev_dq = 8'h00;
+      repeat (PREAMBLE) begin
+        dev_rwds = 1'b1; #(T_CK/2.0);
+        dev_rwds = 1'b0; #(T_CK/2.0);
+      end
+      // data words + over-stream, byte A during RWDS high, byte B during low
+      for (int unsigned k = 0; k < N_WORDS + N_OVER; k++) begin
+        logic [15:0] w;
+        w        = pat(k);
+        dev_dq   = w[15:8];  dev_rwds = 1'b1; #(T_CK/2.0);
+        dev_dq   = w[7:0];   dev_rwds = 1'b0; #(T_CK/2.0);
+      end
+      dev_rwds = 1'b0;      // back to driven idle
+      dev_dq   = 8'h00;
     end
-    dev_dq_en = 1'b0;
-    #(2*T_CK);
-    // preamble: RWDS toggles, DQ driven 0 (device turnaround)
-    dev_rwds_en = 1'b1;
-    dev_dq_en   = 1'b1;
-    dev_dq      = 8'h00;
-    repeat (PREAMBLE) begin
-      dev_rwds = 1'b1; #(T_CK/2.0);
-      dev_rwds = 1'b0; #(T_CK/2.0);
-    end
-    // data words + over-stream, byte A during RWDS high, byte B during low
-    for (int unsigned k = 0; k < N_WORDS + N_OVER; k++) begin
-      logic [15:0] w;
-      w        = pat(k);
-      dev_dq   = w[15:8];  dev_rwds = 1'b1; #(T_CK/2.0);
-      dev_dq   = w[7:0];   dev_rwds = 1'b0; #(T_CK/2.0);
-    end
-    dev_rwds_en = 1'b0;
-    dev_dq_en   = 1'b0;
   endtask
 
   int unsigned got_cnt;
@@ -124,48 +163,39 @@ module tb_local1x;
     got_cnt     += 1;
   end
 
-  int unsigned fails = 0;
-  int unsigned vcount;
-  always @(posedge clk) if (dq_i_valid) vcount++;
   initial begin
-    forever begin
-      @(posedge dut.rd_arm_eff);
-      $display("[%0t] rd_arm_eff ROSE (vcount=%0d)", $time, vcount);
-    end
-  end
-
-  initial begin
-    rd_arm = 1'b0;
-    repeat (8) @(posedge clk);
-    rst = 1'b0;
+    fails       = 0;
+    done        = 1'b0;
+    rd_arm      = 1'b0;
+    // hostile drives the bus only during a burst (float window is part of the hazard); benign
+    // keeps the bus driven at all times so the immediate arm never samples a floating strobe.
+    dev_dq_en   = ~HOSTILE;
+    dev_rwds_en = ~HOSTILE;
+    dev_dq      = '0;
+    dev_rwds    = 1'b0;
+    @(negedge rst);
     repeat (4) @(posedge clk);
 
     for (int unsigned p = 0; p < N_PHASES; p++) begin
       realtime phi;
-      phi = (T_CK * p) / N_PHASES;
+      phi     = (T_CK * p) / N_PHASES;
       got_cnt = 0;
-      // arm ahead of the burst (controller arms during latency)
+      // arm ahead of the burst (controller arms during latency), then drive the whole burst to
+      // completion BEFORE checking — bursts must not overlap.
       rd_arm  = 1'b1;
-      fork
-        drive_burst(phi);
-      join_none
-      if (p == 0) begin
-        repeat (20) @(posedge clk);
-        $display("DBG p0: rst=%b rd_arm=%b arm_cnt=%0d rd_arm_eff=%b rwds_s0=%b rwds_s1=%b",
-                 rst, rd_arm, dut.arm_cnt, dut.rd_arm_eff, dut.rwds_s0_q, dut.rwds_s1_q);
-      end
-      // (the hostile window inside drive_burst spans ~20 CK; ARM_DELAY_CYCLES=16 must blind it)
-      repeat (8) @(posedge clk);   // drain
+      drive_burst(phi);
+      repeat (8) @(posedge clk);   // drain the FIFO
       // check the first N_WORDS recovered words (over-stream may add extras — the controller
       // word-counts; here we only require the leading words to be exact and in order)
       if (got_cnt < N_WORDS) begin
-        $display("PHASE %0d (phi=%0.2f ns): FAIL — only %0d/%0d words recovered (vcount=%0d wptr=%0d)",
-                 p, phi, got_cnt, N_WORDS, vcount, dut.wptr_bin);
+        $display("[%s] PHASE %0d (phi=%0.2f ns): FAIL — only %0d/%0d words recovered (wptr=%0d)",
+                 HOSTILE ? "hostile" : "benign", p, phi, got_cnt, N_WORDS, dut.wptr_bin);
         fails++;
       end else begin
         for (int unsigned k = 0; k < N_WORDS; k++) begin
           if (got[k] !== pat(k)) begin
-            $display("PHASE %0d (phi=%0.2f ns): FAIL — word[%0d] got=%04x exp=%04x", p, phi, k, got[k], pat(k));
+            $display("[%s] PHASE %0d (phi=%0.2f ns): FAIL — word[%0d] got=%04x exp=%04x",
+                     HOSTILE ? "hostile" : "benign", p, phi, k, got[k], pat(k));
             fails++;
             break;
           end
@@ -174,10 +204,51 @@ module tb_local1x;
       rd_arm = 1'b0;               // disarm flushes for the next phase
       repeat (6) @(posedge clk);
     end
+    done = 1'b1;
+  end
 
-    if (fails == 0) $display("TB_RESULT: PASS (all %0d phases clean)", N_PHASES);
-    else            $display("TB_RESULT: FAIL (%0d/%0d phases failed)", fails, N_PHASES);
-    if (fails != 0) $fatal(1, "tb_local1x failed");
+endmodule
+
+// ------------------------------------------------------------------------------------------------
+//  Top: shared clocks + reset, two harness configurations, aggregate result.
+// ------------------------------------------------------------------------------------------------
+module tb_local1x;
+
+  localparam realtime     T_CK     = 5.0;   // 200 MHz
+  localparam int unsigned N_PHASES = 20;
+
+  logic clk = 0, clk_smp, rst = 1;
+  always #(T_CK/2.0) clk = ~clk;
+  // +90 deg sampling clock, same frequency
+  initial begin
+    clk_smp = 0;
+    #(T_CK/4.0);
+    forever #(T_CK/2.0) clk_smp = ~clk_smp;
+  end
+
+  int unsigned fails_h, fails_b;
+  logic        done_h,  done_b;
+
+  // hostile window, arm-delay blinds the float runts
+  local1x_harness #(.N_PHASES(N_PHASES), .ARM_DELAY(16), .HOSTILE(1'b1)) h_hostile (
+    .clk(clk), .clk_smp(clk_smp), .rst(rst), .fails(fails_h), .done(done_h)
+  );
+  // benign window, arm immediately (parameter-sweep sanity)
+  local1x_harness #(.N_PHASES(N_PHASES), .ARM_DELAY(0), .HOSTILE(1'b0)) h_benign (
+    .clk(clk), .clk_smp(clk_smp), .rst(rst), .fails(fails_b), .done(done_b)
+  );
+
+  initial begin
+    rst = 1'b1;
+    repeat (8) @(posedge clk);
+    rst = 1'b0;
+    wait (done_h && done_b);
+    if (fails_h == 0 && fails_b == 0)
+      $display("TB_RESULT: PASS (hostile ARM=16 + benign ARM=0, all %0d phases each)", N_PHASES);
+    else
+      $display("TB_RESULT: FAIL (hostile %0d/%0d + benign %0d/%0d phases failed)",
+               fails_h, N_PHASES, fails_b, N_PHASES);
+    if (fails_h != 0 || fails_b != 0) $fatal(1, "tb_local1x failed");
     $finish;
   end
 

@@ -279,10 +279,16 @@ module hyperbus_gpio_io #(
     end
   end
 
+  // Gray-pointer synchroniser + read pointer track the SAME effective arm the write side uses
+  // (rd_arm_eff), NOT raw phy_rd_arm. The write pointer only advances under rd_arm_eff, so keying
+  // the synchroniser and read side on phy_rd_arm left them armed through the blind window and, more
+  // importantly, released one clk out of step with the write pointer at disarm — an incoherent-FIFO
+  // hazard. Unifying on rd_arm_eff resets write ptr, sync, and read ptr together at every (re)arm
+  // and disarm, so "empty" is always exact and the per-burst disarm flush is atomic.
   wire  [RXF_AW:0] wptr_gray = wptr_bin ^ (wptr_bin >> 1);
   logic [RXF_AW:0] wgray_s1, wgray_s2;
   always_ff @(posedge clk) begin
-    if (rst || !phy_rd_arm) begin
+    if (rst || !rd_arm_eff) begin
       wgray_s1 <= '0;
       wgray_s2 <= '0;
     end else begin
@@ -307,7 +313,7 @@ module hyperbus_gpio_io #(
       phy_dq_i_valid <= 1'b0;
     end else begin
       phy_dq_i_valid <= 1'b0;
-      if (!phy_rd_arm) begin
+      if (!rd_arm_eff) begin
         rptr_bin <= '0;
       end else if (!rxf_empty) begin
         phy_dq_i       <= rxf_mem[rptr_bin[RXF_AW-1:0]];
