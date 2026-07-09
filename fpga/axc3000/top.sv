@@ -340,6 +340,7 @@ module top (
     .CK_DIN_HI        (1'b1)
   ) u_io (
     .clk            (clk),
+    .clk_smp        (clk2x),   // +90 deg CK-rate sampling clock (core-only; LOCAL1X eye phase)
     .rst            (sys_rst),
     .phy_cs_n       (phy_cs_n_w),
     .phy_rst_n      (phy_rst_n_w),

@@ -31,9 +31,18 @@ module hyperbus_gpio_io #(
     parameter int unsigned DQ_WIDTH         = 8,
     parameter int unsigned RD_PREAMBLE_SKIP = 1,
     parameter bit          TX_B_DLY         = 1'b1,
-    parameter bit          CK_DIN_HI        = 1'b1
+    parameter bit          CK_DIN_HI        = 1'b1,
+    // Effective-arm delay (clk cycles): the controller arms the receiver at latency start, but
+    // between the device's latency-indicator release and the read preamble both pins FLOAT — at
+    // 200 MHz the floating RWDS couples CK runts that the pairing would eat as words. Delaying the
+    // effective arm keeps the receiver blind through the float window; data arrives >= 2x-latency
+    // (24 CK at latency 6x2) after the controller arms, so 16 leaves >= 6 CK of margin ahead of
+    // the real preamble. Sweepable; 0 = arm immediately (the original exposure).
+    parameter int unsigned ARM_DELAY_CYCLES = 16
 ) (
     input  logic                  clk,          // CK-rate word clock (controller + all launches)
+    input  logic                  clk_smp,      // CK-rate RX sampling clock, PLL-phase-shifted (90 deg
+                                                // default) — CORE-ONLY; the LOCAL1X eye-position knob
     input  logic                  rst,          // synchronous, active-high
 
     // ---- ctrl-facing (mirror of hyperbus_ctrl's PHY master interface) ----
@@ -113,8 +122,12 @@ module hyperbus_gpio_io #(
         .ena      (1'b1),
         .areset   (1'b1),   // ACTIVE-LOW reset_n on ph2 atoms
         .sreset   (1'b0),
+        // PROVEN-STREAMING config (200 MHz, RD_CYCLES=798 with real device strobes): byte A on
+        // datainhi + one-clk-delayed byte B on datainlo — the same alignment the FABRIC2X 175 MHz
+        // build validated. (The A-on-datainlo "physics" swap regressed the CA to a dead device —
+        // the ck_cell's rise evidently lands mid-second-half, exactly where A sits here.)
         .datainhi (phy_dq_o[DQ_WIDTH + gi]),  // byte A bit i
-        .datainlo (tx_b[gi]),                 // byte B bit i (TX_B_DLY-aligned)
+        .datainlo (tx_b[gi]),                 // byte B bit i (TX_B_DLY one-clk-delayed)
         .dataout  (dq_ddr_out[gi]),
         .clk      (clk)
       );
@@ -171,22 +184,21 @@ module hyperbus_gpio_io #(
 
   // Both-edge input sampling (reset-less datapath). neg-edge regs are retimed into the posedge
   // domain half a cycle later (a constrained 2.5 ns path at 200 MHz).
-  logic [DQ_WIDTH-1:0] dq_pos_q, dq_neg_q, dq_neg_ret;
-  logic                rwds_pos_q, rwds_neg_q, rwds_neg_ret;
-  always_ff @(posedge clk) begin
-    dq_pos_q   <= dq_raw;
-    rwds_pos_q <= rwds_raw;
+  // Both-edge sampling on clk_smp (phase-shifted): with +90 deg the two sample points land at
+  // T/4 and 3T/4 of each clk cycle, and both are stable by the next clk posedge (related-clock
+  // paths, STA-timed). s0 = the posedge-clk_smp sample (older), s1 = the negedge sample (newer).
+  logic [DQ_WIDTH-1:0] dq_s0_q, dq_s1_q;
+  logic                rwds_s0_q, rwds_s1_q;
+  always_ff @(posedge clk_smp) begin
+    dq_s0_q   <= dq_raw;
+    rwds_s0_q <= rwds_raw;
   end
   /* verilator lint_off SYNCASYNCNET */
-  always_ff @(negedge clk) begin
-    dq_neg_q   <= dq_raw;
-    rwds_neg_q <= rwds_raw;
+  always_ff @(negedge clk_smp) begin
+    dq_s1_q   <= dq_raw;
+    rwds_s1_q <= rwds_raw;
   end
   /* verilator lint_on SYNCASYNCNET */
-  always_ff @(posedge clk) begin
-    dq_neg_ret   <= dq_neg_q;
-    rwds_neg_ret <= rwds_neg_q;
-  end
 
   logic [PHYW-1:0]  rxf_mem [RXF_DEPTH];
   logic [RXF_AW:0]  wptr_bin, rptr_bin;
@@ -197,10 +209,27 @@ module hyperbus_gpio_io #(
   // Two-sample-per-cycle SDR pairing, unrolled. Sample order each posedge k:
   //   s0 = {rwds_neg_ret, dq_neg_ret}  (captured at negedge k-1.5 -> retimed; OLDER)
   //   s1 = {rwds_pos_q,   dq_pos_q}    (captured at posedge k-1;   NEWER)
-  wire s0_rise =  rwds_neg_ret & ~rwds_prev;
-  wire s0_fall = ~rwds_neg_ret &  rwds_prev;
-  wire s1_rise =  rwds_pos_q   & ~rwds_neg_ret;
-  wire s1_fall = ~rwds_pos_q   &  rwds_neg_ret;
+  wire s0_rise =  rwds_s0_q & ~rwds_prev;
+  wire s0_fall = ~rwds_s0_q &  rwds_prev;
+  wire s1_rise =  rwds_s1_q & ~rwds_s0_q;
+  wire s1_fall = ~rwds_s1_q &  rwds_s0_q;
+
+  // Effective arm = controller arm, rise-delayed by ARM_DELAY_CYCLES (fall passes through, so the
+  // disarm flush is never delayed). Keeps the receiver blind through the latency-window float
+  // (coupling runts on RWDS at 200 MHz read as phantom words otherwise).
+  localparam int unsigned ARMW = (ARM_DELAY_CYCLES == 0) ? 1 : $clog2(ARM_DELAY_CYCLES + 1);
+  logic [ARMW-1:0] arm_cnt;
+  logic            rd_arm_eff;
+  always_ff @(posedge clk) begin
+    if (rst || !phy_rd_arm) begin
+      arm_cnt    <= '0;
+      rd_arm_eff <= 1'b0;
+    end else if (arm_cnt != ARMW'(ARM_DELAY_CYCLES)) begin
+      arm_cnt    <= arm_cnt + 1'b1;
+    end else begin
+      rd_arm_eff <= 1'b1;
+    end
+  end
 
   // At a CK-rate strobe, the two samples of one clk cycle can carry at most ONE completed word
   // (a fall needs a preceding rise; two falls per cycle would need a 2x-rate strobe). Single-push
@@ -217,30 +246,30 @@ module hyperbus_gpio_io #(
     pushval = '0;
     if (s0_fall && have_a) begin
       push    = 1'b1;
-      pushval = {rx_byte_a, dq_neg_ret};
+      pushval = {rx_byte_a, dq_s0_q};
     end else if (s1_fall && (s0_rise ? s0_ok : have_a)) begin
       push    = 1'b1;
-      pushval = {s0_rise ? dq_neg_ret : rx_byte_a, dq_pos_q};
+      pushval = {s0_rise ? dq_s0_q : rx_byte_a, dq_s1_q};
     end
   end
 
   always_ff @(posedge clk) begin
-    if (rst || !phy_rd_arm) begin
+    if (rst || !rd_arm_eff) begin
       wptr_bin  <= '0;
       have_a    <= 1'b0;
-      rwds_prev <= 1'b0;
+      rwds_prev <= rwds_s1_q;   // track the LIVE level while blind: no phantom edge at arm release
       pre_skip  <= SKIPW'(RD_PREAMBLE_SKIP);
       rx_byte_a <= '0;
     end else begin
-      rwds_prev <= rwds_pos_q;
+      rwds_prev <= rwds_s1_q;
       // preamble skip consumes rising edges (at most one rise per cycle at a CK-rate strobe)
       if ((s0_rise || s1_rise) && pre_skip != '0) begin
         pre_skip <= pre_skip - 1'b1;
         have_a   <= 1'b0;
       end else begin
         // byte-A load: the newest unconsumed rise wins; a push consumes the pending A
-        if (s1_rise)                 begin rx_byte_a <= dq_pos_q;  have_a <= 1'b1; end
-        else if (s0_rise && !s1_fall) begin rx_byte_a <= dq_neg_ret; have_a <= 1'b1; end
+        if (s1_rise)                 begin rx_byte_a <= dq_s1_q;  have_a <= 1'b1; end
+        else if (s0_rise && !s1_fall) begin rx_byte_a <= dq_s0_q; have_a <= 1'b1; end
         else if (push)               have_a <= 1'b0;
       end
       if (push) begin

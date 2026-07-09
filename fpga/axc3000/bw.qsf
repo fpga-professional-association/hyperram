@@ -61,7 +61,7 @@ set_global_assignment -name LAST_QUARTUS_VERSION "26.1.0 Pro Edition"
 # names below — the compile logs identify which one this Quartus/family accepts (unknown names are
 # reported/ignored); remove the rejected ones once identified.
 # KILL-TEST: delay chain suspected of killing the CK output entirely (capture shows no RWDS data strobe ever)
-# set_instance_assignment -name OUTPUT_DELAY_CHAIN 15 -to hb_ck
+# set_instance_assignment -name OUTPUT_DELAY_CHAIN 15 -to hb_ck  # (798-build had none)
 set_instance_assignment -name D5_DELAY 15 -to hb_ck -entity top
 
 # ---- hb_rwds input-delay eye-centring (issue #9, RX HARD_CHAIN) --------------------------------

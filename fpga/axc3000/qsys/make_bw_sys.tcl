@@ -5,8 +5,8 @@
 #   * Agilex-3 IOPLL: outclk0 = clk (CK_MHZ, 0 deg = HyperBus CK word clock; the ONLY clock in the
 #                     I/O periphery — clocks the controller, fabric, and ALL of the DDIO PHY's I/O
 #                     cells under CK_SCHEME="CLK_DLY", issue #8),
-#                     outclk1 = (2x CK_MHZ, 0 deg) CORE-ONLY fabric clock: the DDIO PHY's FABRIC2X
-#                     CK generator + the hyperbus_capture debug sampler. It clocks NO I/O cell. (The export interface is still named "clk90" for the frozen port
+#                     outclk1 = (CK_MHZ, +90 deg) CORE-ONLY RX sampling clock (LOCAL1X eye phase)
+#                     + the hyperbus_capture debug sampler. It clocks NO I/O cell. (The export interface is still named "clk90" for the frozen port
 #                     list; it is NOT a 90 deg phase — that second phase is exactly what the DDIO
 #                     PHY could not route into Bank 3A, Fitter err 24403/24404.)
 #   * reset bridge + reset controller (synchronous, active-high fabric reset, 50 MHz domain)
@@ -62,7 +62,7 @@ set_instance_parameter_value iopll gui_number_of_clocks          {2}
 set_instance_parameter_value iopll gui_output_clock_frequency0   $CK_MHZ
 set_instance_parameter_value iopll gui_phase_shift_deg0          {0.0}
 set_instance_parameter_value iopll gui_output_clock_frequency1   $BYTE_MHZ
-set_instance_parameter_value iopll gui_phase_shift_deg1          {0.0}
+set_instance_parameter_value iopll gui_phase_shift_deg1          {90.0}
 
 # Clock bridges: an IOPLL output clock that is BOTH exported AND fanned to internal sinks loses its
 # internal connections on save (the export wins). So the internal fabric (rst_ctrl, jtag_master)
