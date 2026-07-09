@@ -21,8 +21,9 @@ module hyperbus_phy
     parameter int unsigned LEN_WIDTH   = HB_LEN_WIDTH_DEFAULT,
     parameter              PHY_VARIANT = "GENERIC",   // GENERIC | INTEL | XILINX
     parameter bit          DIFF_CK     = 1'b1,
-    parameter int unsigned RD_PREAMBLE_SKIP = 0        // SDR variant only: leading rwds-rise edges to
-                                                       // ignore as read-strobe preamble (see phy_sdr).
+    parameter int unsigned RD_PREAMBLE_SKIP = 0        // SDR + GENERIC variants: leading rwds-rise edges
+                                                       // to ignore as read-strobe preamble (see phy_sdr /
+                                                       // phy_generic). ALTERA/XILINX branches ignore it.
 ) (
     input  logic                clk,
     input  logic                clk90,
@@ -102,7 +103,8 @@ module hyperbus_phy
     end else begin : g_generic
       hyperbus_phy_generic #(
         .DQ_WIDTH(DQ_WIDTH), .DATA_WIDTH(DATA_WIDTH), .ADDR_WIDTH(ADDR_WIDTH),
-        .LEN_WIDTH(LEN_WIDTH), .PHY_VARIANT(PHY_VARIANT), .DIFF_CK(DIFF_CK)
+        .LEN_WIDTH(LEN_WIDTH), .PHY_VARIANT(PHY_VARIANT), .DIFF_CK(DIFF_CK),
+        .RD_PREAMBLE_SKIP(RD_PREAMBLE_SKIP)
       ) u_var (
         .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
         .phy_cs_n(phy_cs_n), .phy_rst_n(phy_rst_n), .phy_ck_en(phy_ck_en),

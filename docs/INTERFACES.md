@@ -311,3 +311,12 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   byte clock (0°, same PLL) instead of a 90° phase — see the "SDR variant clock note" above. It adds
   a non-frozen, defaulted read-eye tuning parameter `CAPTURE_PHASE`. Controller, front-ends, model,
   and all other module boundaries are unchanged.
+- **v4 (2026-07-09):** the `RD_PREAMBLE_SKIP` read-strobe-preamble parameter (added on `hyperbus_phy`
+  at v3, then implemented only by the `SDR` variant) now also reaches the `GENERIC` PHY variant
+  (`hyperbus_phy_generic.sv` — read-path preamble phantom-word skip, disarm FIFO flush, deeper RX
+  FIFO) and is exposed on the `hyperram_axi` top, joining `hyperram_avalon` which already forwarded
+  it. **Parameter-only change: no frozen port name, direction, or width changes.** `RD_PREAMBLE_SKIP`
+  keeps its name/meaning and its default `0`, which is bit-exact for every existing caller (the skip
+  branch never fires). `ALTERA`/`XILINX` variants still do not implement it — the wrapper simply never
+  forwards it to their branches, as before. Controller, front-ends, model, and all other module
+  boundaries are unchanged.
