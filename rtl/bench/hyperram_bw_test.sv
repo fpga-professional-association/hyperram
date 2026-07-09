@@ -38,6 +38,11 @@
 //    0x14    |  5   | ERR_COUNT            |  R     | number of read words that mismatched
 //    0x18    |  6   | DATA_BYTES_PER_WORD  |  R     | constant = 2 (bytes per HyperBus word)
 //    0x1C    |  7   | VERSION / MAGIC      |  R     | constant identifier (default 0x48425754 = "HBWT")
+//    0x20    |  8   | ERR_ADDR             |  R     | WORD address of the first read mismatch
+//    0x24    |  9   | ERR_GOT              |  R     | read data returned at the first mismatch
+//    0x28    | 10   | ERR_EXP              |  R     | expected pattern at the first mismatch
+//    0x2C    | 11   | BURSTW               |  R/W   | WRITE-phase HyperBus burst length (words); 0 => default
+//    0x30    | 12   | RBURSTW              |  R/W   | READ-phase  HyperBus burst length (words); 0 => default
 // =====================================================================================
 //
 // See docs/BW_TEST.md for the full narrative, the MB/s formula and the sim/hardware run notes.
@@ -90,7 +95,8 @@ module hyperram_bw_test
     localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRADDR = 4'd8;  // WORD address of the first mismatch
     localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRGOT  = 4'd9;  // read data returned at that address
     localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERREXP  = 4'd10; // expected pattern at that address
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BURSTW  = 4'd11; // R/W: HyperBus burst length (words), default BURST_WORDS
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BURSTW  = 4'd11; // R/W: WRITE burst length (words), default BURST_WORDS
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_RBURSTW = 4'd12; // R/W: READ  burst length (words), default BURST_WORDS
 
     // ------------------------------------------------------------------------
     // Deterministic, address-seeded per-word data pattern (xorshift32 folded to
@@ -140,14 +146,20 @@ module hyperram_bw_test
     logic                  wr_started;  // WR_CYCLES gate (first cmd asserted .. last beat)
     logic                  rd_started;  // RD_CYCLES gate (first cmd asserted .. last word)
 
-    // Words in the current burst = min(r_burstw, words_left). r_burstw is RUNTIME-programmable
-    // (REG_BURSTW, default BURST_WORDS) so the host can sweep the HyperBus burst length without a
-    // recompile — used to find the device's single-burst (tCSM) ceiling and the write-boundary point.
+    // Words in the current burst = min(active_burstw, words_left). The WRITE phase uses r_burstw and
+    // the READ phase uses r_rburstw — both RUNTIME-programmable (REG_BURSTW / REG_RBURSTW, default
+    // BURST_WORDS) so the host can sweep write and read burst lengths INDEPENDENTLY without a
+    // recompile: e.g. write a single (correct) burst while splitting the read into many, isolating the
+    // multi-burst READ path from the split-WRITE commit quirk (issue #2).
     logic [LEN_WIDTH-1:0]  r_burstw;
+    logic [LEN_WIDTH-1:0]  r_rburstw;
+    wire                   in_read_phase = (state == S_RSTART) || (state == S_RCMD) ||
+                                           (state == S_RDATA);
+    wire [LEN_WIDTH-1:0]   active_burstw = in_read_phase ? r_rburstw : r_burstw;
     logic [LEN_WIDTH-1:0]  this_burst;
     always_comb begin
-        if (words_left >= 32'(r_burstw)) this_burst = r_burstw;
-        else                             this_burst = words_left[LEN_WIDTH-1:0];
+        if (words_left >= 32'(active_burstw)) this_burst = active_burstw;
+        else                                  this_burst = words_left[LEN_WIDTH-1:0];
     end
 
     // CSR start strobe: a write of CTRL bit0 while the CSR bus is ready.
@@ -190,6 +202,7 @@ module hyperram_bw_test
             REG_ERRGOT:  csr_readdata = 32'(r_err_got);
             REG_ERREXP:  csr_readdata = 32'(r_err_exp);
             REG_BURSTW:  csr_readdata = 32'(r_burstw);
+            REG_RBURSTW: csr_readdata = 32'(r_rburstw);
             default:    csr_readdata = 32'h0;
         endcase
     end
@@ -213,6 +226,7 @@ module hyperram_bw_test
             r_err_exp     <= '0;
             r_err_latched <= 1'b0;
             r_burstw    <= LEN_WIDTH'(BURST_WORDS);   // default; host may reprogram via REG_BURSTW
+            r_rburstw   <= LEN_WIDTH'(BURST_WORDS);   // default; host may reprogram via REG_RBURSTW
             cur_addr    <= '0;
             words_left  <= 32'd0;
             beat        <= '0;
@@ -226,9 +240,12 @@ module hyperram_bw_test
                 unique case (csr_address)
                     REG_LEN:    r_len    <= csr_writedata;
                     REG_BASE:   r_base   <= csr_writedata[ADDR_WIDTH-1:0];
-                    REG_BURSTW: r_burstw <= (csr_writedata[LEN_WIDTH-1:0] == '0)
-                                            ? LEN_WIDTH'(BURST_WORDS)         // 0 => reset to default
-                                            : csr_writedata[LEN_WIDTH-1:0];
+                    REG_BURSTW: r_burstw  <= (csr_writedata[LEN_WIDTH-1:0] == '0)
+                                             ? LEN_WIDTH'(BURST_WORDS)        // 0 => reset to default
+                                             : csr_writedata[LEN_WIDTH-1:0];
+                    REG_RBURSTW: r_rburstw <= (csr_writedata[LEN_WIDTH-1:0] == '0)
+                                             ? LEN_WIDTH'(BURST_WORDS)        // 0 => reset to default
+                                             : csr_writedata[LEN_WIDTH-1:0];
                     default:  /* CTRL + read-only regs: no stored effect */ ;
                 endcase
             end
