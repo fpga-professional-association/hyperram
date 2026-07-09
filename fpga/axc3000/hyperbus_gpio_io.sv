@@ -192,7 +192,10 @@ module hyperbus_gpio_io #(
     end else begin : g_ck_vendor
       hbgpio_ck_cell u_ck_cell (
         .ck      (clk),
-        .din     ((CK_GATE == "DIN") ? (cken_q ? (CK_DIN_HI ? 2'b10 : 2'b01) : 2'b00)
+        // DIN gating uses the PRE-pipeline enable (phy_ck_en): the cell's registered din path
+        // adds one cycle vs the cke path, and gating from cken_q shifted the whole train +1 CK
+        // (CA garbage, dead bus — silicon-observed). phy_ck_en restores the cke-equivalent timing.
+        .din     ((CK_GATE == "DIN") ? (phy_ck_en ? (CK_DIN_HI ? 2'b10 : 2'b01) : 2'b00)
                                      : (CK_DIN_HI ? 2'b10 : 2'b01)),
         .cke     ((CK_GATE == "DIN") ? 1'b1 : (cken_q | ck_stretch)),
         .pad_out (hb_ck)
