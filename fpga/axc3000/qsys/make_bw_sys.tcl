@@ -51,8 +51,8 @@ set_instance_parameter_value clk_in NUM_CLOCK_OUTPUTS   {1}
 # clock would be 400 MHz at the 200 MHz device ceiling — unclosable and unneeded).
 # Peak throughput ~= 2 bytes * CK_MHZ MB/s per direction (DDR x8).
 #   50 -> ~100 MB/s | 100 -> ~200 | 175 -> ~350 (SDR ceiling was here) | 200 -> ~400 (device max).
-set CK_MHZ   175.0
-set BYTE_MHZ [expr {2.0 * $CK_MHZ}]
+set CK_MHZ   200.0
+set BYTE_MHZ $CK_MHZ
 
 add_instance iopll altera_iopll
 set_instance_parameter_value iopll gui_reference_clock_frequency {25.0}

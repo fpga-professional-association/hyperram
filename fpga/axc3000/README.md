@@ -74,6 +74,19 @@ QPRO() { docker run --rm -i --user $(id -u):$(id -g) -e HOME=/tmp \
 
    Bitstream lands in `output_files/bw.sof`. Run the tensor-mode / timing audit as usual.
 
+## Devkit sharing — REQUIRED lock protocol
+
+Multiple agents/sessions may use this board. **Every** board access (programming AND
+`system-console`) must hold the shared lock — `flock` auto-releases on process exit, so a crashed
+holder never wedges the board:
+
+```bash
+flock -w 600 /tmp/axc3000-devkit.lock -c '<your docker quartus_pgm / system-console command>'
+```
+
+Compiles and STA need no lock (they don't touch the board). If `flock` times out after 600 s,
+another agent is mid-session — retry, don't steal.
+
 ## Program the board
 
 Program over the on-board USB-Blaster III (see the project memory note on the AXC3000 JTAG path —

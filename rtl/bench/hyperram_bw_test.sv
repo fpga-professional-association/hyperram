@@ -135,6 +135,14 @@ module hyperram_bw_test
     state_e state;
 
     logic [ADDR_WIDTH-1:0] cur_addr;    // base word address of the current burst
+    // Pipelined data pattern (timing fix, 200 MHz fabric): gen_pattern() is a multi-level xorshift;
+    // computed combinationally from cur_addr/beat it was the design's WORST fabric path (bench
+    // address register -> xorshift -> Avalon -> ctrl -> PHY DQ I/O cell, Fmax 184 MHz). pat_q holds
+    // the CURRENT write beat's pattern, exp_q the CURRENT read beat's expected value; both are
+    // computed one cycle ahead at every (cur_addr, beat) change, so the xorshift terminates in a
+    // local register instead of the I/O launch path.
+    logic [DATA_WIDTH-1:0] pat_q;       // gen_pattern(cur_addr + beat) for the write phase
+    logic [DATA_WIDTH-1:0] exp_q;       // gen_pattern(cur_addr + beat) for the read phase
     logic [31:0]           words_left;  // words remaining in the current phase
     logic [LEN_WIDTH-1:0]  beat;        // words done within the current burst
     logic                  wr_started;  // WR_CYCLES gate (first cmd asserted .. last beat)
@@ -169,7 +177,7 @@ module hyperram_bw_test
         m_burstcount = this_burst;
         m_read       = (state == S_RCMD);
         m_write      = (state == S_WBEAT);
-        m_writedata  = gen_pattern(cur_addr + ADDR_WIDTH'(beat));
+        m_writedata  = pat_q;   // pipelined gen_pattern (see pat_q declaration)
     end
 
     // ------------------------------------------------------------------------
@@ -265,6 +273,7 @@ module hyperram_bw_test
                         state      <= S_RSTART;
                     end else begin
                         beat       <= '0;
+                        pat_q      <= gen_pattern(cur_addr);   // beat 0 pattern, ready on S_WBEAT entry
                         wr_started <= 1'b1;
                         state      <= S_WBEAT;
                     end
@@ -282,7 +291,8 @@ module hyperram_bw_test
                                 wr_started <= 1'b0;         // last burst -> stop counting after this cycle
                             state      <= S_WSTART;
                         end else begin
-                            beat <= beat + LEN_WIDTH'(1);
+                            beat  <= beat + LEN_WIDTH'(1);
+                            pat_q <= gen_pattern(cur_addr + ADDR_WIDTH'(beat) + ADDR_WIDTH'(1));
                         end
                     end
                 end
@@ -297,6 +307,7 @@ module hyperram_bw_test
                         state   <= S_IDLE;
                     end else begin
                         beat       <= '0;
+                        exp_q      <= gen_pattern(cur_addr);   // beat 0 expectation, ready before data
                         rd_started <= 1'b1;
                         state      <= S_RCMD;
                     end
@@ -311,14 +322,14 @@ module hyperram_bw_test
                 S_RDATA: begin
                     r_rd_cycles <= r_rd_cycles + 32'd1;
                     if (m_readdatavalid) begin
-                        if (m_readdata != gen_pattern(cur_addr + ADDR_WIDTH'(beat))) begin
+                        if (m_readdata != exp_q) begin
                             r_err_count <= r_err_count + 32'd1;
                             st_error    <= 1'b1;
                             if (!r_err_latched) begin       // capture the FIRST mismatch only
                                 r_err_latched <= 1'b1;
                                 r_err_addr    <= cur_addr + ADDR_WIDTH'(beat);
                                 r_err_got     <= m_readdata;
-                                r_err_exp     <= gen_pattern(cur_addr + ADDR_WIDTH'(beat));
+                                r_err_exp     <= exp_q;
                             end
                         end
                         if (beat + LEN_WIDTH'(1) == this_burst) begin
@@ -328,7 +339,8 @@ module hyperram_bw_test
                                 rd_started <= 1'b0;         // last burst -> stop counting after this cycle
                             state      <= S_RSTART;
                         end else begin
-                            beat <= beat + LEN_WIDTH'(1);
+                            beat  <= beat + LEN_WIDTH'(1);
+                            exp_q <= gen_pattern(cur_addr + ADDR_WIDTH'(beat) + ADDR_WIDTH'(1));
                         end
                     end
                 end

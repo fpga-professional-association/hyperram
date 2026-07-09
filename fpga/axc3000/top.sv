@@ -223,38 +223,33 @@ module top (
     .m_waitrequest   (av_waitrequest)
   );
 
-  hyperram_avalon #(
-    .DQ_WIDTH         (8),
-    .DATA_WIDTH       (16),
-    .ADDR_WIDTH       (32),
-    .LEN_WIDTH        (16),
-    .LATENCY_CLOCKS   (6),             // hyperram_bw_top defaults (mirror sim/tb_avalon.sv)
-    .FIXED_LATENCY    (1'b1),
-    .MAX_BURST_WORDS  (0),
-    .PROGRAM_CR       (1'b1),
-    .POR_DELAY_CYCLES (0),
-    .INIT_CR0         (16'h8F1F),      // latency code 6, fixed
-    .PHY_VARIANT      ("INTEL"),       // Agilex-3 DDIO PHY (I/O at 1x CK — the 200 MHz path, issue #3)
-    .DIFF_CK          (1'b0),          // single-ended CK on AXC3000 (no hb_ck_n pin)
-    // Winbond W957D8NB drives a read-strobe PREAMBLE: RWDS toggles with DQ Hi-Z (=0x00) for ONE CK
-    // cycle before the first real read byte (on-silicon capture cap_sample_dump.txt: preamble pulse
-    // at idx85/86, then the first data word at idx87..). The PHY discards that one leading RWDS
-    // rising edge so byte pairing starts on the real read data — without it, the preamble edge paired
-    // into a phantom {0x00,0x00} word and the bandwidth test hung (STATUS never reached done).
-    // = the device preamble length in CK cycles (1 on the W957D8NB). The ALTERA PHY's FABRIC
-    // capture scheme absorbs its one-edge view lag internally (rx_prime), so this knob means the
-    // same thing here as on the SDR PHY.
-    .RD_PREAMBLE_SKIP (1),
-    // Single-periphery-clock CK forwarding (issue #8): CK DDIOs launch on the SAME clk as the DQ
-    // DDIOs (no clk90 phase into Bank 3A -> no Fitter 24403/24404); the quarter-period eye-centring
-    // shift is applied by the hard output-delay assignment on the hb_ck pin in bw.qsf.
-    .CK_SCHEME        ("FABRIC2X")
-  ) u_hyperram (
+  // ---- native fe <-> ctrl channels (hyperram_avalon inlined for the GPIO-cell I/O build) ------
+  wire        cmd_valid, cmd_ready, cmd_read, cmd_reg, cmd_wrap;
+  wire [31:0] cmd_addr;
+  wire [15:0] cmd_len;
+  wire        wr_valid, wr_ready, wr_last;
+  wire [15:0] wr_data;
+  wire [1:0]  wr_strb;
+  wire        rd_valid, rd_ready, rd_last;
+  wire [15:0] rd_data;
+  wire [1:0]  fe_dbg_state;
+  wire [3:0]  ctrl_dbg_state;
+  wire [5:0]  ctrl_dbg_rem, ctrl_dbg_seg;
+
+  // ---- ctrl <-> board GPIO-cell I/O layer ----
+  wire        phy_cs_n_w, phy_rst_n_w, phy_ck_en_w, phy_dq_oe_w, phy_rwds_oe_w, phy_rd_arm_w;
+  wire [15:0] phy_dq_o_w, phy_dq_i_w;
+  wire [1:0]  phy_rwds_o_w;
+  wire        phy_dq_i_valid_w, phy_rwds_i_w;
+
+  hyperbus_avalon #(
+    .DQ_WIDTH   (8),
+    .DATA_WIDTH (16),
+    .ADDR_WIDTH (32),
+    .LEN_WIDTH  (16)
+  ) u_fe (
     .clk               (clk),
-    .clk90             (clk2x),  // FABRIC2X: 2x-CK CORE-ONLY fabric clock for the proven CK generator
-    .clk_ref           (clk),    // unused (tie-off)
     .rst               (sys_rst),
-    // Avalon-MM slave (driven by the bench master above); full-word writes only
     .avs_address       (av_address),
     .avs_read          (av_read),
     .avs_write         (av_write),
@@ -264,22 +259,117 @@ module top (
     .avs_readdata      (av_readdata),
     .avs_readdatavalid (av_readdatavalid),
     .avs_waitrequest   (av_waitrequest),
-    // split HyperBus device pins
-    .hb_ck             (hb_ck_int),
-    .hb_ck_n           (hb_ck_n_int),
-    .hb_cs_n           (hb_cs_n_int),
-    .hb_rst_n          (hb_rst_n_int),
-    .hb_dq_o           (hb_dq_o_int),
-    .hb_dq_oe          (hb_dq_oe_int),
-    .hb_dq_i           (hb_dq_i_int),
-    .hb_rwds_o         (hb_rwds_o_int),
-    .hb_rwds_oe        (hb_rwds_oe_int),
-    .hb_rwds_i         (hb_rwds_i_int),
-    // status
-    .init_done         (init_done),
-    // debug taps -> capture
-    .dbg_bus           (av_dbg)
+    .cmd_valid         (cmd_valid),
+    .cmd_ready         (cmd_ready),
+    .cmd_read          (cmd_read),
+    .cmd_reg           (cmd_reg),
+    .cmd_wrap          (cmd_wrap),
+    .cmd_addr          (cmd_addr),
+    .cmd_len           (cmd_len),
+    .wr_valid          (wr_valid),
+    .wr_ready          (wr_ready),
+    .wr_data           (wr_data),
+    .wr_strb           (wr_strb),
+    .wr_last           (wr_last),
+    .rd_valid          (rd_valid),
+    .rd_ready          (rd_ready),
+    .rd_data           (rd_data),
+    .rd_last           (rd_last),
+    .dbg_state         (fe_dbg_state)
   );
+
+  hyperbus_ctrl #(
+    .DQ_WIDTH          (8),
+    .DATA_WIDTH        (16),
+    .ADDR_WIDTH        (32),
+    .LEN_WIDTH         (16),
+    .LATENCY_CLOCKS    (6),
+    .FIXED_LATENCY     (1'b1),
+    .MAX_BURST_WORDS   (0),
+    .PROGRAM_CR        (1'b1),
+    .POR_DELAY_CYCLES  (0),
+    .INIT_CR0          (16'h8F1F)
+  ) u_ctrl (
+    .clk            (clk),
+    .rst            (sys_rst),
+    .cmd_valid      (cmd_valid),
+    .cmd_ready      (cmd_ready),
+    .cmd_read       (cmd_read),
+    .cmd_reg        (cmd_reg),
+    .cmd_wrap       (cmd_wrap),
+    .cmd_addr       (cmd_addr),
+    .cmd_len        (cmd_len),
+    .wr_valid       (wr_valid),
+    .wr_ready       (wr_ready),
+    .wr_data        (wr_data),
+    .wr_strb        (wr_strb),
+    .wr_last        (wr_last),
+    .rd_valid       (rd_valid),
+    .rd_ready       (rd_ready),
+    .rd_data        (rd_data),
+    .rd_last        (rd_last),
+    .busy           (),
+    .init_done      (init_done),
+    .err_underrun   (),
+    .err_timeout    (),
+    .phy_cs_n       (phy_cs_n_w),
+    .phy_rst_n      (phy_rst_n_w),
+    .phy_ck_en      (phy_ck_en_w),
+    .phy_dq_o       (phy_dq_o_w),
+    .phy_dq_oe      (phy_dq_oe_w),
+    .phy_rwds_o     (phy_rwds_o_w),
+    .phy_rwds_oe    (phy_rwds_oe_w),
+    .phy_rd_arm     (phy_rd_arm_w),
+    .phy_dq_i       (phy_dq_i_w),
+    .phy_dq_i_valid (phy_dq_i_valid_w),
+    .phy_rwds_i     (phy_rwds_i_w),
+    .dbg_state      (ctrl_dbg_state),
+    .dbg_rd_wptr    (ctrl_dbg_rem),
+    .dbg_rd_rptr    (ctrl_dbg_seg)
+  );
+
+  // dbg_bus for the capture module — same field map as hyperram_avalon's
+  assign av_dbg = {2'd0, cmd_len[5:0], ctrl_dbg_seg, ctrl_dbg_rem, rd_last, rd_ready, rd_valid,
+                   phy_dq_i_valid_w, cmd_ready, cmd_valid, fe_dbg_state, ctrl_dbg_state};
+
+  // Board I/O layer: vendor GPIO cells (DQ bidir DDR w/ delay, CK DDR out w/ CKE) + proven RWDS path.
+  hyperbus_gpio_io #(
+    .DQ_WIDTH         (8),
+    .RD_PREAMBLE_SKIP (1),
+    .TX_B_DLY         (1'b1),
+    .CK_DIN_HI        (1'b1)
+  ) u_io (
+    .clk            (clk),
+    .rst            (sys_rst),
+    .phy_cs_n       (phy_cs_n_w),
+    .phy_rst_n      (phy_rst_n_w),
+    .phy_ck_en      (phy_ck_en_w),
+    .phy_dq_o       (phy_dq_o_w),
+    .phy_dq_oe      (phy_dq_oe_w),
+    .phy_rwds_o     (phy_rwds_o_w),
+    .phy_rwds_oe    (phy_rwds_oe_w),
+    .phy_rd_arm     (phy_rd_arm_w),
+    .phy_dq_i       (phy_dq_i_w),
+    .phy_dq_i_valid (phy_dq_i_valid_w),
+    .phy_rwds_i     (phy_rwds_i_w),
+    .hb_ck          (hb_ck),
+    .hb_cs_n        (hb_cs_n),
+    .hb_rst_n       (hb_rst_n),
+    .hb_dq          (hb_dq),
+    .hb_rwds        (hb_rwds)
+  );
+
+  // Fabric-visible probe stand-ins for the capture module (GPIO cells own the DQ pads; a raw DQ
+  // fanout would re-create the P2X input-term conflict — tie those probes off).
+  assign hb_ck_int      = 1'b0;
+  assign hb_cs_n_int    = phy_cs_n_w;
+  assign hb_rst_n_int   = phy_rst_n_w;
+  assign hb_dq_o_int    = 8'h00;
+  assign hb_dq_oe_int   = phy_dq_oe_w;
+  assign hb_dq_i_int    = 8'h00;
+  assign hb_rwds_o_int  = 1'b0;
+  assign hb_rwds_oe_int = phy_rwds_oe_w;
+  assign hb_rwds_i_int  = hb_rwds;
 
   // =========================================================================
   // On-chip logic analyzer (DEBUG): records the HyperBus pin-side signals + the av_* handshake at
@@ -325,32 +415,5 @@ module top (
     .csr_waitrequest  (cap_waitrequest)
   );
 
-  // =========================================================================
-  // Board pad ring: split PHY signals -> real Agilex inout pads (tennm_ph2 io_obuf/io_ibuf)
-  // =========================================================================
-  wire hb_ck_n_nc;   // single-ended: ck_n obuf output unused (constant, swept by the fitter)
-
-  hyperbus_pads_altera #(
-    .DQ_WIDTH (8)
-  ) u_pads (
-    // split PHY side
-    .phy_hb_ck      (hb_ck_int),
-    .phy_hb_ck_n    (hb_ck_n_int),
-    .phy_hb_cs_n    (hb_cs_n_int),
-    .phy_hb_rst_n   (hb_rst_n_int),
-    .phy_hb_dq_o    (hb_dq_o_int),
-    .phy_hb_dq_oe   (hb_dq_oe_int),
-    .phy_hb_dq_i    (hb_dq_i_int),
-    .phy_hb_rwds_o  (hb_rwds_o_int),
-    .phy_hb_rwds_oe (hb_rwds_oe_int),
-    .phy_hb_rwds_i  (hb_rwds_i_int),
-    // device pads
-    .hb_ck          (hb_ck),
-    .hb_ck_n        (hb_ck_n_nc),
-    .hb_cs_n        (hb_cs_n),
-    .hb_rst_n       (hb_rst_n),
-    .hb_dq          (hb_dq),
-    .hb_rwds        (hb_rwds)
-  );
 
 endmodule
