@@ -95,40 +95,35 @@ module hyperbus_gpio_io #(
   wire                tx_rwds_b = TX_B_DLY ? rwds_b_dly : phy_rwds_o[0];
 
   // ================================================================================================
-  //  DQ — vendor bidir DDR GPIO cell (hbgpio_dq_cell): din/dout are per-pin interleaved pairs
-  //  {bit 2i+1 = first/hi sub-phase, bit 2i = second/lo sub-phase}; oe is per pin. ck_out = clk
-  //  (launch), ck_in = raw RWDS (source-synchronous capture; the cell's DDIO_WITH_DELAY gives the
-  //  data-vs-strobe margin). pad_io is the real pin.
+  //  DQ — raw tennm_ph2_ddio_out TX atoms (proven at 175 in the atom PHY) + inferred tristate pads.
+  //  The vendor dq_cell was retired: its strobe-clocked input DDIO registers read constant zeros
+  //  (hard input DDR regs cannot be clocked from a fabric-routed data pin on this silicon — confirmed
+  //  for raw atoms AND vendor cells), and leaving them configured-but-unused recreates the pad's
+  //  P2X input-term conflict. RX is LOCAL1X fabric sampling below; the raw ibuf nets feed it.
   // ================================================================================================
-  logic [2*DQ_WIDTH-1:0] dq_din;
-  logic [2*DQ_WIDTH-1:0] dq_dout;
+  logic [DQ_WIDTH-1:0] dq_ddr_out;
   genvar gi;
   generate
-    for (gi = 0; gi < DQ_WIDTH; gi = gi + 1) begin : g_dqmap
-      assign dq_din[2*gi+1] = phy_dq_o[DQ_WIDTH + gi];  // byte A bit i — first sub-phase
-      assign dq_din[2*gi]   = tx_b[gi];                 // byte B bit i — second sub-phase (delayed)
+    for (gi = 0; gi < DQ_WIDTH; gi = gi + 1) begin : g_dq_tx
+      tennm_ph2_ddio_out #(
+        .mode      ("MODE_DDR"),
+        .asclr_ena ("ASCLR_ENA_NONE"),
+        .sclr_ena  ("SCLR_ENA_NONE")
+      ) u_dq_tx (
+        .ena      (1'b1),
+        .areset   (1'b1),   // ACTIVE-LOW reset_n on ph2 atoms
+        .sreset   (1'b0),
+        .datainhi (phy_dq_o[DQ_WIDTH + gi]),  // byte A bit i
+        .datainlo (tx_b[gi]),                 // byte B bit i (TX_B_DLY-aligned)
+        .dataout  (dq_ddr_out[gi]),
+        .clk      (clk)
+      );
+      assign hb_dq[gi] = dqoe_q ? dq_ddr_out[gi] : 1'bz;
     end
   endgenerate
 
-  wire rwds_raw = hb_rwds;   // raw input buffer view of the (bidir) RWDS pin
-
-  hbgpio_dq_cell u_dq_cell (
-    .ck_in  (rwds_raw),
-    .ck_out (clk),
-    .dout   (dq_dout),
-    .din    (dq_din),
-    .oe     ({DQ_WIDTH{dqoe_q}}),
-    .pad_io (hb_dq)
-  );
-
-  // RX pair rails from the cell's input DDIO registers (rwds domain).
-  logic [DQ_WIDTH-1:0] rx_hi, rx_lo;
-  generate
-    for (gi = 0; gi < DQ_WIDTH; gi = gi + 1) begin : g_rxmap
-      assign rx_hi[gi] = dq_dout[2*gi+1];   // sampled at strobe rise (byte A)
-      assign rx_lo[gi] = dq_dout[2*gi];     // sampled at strobe fall (byte B)
-    end
-  endgenerate
+  wire [DQ_WIDTH-1:0] dq_raw   = hb_dq;     // raw input-buffer view (fabric)
+  wire                rwds_raw = hb_rwds;   // raw RWDS view
 
   // ================================================================================================
   //  CK — vendor DDR-out GPIO cell with clock-enable: emits clk on the pin while cke is high.
@@ -162,45 +157,98 @@ module hyperbus_gpio_io #(
   assign hb_rwds = rwoe_q ? rwds_ddr_out : 1'bz;
 
   // ================================================================================================
-  //  RX : strobe-domain byte pairing + preamble skip + elastic FIFO + clk-side drain.
-  //  Same machinery proven in the DDIO bring-up (hyperbus_phy_altera FABRIC scheme): the pairing
-  //  process clocks on the raw strobe and reads the cell's dout rails one edge late (pre-edge
-  //  views => matched {A(n),B(n)} pairs, prime-gated first push); the whole write side is held in
-  //  async reset by rx_flush_q (clk-registered, glitch-free) while the receiver is disarmed.
+  //  RX : LOCAL1X — both-edge fabric sampling at the 1x clock + the silicon-proven SDR edge-detect
+  //  pairing. posedge and negedge registers each sample DQ/RWDS once per clk, yielding the same
+  //  2-samples-per-CK stream the SDR PHY's algorithm consumed from its 2x clock — with NO 2x clock.
+  //  The pairing FSM is fully synchronous in the clk domain and processes both samples per cycle in
+  //  arrival order (pos_q from the previous posedge, then neg_q from the mid-cycle negedge). RWDS
+  //  RISING edges across consecutive samples tag byte A, falling edges complete {A,B} words —
+  //  self-aligning against the device's tCKDS flight-delay phase, exactly like the SDR PHY.
   // ================================================================================================
   localparam int unsigned RXF_DEPTH = 32;
   localparam int unsigned RXF_AW    = $clog2(RXF_DEPTH);
   localparam int unsigned SKIPW     = (RD_PREAMBLE_SKIP == 0) ? 1 : $clog2(RD_PREAMBLE_SKIP + 1);
 
-  logic [PHYW-1:0]  rxf_mem [RXF_DEPTH];
-  logic [RXF_AW:0]  wptr_bin, rptr_bin;
-  logic [SKIPW-1:0] pre_skip = SKIPW'(RD_PREAMBLE_SKIP);
-  logic             rx_prime;
-
-  logic rx_flush_q;
+  // Both-edge input sampling (reset-less datapath). neg-edge regs are retimed into the posedge
+  // domain half a cycle later (a constrained 2.5 ns path at 200 MHz).
+  logic [DQ_WIDTH-1:0] dq_pos_q, dq_neg_q, dq_neg_ret;
+  logic                rwds_pos_q, rwds_neg_q, rwds_neg_ret;
   always_ff @(posedge clk) begin
-    if (rst) rx_flush_q <= 1'b1;
-    else     rx_flush_q <= ~phy_rd_arm;
+    dq_pos_q   <= dq_raw;
+    rwds_pos_q <= rwds_raw;
+  end
+  /* verilator lint_off SYNCASYNCNET */
+  always_ff @(negedge clk) begin
+    dq_neg_q   <= dq_raw;
+    rwds_neg_q <= rwds_raw;
+  end
+  /* verilator lint_on SYNCASYNCNET */
+  always_ff @(posedge clk) begin
+    dq_neg_ret   <= dq_neg_q;
+    rwds_neg_ret <= rwds_neg_q;
   end
 
-  /* verilator lint_off SYNCASYNCNET */
-  always_ff @(posedge rwds_raw or posedge rx_flush_q) begin
-    if (rx_flush_q) begin
-      wptr_bin <= '0;
-      rx_prime <= 1'b0;
-      pre_skip <= SKIPW'(RD_PREAMBLE_SKIP);
-    end else if (pre_skip != '0) begin
-      pre_skip <= pre_skip - 1'b1;
-      rx_prime <= 1'b0;
+  logic [PHYW-1:0]  rxf_mem [RXF_DEPTH];
+  logic [RXF_AW:0]  wptr_bin, rptr_bin;
+  logic [SKIPW-1:0] pre_skip;
+  logic [DQ_WIDTH-1:0] rx_byte_a;
+  logic have_a, rwds_prev;
+
+  // Two-sample-per-cycle SDR pairing, unrolled. Sample order each posedge k:
+  //   s0 = {rwds_neg_ret, dq_neg_ret}  (captured at negedge k-1.5 -> retimed; OLDER)
+  //   s1 = {rwds_pos_q,   dq_pos_q}    (captured at posedge k-1;   NEWER)
+  wire s0_rise =  rwds_neg_ret & ~rwds_prev;
+  wire s0_fall = ~rwds_neg_ret &  rwds_prev;
+  wire s1_rise =  rwds_pos_q   & ~rwds_neg_ret;
+  wire s1_fall = ~rwds_pos_q   &  rwds_neg_ret;
+
+  // At a CK-rate strobe, the two samples of one clk cycle can carry at most ONE completed word
+  // (a fall needs a preceding rise; two falls per cycle would need a 2x-rate strobe). Single-push
+  // logic, cases enumerated:
+  //   (s0_fall)            -> completes the word begun in an earlier cycle
+  //   (s0_rise, s1_fall)   -> rise and completion within this cycle ({dq_neg_ret, dq_pos_q})
+  //   (s1_fall)            -> completes the word begun earlier
+  //   rises without falls  -> just load/skip byte A
+  wire s0_ok = (pre_skip == '0);
+  logic            push;
+  logic [PHYW-1:0] pushval;
+  always_comb begin
+    push    = 1'b0;
+    pushval = '0;
+    if (s0_fall && have_a) begin
+      push    = 1'b1;
+      pushval = {rx_byte_a, dq_neg_ret};
+    end else if (s1_fall && (s0_rise ? s0_ok : have_a)) begin
+      push    = 1'b1;
+      pushval = {s0_rise ? dq_neg_ret : rx_byte_a, dq_pos_q};
+    end
+  end
+
+  always_ff @(posedge clk) begin
+    if (rst || !phy_rd_arm) begin
+      wptr_bin  <= '0;
+      have_a    <= 1'b0;
+      rwds_prev <= 1'b0;
+      pre_skip  <= SKIPW'(RD_PREAMBLE_SKIP);
+      rx_byte_a <= '0;
     end else begin
-      rx_prime <= 1'b1;
-      if (rx_prime) begin
-        rxf_mem[wptr_bin[RXF_AW-1:0]] <= {rx_hi, rx_lo};
+      rwds_prev <= rwds_pos_q;
+      // preamble skip consumes rising edges (at most one rise per cycle at a CK-rate strobe)
+      if ((s0_rise || s1_rise) && pre_skip != '0) begin
+        pre_skip <= pre_skip - 1'b1;
+        have_a   <= 1'b0;
+      end else begin
+        // byte-A load: the newest unconsumed rise wins; a push consumes the pending A
+        if (s1_rise)                 begin rx_byte_a <= dq_pos_q;  have_a <= 1'b1; end
+        else if (s0_rise && !s1_fall) begin rx_byte_a <= dq_neg_ret; have_a <= 1'b1; end
+        else if (push)               have_a <= 1'b0;
+      end
+      if (push) begin
+        rxf_mem[wptr_bin[RXF_AW-1:0]] <= pushval;
         wptr_bin                      <= wptr_bin + 1'b1;
       end
     end
   end
-  /* verilator lint_on SYNCASYNCNET */
 
   wire  [RXF_AW:0] wptr_gray = wptr_bin ^ (wptr_bin >> 1);
   logic [RXF_AW:0] wgray_s1, wgray_s2;

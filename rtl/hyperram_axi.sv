@@ -277,12 +277,8 @@ module hyperram_axi
     .LEN_WIDTH    (LEN_WIDTH),
     .PHY_VARIANT  (PHY_VARIANT),
     .DIFF_CK      (DIFF_CK),
-<<<<<<< HEAD
     .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP),
     .CK_SCHEME    (CK_SCHEME)
-=======
-    .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP)
->>>>>>> issue6-generic-parity
   ) u_phy (
     .clk            (clk),
     .clk90          (clk90),
