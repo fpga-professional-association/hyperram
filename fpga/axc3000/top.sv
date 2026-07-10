@@ -332,9 +332,11 @@ module top (
     .dbg_rd_rptr    (ctrl_dbg_seg)
   );
 
-  // dbg_bus for the capture module — same field map as hyperram_avalon's
-  assign av_dbg = {2'd0, cmd_len[5:0], ctrl_dbg_seg, ctrl_dbg_rem, rd_last, rd_ready, rd_valid,
-                   phy_dq_i_valid_w, cmd_ready, cmd_valid, fe_dbg_state, ctrl_dbg_state};
+  // dbg_bus for the capture module — REPURPOSED as an Avalon read-stream logger (error-map debug):
+  // [16] = av_readdatavalid, [15:0] = av_readdata. Each capture sample with bit16 set carries one
+  // returned read word; comparing against gen_pattern gives the complete per-word error vector of
+  // a small run (the ctrl-tap map it replaces is preserved in git history).
+  assign av_dbg = {15'd0, av_readdatavalid, av_readdata};
 
   // Board I/O layer: vendor GPIO cells (DQ bidir DDR w/ delay, CK DDR out w/ CKE) + proven RWDS path.
   hyperbus_gpio_io #(
