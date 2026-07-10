@@ -23,6 +23,8 @@ if {$argc >= 1} { set LEN_WORDS [lindex $argv 0] }
 if {$argc >= 2} { set BASE_ADDR [lindex $argv 1] }
 if {$argc >= 3} { set BURSTW    [lindex $argv 2] }
 if {$argc >= 4} { set F_CLK [expr {double([lindex $argv 3]) * 1.0e6}] }   ;# arg 4 = clk (word) freq in MHz
+set CALV -1                ;# arg 5 = REG_CAL image (live read-eye cal, issue #10: [0]=capture_phase
+if {$argc >= 5} { set CALV [lindex $argv 4] }   ;# [3:1]=preamble_skip [8:4]=rx_tap [9]=pair_skew); -1 => POR seed
 
 # CSR byte offsets
 set CTRL   0x00
@@ -38,6 +40,7 @@ set ERRADDR 0x20   ;# first-mismatch WORD address
 set ERRGOT  0x24   ;# first-mismatch value returned
 set ERREXP  0x28   ;# first-mismatch value expected
 set BURSTWR 0x2C   ;# R/W HyperBus burst length (words)
+set CALR    0x34   ;# R/W live PHY read-eye calibration image (issue #10 REG_CAL)
 
 # ---- helpers -------------------------------------------------------------
 proc rd32 {m a} {
@@ -74,6 +77,10 @@ master_write_32 $m $LEN  $LEN_WORDS
 master_write_32 $m $BASE $BASE_ADDR
 if {$BURSTW != 0} { master_write_32 $m $BURSTWR $BURSTW }
 if {$BURSTW != 0} { master_write_32 $m 0x30 $BURSTW }  ;# REG_RBURSTW (issue #2): read burst = write burst
+if {$CALV != -1} {
+    master_write_32 $m $CALR $CALV
+    puts [format "REG_CAL       = 0x%08X (live read-eye cal)" [rd32 $m $CALR]]
+}
 set burstw_now [rd32 $m $BURSTWR]
 puts [format "BURST_WORDS   = %d (HyperBus burst length)" $burstw_now]
 

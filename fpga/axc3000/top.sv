@@ -201,7 +201,11 @@ module top (
     .BURST_WORDS    (64),              // EXPERIMENT: larger Avalon burst — writes LEN<=64 as ONE HyperBus
                                        // burst (no write->write boundary) to confirm the boundary drop
     .CSR_ADDR_WIDTH (CSR_AW),
-    .VERSION_MAGIC  (32'h4842_5754)    // "HBWT"
+    .VERSION_MAGIC  (32'h4842_5754),   // "HBWT"
+    // REG_CAL (word 13/0x34) POR seed: [3:1]=preamble_skip=1 matches u_io's RD_PREAMBLE_SKIP(1).
+    // On THIS build the cal_* outputs are readback-only: the GPIO-cell I/O layer's knobs are
+    // compile-time (ALTERA DDIO runtime paths are issue-#3-gated), so they fan out nowhere.
+    .CAL_RESET      (32'h0000_0002)
   ) u_bw (
     .clk             (clk),     // 50 MHz CK word clock (controller)
     .rst             (sys_rst),
@@ -220,7 +224,12 @@ module top (
     .m_writedata     (av_writedata),
     .m_readdata      (av_readdata),
     .m_readdatavalid (av_readdatavalid),
-    .m_waitrequest   (av_waitrequest)
+    .m_waitrequest   (av_waitrequest),
+    // Runtime read-eye cal outputs (v9): readback-only here — see the CAL_RESET note above.
+    .cal_capture_phase (),
+    .cal_preamble_skip (),
+    .cal_rx_tap        (),
+    .cal_pair_skew     ()
   );
 
   // ---- native fe <-> ctrl channels (hyperram_avalon inlined for the GPIO-cell I/O build) ------
@@ -291,10 +300,14 @@ module top (
     .INIT_CR0          (16'h8F1F),
     // Silicon findings, now first-class controller features (wave-1 ctrl-cluster):
     .BURST_BOUNDARY_WORDS (16'h2000),  // W957D8NB releases the bus when a burst crosses 16 KB
-    .WR_COMMIT_READ       (1'b1),      // composition: commit-read covers the chop/boundary splits
-    .COMMIT_READ_MODE     ("FULL_BURST"),
+    .WR_COMMIT_READ       (1'b0),      // 2026-07-10 silicon: read-shaped interposes NEVER commit a
+                                       //   write->write pending tail (FULL_BURST included) — replay
+                                       //   below is the working fix, and dropping the interpose also
+                                       //   drops its whole-segment re-read cost at every split
     .WR_COALESCE          (1'b1),      // issue #1 direction 4: merge contiguous writes into one CS#
     .WR_COALESCE_WAIT     (8),
+    .WR_CHOP_REPLAY       (1'b1),      // issue #1 direction 5: re-send the 4-word tail the device
+    .WR_REPLAY_WORDS      (4),         //   drops at every forced chop (tCSM / 16 KB boundary)
     .WR_LAT_TRIM          (3)          // silicon-measured: device write window opens 3 CK early
   ) u_ctrl (
     .clk            (clk),
