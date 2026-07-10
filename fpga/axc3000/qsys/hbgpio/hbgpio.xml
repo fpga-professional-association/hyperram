@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <deploy
- date="2026.07.09.22:00:01"
+ date="2026.07.10.01:06:38"
  outputDirectory="/workspace/fpga/axc3000/qsys/hbgpio/">
  <perimeter>
   <parameter

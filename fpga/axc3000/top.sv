@@ -285,13 +285,14 @@ module top (
     .LEN_WIDTH         (16),
     .LATENCY_CLOCKS    (6),
     .FIXED_LATENCY     (1'b1),
-    .MAX_BURST_WORDS   (0),
+    .MAX_BURST_WORDS   (512),         // tCSM chop budget for coalesced streams (~2.9us @175, huge margin vs ~15us)
     .PROGRAM_CR        (1'b1),
     .POR_DELAY_CYCLES  (0),
     .INIT_CR0          (16'h8F1F),
     // Silicon findings, now first-class controller features (wave-1 ctrl-cluster):
     .BURST_BOUNDARY_WORDS (16'h2000),  // W957D8NB releases the bus when a burst crosses 16 KB
-    .WR_COMMIT_READ       (1'b0),      // A/B isolation: coalescing alone (config A)
+    .WR_COMMIT_READ       (1'b1),      // composition: commit-read covers the chop/boundary splits
+    .COMMIT_READ_MODE     ("FULL_BURST"),
     .WR_COALESCE          (1'b1),      // issue #1 direction 4: merge contiguous writes into one CS#
     .WR_COALESCE_WAIT     (8),
     .WR_LAT_TRIM          (3)          // silicon-measured: device write window opens 3 CK early
