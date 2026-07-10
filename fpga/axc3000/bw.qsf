@@ -27,8 +27,11 @@ set_global_assignment -name QIP_FILE qsys/hbgpio/hbgpio.qip
 set_global_assignment -name IP_FILE  qsys/ip/hbgpio/hbgpio_ck_cell.ip
 set_global_assignment -name IP_FILE  qsys/ip/hbgpio/hbgpio_dq_cell.ip
 
-# Fitter/synthesis aggressiveness for 200 MHz fabric closure
-set_global_assignment -name OPTIMIZATION_MODE "SUPERIOR PERFORMANCE"
+# Fitter/synthesis aggressiveness for 200 MHz fabric closure. MAXIMUM PLACEMENT EFFORT added
+# 2026-07-09: the integrated replay+cal build missed setup by -0.055 ns on 9 paths into ONE
+# rd_fifo M20K input register (u_bw S_RSTART -> u_ctrl) at the Slow-0C corner — placement luck,
+# not architecture; the higher effort closes it without RTL churn.
+set_global_assignment -name OPTIMIZATION_MODE "SUPERIOR PERFORMANCE WITH MAXIMUM PLACEMENT EFFORT"
 
 # ---- HyperBus master IP + bandwidth harness (package FIRST) ----
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/hyperbus_pkg.sv

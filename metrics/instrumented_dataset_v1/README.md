@@ -1,5 +1,12 @@
 # Instrumented FPGA Dataset v1 — `infra-hyperram`
 
+> **Frozen snapshot (captured 2026-07-08).** The measurements below describe the state at capture
+> time and are intentionally NOT updated with later progress — they are provenance for
+> `fpga_dataset_v1.db`. In particular, the "PNR BLOCKED / no bitstream / hardware verification
+> BLOCKED" rows were subsequently RESOLVED on the `ddio-200` branch (Fitter 24403/24404 fixed,
+> bitstreams produced, silicon-verified up to 344.7/337.3 MB/s at 175 MHz with `ERR_COUNT=0`) —
+> see `fpga/axc3000/README.md` for the current hardware status.
+
 Machine-readable log of an **AI-led FPGA IP generation** run: the clean-room
 HyperBus/HyperRAM controller IP in this repo (controller + AXI4/Avalon front-ends
 + PHY + bandwidth test), built by an agentic LLM (Claude Opus 4.8) under the Claude
