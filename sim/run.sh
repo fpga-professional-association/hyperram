@@ -97,6 +97,12 @@ run_one tb_reg.sv      tb_reg
 run_one tb_axi_wrap.sv tb_axi_wrap
 run_one tb_xilinx.sv   tb_xilinx     "${XILINX_SIM_SRCS[@]}"
 run_one tb_commit.sv     tb_commit     "${BENCH_SRCS[@]}"
+# Spec-feature TBs (issue #5): CR1 init write, POR/reset AC-timing, Deep-Power-Down enter/exit, and
+# active clock-stop on read back-pressure.
+run_one tb_cr1init.sv    tb_cr1init      # issue #5 A3: CR1 init write
+run_one tb_por_timing.sv tb_por_timing   # issue #5 A4: POR/reset AC-timing
+run_one tb_dpd.sv        tb_dpd          # issue #5 A1: Deep Power-Down enter/exit
+run_one tb_clkstop.sv    tb_clkstop      # issue #5 A2: active clock-stop
 
 echo "=================================================================="
 if [ "$overall" -eq 0 ]; then

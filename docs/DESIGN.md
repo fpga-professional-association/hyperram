@@ -154,10 +154,24 @@ lets the *generic* PHY be a thin, inferrable, Verilator-clean DDR wrapper while 
 
 ## 5. Transaction flow (reference)
 
-1. **POR init** (`hb_init`): hold `hb_rst_n` low ≥ tRPH, wait the configured POR delay (~150 µs
-   modeled as a cycle count param), then, if `PROGRAM_CR` is set, issue a register-space write of CR0
-   (latency code + fixed/variable + burst config from parameters) and optionally CR1. Assert
-   `init_done`. User commands are gated until `init_done`.
+1. **POR init** (`ST_RESET`→`ST_POR`→`ST_INIT`): pulse `hb_rst_n` low for the reset window, wait the
+   post-reset gap, then, if `PROGRAM_CR` is set, issue a register-space (zero-latency) write of CR0
+   (latency code + fixed/variable + burst config from parameters); if `PROGRAM_CR1` is also set, a
+   **second** zero-latency write of `INIT_CR1` follows (§8.2 — CR1 holds distributed-refresh / PASR /
+   hybrid-sleep on real HyperRAM). Assert `init_done`; user commands are gated until then.
+   - **Reset AC-timing (Table 8.3).** The reset-pulse and post-reset-gap cycle counts are **derived from
+     ns/µs spec timings** when `CLK_FREQ_MHZ ≠ 0`: `RESET_CYCLES = ceil(tRP / tCK)` (tRP ≥ 200 ns); the
+     `ST_POR` dwell before the first CS# = `max(POR_DELAY_CYCLES, ceil(tRH/tCK), ceil((tRPH−tRP)/tCK),
+     tVCS·f)` so it satisfies **tRH ≥ 200 ns**, **tRPH ≥ 400 ns** (from reset fall) and **tVCS ≤ 150 µs**
+     (VCC-valid → first access) at once. `CLK_FREQ_MHZ = 0` keeps the legacy fixed `RESET_CYCLES = 8` and
+     the raw `POR_DELAY_CYCLES` (unchanged for every existing instantiation).
+   - **Deep-Power-Down (§5.2.1, `SUPPORT_DPD`).** A host CR0 register write with CR0[15]=0 is snooped and
+     latches an internal DPD flag; the next command is then preceded by a guarded wake — a CS# wake pulse
+     (device exits DPD) plus a `TDPDOUT_CYCLES` dwell (tDPDOUT) — before it reaches the bus.
+   - **Active clock-stop (§1, `ACTIVE_CLK_STOP`).** During a read, `phy_ck_en` is deasserted on word
+     boundaries once the read holding-FIFO passes its high-water mark (caller back-pressure via
+     `rd_ready`), halting the device instead of dropping words; the RWDS-Low stall timeout is frozen for
+     the intentional pause. CK resumes when the caller drains.
 2. **Command accept:** on `cmd_valid & cmd_ready`, latch read/reg/wrap/addr/len; build the 48-bit CA
    with `hb_pack_ca()`.
 3. **CA phase:** drop `phy_cs_n`, run CK, drive the 6 CA bytes over 3 cycles (`phy_dq_o` word pairs).
