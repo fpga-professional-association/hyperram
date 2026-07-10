@@ -1,13 +1,18 @@
-// tb_local1x — phase-sweep regression for the LOCAL1X RX pairing in fpga/axc3000/hyperbus_gpio_io.sv.
+// tb_local1x — phase-sweep regression for the QUAD1X RX pairing in fpga/axc3000/hyperbus_gpio_io.sv
+// (module/file names kept as "local1x" for continuity; the DUT's RX now samples FOUR phases per
+// word cycle — clk pos/neg (0/180 deg) AND clk_smp pos/neg (90/270 deg) — not two).
 //
-// The LOCAL1X claim: both-edge fabric sampling on a phase-shifted 1x clock + RWDS edge-detect
-// pairing recovers the read byte stream for ANY flight-delay phase (the property the SDR PHY's
-// 2x scheme demonstrated on silicon). The reusable local1x_harness below instantiates
-// hyperbus_gpio_io (with the behavioral atom stubs from sim/model/gpio_io_sim_stubs.sv), drives a
-// synthetic device read burst — optional preamble cycle, N data words, over-stream stragglers —
-// onto hb_dq/hb_rwds with a swept launch phase PHI in [0, T), and checks the recovered words for
-// every phase step. The controller re-arms per burst; the disarm between phases must flush the
-// over-stream words so the next burst starts clean.
+// The claim under test: edge-detect pairing over a 4-phase (0/90/180/270 deg), all-1x-clocked
+// sample stream recovers the read byte stream for ANY flight-delay phase AND absorbs the brief
+// device output-timing wobble at page crossings (see WOBBLE_* below) — the property the
+// source-synchronous SDR PHY demonstrated on silicon, now at quarter-cycle resolution with no 2x
+// clock anywhere (the min-pulse-limited 2x clock is out of bounds for a 200 MHz build). The
+// reusable local1x_harness below instantiates hyperbus_gpio_io (with the behavioral atom stubs
+// from sim/model/gpio_io_sim_stubs.sv), drives a synthetic device read burst — optional preamble
+// cycle, N data words (one of which wobbles), over-stream stragglers — onto hb_dq/hb_rwds with a
+// swept launch phase PHI in [0, T), and checks the recovered words for every phase step. The
+// controller re-arms per burst; the disarm between phases must flush the over-stream words so the
+// next burst starts clean.
 //
 // tb_local1x drives the harness in TWO configurations from a single run:
 //   * h_hostile : ARM_DELAY_CYCLES=16, HOSTILE window (latency indicator + float-coupling RWDS
@@ -15,6 +20,9 @@
 //   * h_benign  : ARM_DELAY_CYCLES=0  (arm immediately), benign window (no float runts) — the
 //                 parameter-sweep sanity check that the pairing + arm/disarm path is correct even
 //                 with zero blind delay.
+// Both configurations also carry the page-crossing wobble (WOBBLE_* parameters, default period 16
+// / offset 7 / 0.6 ns) on top of their own hazard, since the wobble is a device-side effect
+// independent of the arm-delay/float-window receiver-side hazard.
 //
 // Runs under: verilator --binary --timing (5.020).
 
@@ -31,7 +39,17 @@ module local1x_harness #(
     parameter int unsigned PREAMBLE  = 1,      // device preamble CK cycles
     parameter int unsigned N_PHASES  = 20,     // PHI sweep steps across one CK period
     parameter int unsigned ARM_DELAY = 16,     // hyperbus_gpio_io ARM_DELAY_CYCLES
-    parameter bit          HOSTILE   = 1'b1    // 1 = latency indicator + float runts; 0 = benign
+    parameter bit          HOSTILE   = 1'b1,   // 1 = latency indicator + float runts; 0 = benign
+    // Device page-crossing output wobble (silicon finding: the W957D8NB's 32-byte internal page =
+    // 16 words; right at the crossing the device's output launch edge lands ~0.6 ns late for ONE
+    // edge, then SNAPS BACK onto the normal CK grid for the very next edge — a brief output-timing
+    // shift, not data corruption, and not a cumulative phase shift into the rest of the stream. A
+    // fixed 2-sample/cycle grid clips it (one bit flip on silicon); the QUAD1X 4-phase edge-detect
+    // pairing must follow it like the source-synchronous SDR PHY did. Silicon-observed period 16,
+    // first-hit offset 7 (words 7,23,39,55,... on a burst starting at word 0).
+    parameter int unsigned WOBBLE_PERIOD = 16,
+    parameter int unsigned WOBBLE_OFFSET = 7,
+    parameter realtime     WOBBLE_NS     = 0.6
 ) (
     input  logic        clk,
     input  logic        clk_smp,
@@ -90,6 +108,12 @@ module local1x_harness #(
     return x[15:0];
   endfunction
 
+  // Page-crossing wobble extra delay for word k's byte-A launch (0 for every word except the
+  // periodic crossing hit) — see WOBBLE_* parameters above.
+  function automatic realtime wobble_of(input int unsigned k);
+    return ((k % WOBBLE_PERIOD) == WOBBLE_OFFSET) ? WOBBLE_NS : 0.0;
+  endfunction
+
   // Drive one device read burst launched at absolute phase offset phi (ns) after a clk edge.
   task automatic drive_burst(input realtime phi);
     if (HOSTILE) begin
@@ -121,11 +145,17 @@ module local1x_harness #(
         dev_rwds = 1'b1; #(T_CK/2.0);
         dev_rwds = 1'b0; #(T_CK/2.0);
       end
-      // data words + over-stream, byte A during RWDS high, byte B during low
+      // data words + over-stream, byte A during RWDS high, byte B during low. Page-crossing wobble:
+      // word k's byte-A rise is delayed wob (0 or WOBBLE_NS), then the byte-A window is shortened
+      // by the same amount so the falling edge (and every edge after it) lands back on the normal
+      // CK grid — a brief, self-correcting timing shift, not a data error and not a phase drift.
       for (int unsigned k = 0; k < N_WORDS + N_OVER; k++) begin
         logic [15:0] w;
-        w        = pat(k);
-        dev_dq   = w[15:8];  dev_rwds = 1'b1; #(T_CK/2.0);
+        realtime     wob;
+        w   = pat(k);
+        wob = wobble_of(k);
+        #(wob);
+        dev_dq   = w[15:8];  dev_rwds = 1'b1; #(T_CK/2.0 - wob);
         dev_dq   = w[7:0];   dev_rwds = 1'b0; #(T_CK/2.0);
       end
       dev_rwds_en = 1'b0;
@@ -144,11 +174,15 @@ module local1x_harness #(
         dev_rwds = 1'b1; #(T_CK/2.0);
         dev_rwds = 1'b0; #(T_CK/2.0);
       end
-      // data words + over-stream, byte A during RWDS high, byte B during low
+      // data words + over-stream, byte A during RWDS high, byte B during low (page-crossing wobble
+      // applied the same way as the hostile branch — see the comment there).
       for (int unsigned k = 0; k < N_WORDS + N_OVER; k++) begin
         logic [15:0] w;
-        w        = pat(k);
-        dev_dq   = w[15:8];  dev_rwds = 1'b1; #(T_CK/2.0);
+        realtime     wob;
+        w   = pat(k);
+        wob = wobble_of(k);
+        #(wob);
+        dev_dq   = w[15:8];  dev_rwds = 1'b1; #(T_CK/2.0 - wob);
         dev_dq   = w[7:0];   dev_rwds = 1'b0; #(T_CK/2.0);
       end
       dev_rwds = 1'b0;      // back to driven idle

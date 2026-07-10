@@ -236,25 +236,47 @@ module hyperbus_gpio_io #(
   localparam int unsigned RXF_AW    = $clog2(RXF_DEPTH);
   localparam int unsigned SKIPW     = (RD_PREAMBLE_SKIP == 0) ? 1 : $clog2(RD_PREAMBLE_SKIP + 1);
 
-  // Both-edge input sampling (reset-less datapath). neg-edge regs are retimed into the posedge
-  // domain half a cycle later (a constrained 2.5 ns path at 200 MHz).
-  // Both-edge sampling on clk_smp (phase-shifted): with +90 deg the two sample points land at
-  // T/4 and 3T/4 of each clk cycle, and both are stable by the next clk posedge (related-clock
-  // paths, STA-timed). s0 = the posedge-clk_smp sample (older), s1 = the negedge sample (newer).
-  // RX sampling clock: the LOCAL1X pairing is sample-phase-free (proven across all 20 phases in
-  // tb_local1x), so under CK_GEN="FABRIC2X" — where clk_smp carries the 2x CK-generator clock —
-  // the sampler falls back to clk itself (2 samples per word cycle either way).
-  wire rx_smp_clk = (CK_GEN == "FABRIC2X") ? clk : clk_smp;
-  logic [DQ_WIDTH-1:0] dq_s0_q, dq_s1_q;
-  logic                rwds_s0_q, rwds_s1_q;
-  always_ff @(posedge rx_smp_clk) begin
-    dq_s0_q   <= dq_raw;
-    rwds_s0_q <= rwds_raw;
+  // Both-edge input sampling (reset-less datapath), read DIRECTLY by the posedge-clk FSM below —
+  // NO extra retiming stage on any of the four taps. This matters: a register that is itself
+  // clocked by posedge clk (dq_p0_q) is necessarily read STALE by another posedge-clk process (the
+  // FSM), because both fire on the identical edge and the FSM's Active-region read always sees the
+  // pre-this-edge value — i.e. one full clk cycle after capture (s0 = k-1, not k-0). dq_p180_q
+  // avoids that penalty because its OWN capture edge (negedge clk) falls chronologically BEFORE the
+  // FSM's posedge within the same cycle, so the FSM always sees the freshly captured value (s2 =
+  // k-0.5, a plain 2.5 ns related-clock path). The clk_smp taps (dq_p90_q/dq_p270_q) are exactly
+  // analogous to dq_p180_q, not to dq_p0_q: clk_smp's posedge/negedge (T/4, 3T/4 into the clk cycle)
+  // also land chronologically before the FSM's NEXT posedge clk, so a DIRECT read lands at s1 =
+  // k-0.75 / s3 = k-0.25 (related-clock paths, STA-timed, same treatment as dq_p180_q) with no extra
+  // latency. An earlier revision added a `dq_p90_r/dq_p270_r <= dq_p90_q/dq_p270_q` retiming stage
+  // clocked by posedge clk "to bring them into the clk domain" — but that retiming register is
+  // ITSELF a posedge-clk register read by the posedge-clk FSM, so it suffers the exact dq_p0_q-style
+  // one-cycle read penalty ON TOP of its intended 0.75/0.25-cycle age, landing at k-1.75 / k-1.25
+  // instead — scrambling the true chronological sample order (90 deg data ends up OLDER than 0 deg,
+  // 270 deg OLDER than 0 deg) and producing a phantom word at the very first processed edge
+  // (sim-confirmed: a free-running time-fingerprint probe showed the retimed taps trailing the
+  // direct taps by exactly one clk period, every cycle). Removed; do not reintroduce it.
+  // QUAD1X sampling: four phases per word cycle from TWO 1x clocks — clk (0/180 deg via pos/neg
+  // edge) and clk_smp (90/270 deg) — the oversampling density of a 2x clock with NO 2x clock (the
+  // min-pulse ceiling does not apply). The device's output timing wobbles briefly at its internal
+  // 32-byte page crossings (silicon: one bit0 flip every 16 words on a fixed grid — knob-immune);
+  // edge-detect pairing over the 4-phase stream follows RWDS at quarter-cycle resolution the way
+  // the source-synchronous SDR PHY did, absorbing the wobble.
+  // Under CK_GEN="FABRIC2X" clk_smp carries the 2x CK clock instead — fall back to 2-phase clk-only
+  // sampling (the 175 MHz configuration, already silicon-proven clean).
+  logic [DQ_WIDTH-1:0] dq_p0_q, dq_p90_q, dq_p180_q, dq_p270_q;
+  logic                rw_p0_q, rw_p90_q, rw_p180_q, rw_p270_q;
+  always_ff @(posedge clk) begin
+    dq_p0_q <= dq_raw; rw_p0_q <= rwds_raw;
   end
   /* verilator lint_off SYNCASYNCNET */
-  always_ff @(negedge rx_smp_clk) begin
-    dq_s1_q   <= dq_raw;
-    rwds_s1_q <= rwds_raw;
+  always_ff @(negedge clk) begin
+    dq_p180_q <= dq_raw; rw_p180_q <= rwds_raw;
+  end
+  always_ff @(posedge clk_smp) begin
+    dq_p90_q <= dq_raw; rw_p90_q <= rwds_raw;
+  end
+  always_ff @(negedge clk_smp) begin
+    dq_p270_q <= dq_raw; rw_p270_q <= rwds_raw;
   end
   /* verilator lint_on SYNCASYNCNET */
 
@@ -264,13 +286,25 @@ module hyperbus_gpio_io #(
   logic [DQ_WIDTH-1:0] rx_byte_a;
   logic have_a, rwds_prev;
 
-  // Two-sample-per-cycle SDR pairing, unrolled. Sample order each posedge k:
-  //   s0 = {rwds_neg_ret, dq_neg_ret}  (captured at negedge k-1.5 -> retimed; OLDER)
-  //   s1 = {rwds_pos_q,   dq_pos_q}    (captured at posedge k-1;   NEWER)
-  wire s0_rise =  rwds_s0_q & ~rwds_prev;
-  wire s0_fall = ~rwds_s0_q &  rwds_prev;
-  wire s1_rise =  rwds_s1_q & ~rwds_s0_q;
-  wire s1_fall = ~rwds_s1_q &  rwds_s0_q;
+  // Four samples per processing cycle, arrival order (all values from the PREVIOUS word cycle,
+  // stable in the clk domain at this posedge):
+  //   s[0] = 0 deg (dq_p0_q),  s[1] = 90 deg (dq_p90_q), s[2] = 180 deg (dq_p180_q),
+  //   s[3] = 270 deg (dq_p270_q)
+  // Under FABRIC2X only s[0]/s[2] carry unique data (clk_smp is the 2x clock there) — the rise/fall
+  // detect still works because duplicate samples produce no extra edges.
+  wire [3:0]              smp_rw = (CK_GEN == "FABRIC2X")
+                                   ? {rw_p180_q, rw_p180_q, rw_p0_q, rw_p0_q}
+                                   : {rw_p270_q, rw_p180_q, rw_p90_q, rw_p0_q};
+  logic [DQ_WIDTH-1:0]    smp_dq [4];
+  always_comb begin
+    if (CK_GEN == "FABRIC2X") begin
+      smp_dq[0] = dq_p0_q;   smp_dq[1] = dq_p0_q;
+      smp_dq[2] = dq_p180_q; smp_dq[3] = dq_p180_q;
+    end else begin
+      smp_dq[0] = dq_p0_q;   smp_dq[1] = dq_p90_q;
+      smp_dq[2] = dq_p180_q; smp_dq[3] = dq_p270_q;
+    end
+  end
 
   // Effective arm = controller arm, rise-delayed by ARM_DELAY_CYCLES (fall passes through, so the
   // disarm flush is never delayed). Keeps the receiver blind through the latency-window float
@@ -289,60 +323,51 @@ module hyperbus_gpio_io #(
     end
   end
 
-  // At a CK-rate strobe, the two samples of one clk cycle can carry at most ONE completed word
-  // (a fall needs a preceding rise; two falls per cycle would need a 2x-rate strobe). Single-push
-  // logic, cases enumerated:
-  //   (s0_fall)            -> completes the word begun in an earlier cycle
-  //   (s0_rise, s1_fall)   -> rise and completion within this cycle ({dq_neg_ret, dq_pos_q})
-  //   (s1_fall)            -> completes the word begun earlier
-  //   rises without falls  -> just load/skip byte A
-  wire s0_ok = (pre_skip == '0);
-  logic            push;
-  logic [PHYW-1:0] pushval;
-  always_comb begin
-    push    = 1'b0;
-    pushval = '0;
-    if (s0_fall && have_a) begin
-      push    = 1'b1;
-      pushval = {rx_byte_a, dq_s0_q};
-    end else if (s1_fall && (s0_rise ? s0_ok : have_a)) begin
-      push    = 1'b1;
-      pushval = {s0_rise ? dq_s0_q : rx_byte_a, dq_s1_q};
-    end
-  end
-
+  // Sequential 4-sample scan per clk cycle (loop unrolled by synthesis). At a CK-rate strobe at
+  // most TWO words can complete per cycle (a full RWDS period spans 4 samples; wobble can squeeze
+  // two falls into one processing window) — the scan handles any mix, pushing per fall.
   always_ff @(posedge clk) begin
     if (rst || !rd_arm_eff) begin
       wptr_bin  <= '0;
       have_a    <= 1'b0;
-      rwds_prev <= rwds_s1_q;   // track the LIVE level while blind: no phantom edge at arm release
+      rwds_prev <= smp_rw[3];   // track the LIVE level while blind: no phantom edge at arm release
       pre_skip  <= SKIPW'(RD_PREAMBLE_SKIP);
       rx_byte_a <= '0;
     end else begin
-      rwds_prev <= rwds_s1_q;
-      // preamble skip consumes rising edges (at most one rise per cycle at a CK-rate strobe)
-      if ((s0_rise || s1_rise) && pre_skip != '0) begin
-        pre_skip <= pre_skip - 1'b1;
-        have_a   <= 1'b0;
-      end else begin
-        // byte-A load: the newest unconsumed rise wins; a push consumes the pending A
-        if (s1_rise)                 begin rx_byte_a <= dq_s1_q;  have_a <= 1'b1; end
-        else if (s0_rise && !s1_fall) begin rx_byte_a <= dq_s0_q; have_a <= 1'b1; end
-        else if (push)               have_a <= 1'b0;
+      logic                prev;
+      logic                hav;
+      logic [DQ_WIDTH-1:0] abyte;
+      logic [SKIPW-1:0]    skp;
+      logic [RXF_AW:0]     wp;
+      prev  = rwds_prev;
+      hav   = have_a;
+      abyte = rx_byte_a;
+      skp   = pre_skip;
+      wp    = wptr_bin;
+      for (int s = 0; s < 4; s++) begin
+        if (smp_rw[s] & ~prev) begin            // rise: byte A candidate
+          if (skp != '0) begin
+            skp = skp - 1'b1;
+            hav = 1'b0;
+          end else begin
+            abyte = smp_dq[s];
+            hav   = 1'b1;
+          end
+        end else if (~smp_rw[s] & prev & hav) begin   // fall: complete {A,B}
+          rxf_mem[wp[RXF_AW-1:0]] <= {abyte, smp_dq[s]};
+          wp  = wp + 1'b1;
+          hav = 1'b0;
+        end
+        prev = smp_rw[s];
       end
-      if (push) begin
-        rxf_mem[wptr_bin[RXF_AW-1:0]] <= pushval;
-        wptr_bin                      <= wptr_bin + 1'b1;
-      end
+      rwds_prev <= prev;
+      have_a    <= hav;
+      rx_byte_a <= abyte;
+      pre_skip  <= skp;
+      wptr_bin  <= wp;
     end
   end
 
-  // Gray-pointer synchroniser + read pointer track the SAME effective arm the write side uses
-  // (rd_arm_eff), NOT raw phy_rd_arm. The write pointer only advances under rd_arm_eff, so keying
-  // the synchroniser and read side on phy_rd_arm left them armed through the blind window and, more
-  // importantly, released one clk out of step with the write pointer at disarm — an incoherent-FIFO
-  // hazard. Unifying on rd_arm_eff resets write ptr, sync, and read ptr together at every (re)arm
-  // and disarm, so "empty" is always exact and the per-burst disarm flush is atomic.
   wire  [RXF_AW:0] wptr_gray = wptr_bin ^ (wptr_bin >> 1);
   logic [RXF_AW:0] wgray_s1, wgray_s2;
   always_ff @(posedge clk) begin
