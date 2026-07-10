@@ -33,12 +33,19 @@ BENCH_SRCS=(
   "$RTL/bench/hyperram_bw_top.sv"
 )
 
+# Xilinx primitive shim — ONLY needed by tb_xilinx (PHY_VARIANT="XILINX"). Deliberately NOT in
+# COMMON_SRCS: every other TB compiles hyperbus_phy_xilinx.sv but never selects the XILINX variant, so
+# its ODDR/IDDR/IDELAYE2/... instances sit in an elaboration-dead generate branch and need no shim.
+XILINX_SIM_SRCS=(
+  "$SIM/model/xilinx_prims_sim.sv"
+)
+
 # -Wall as required; a handful of benign lint classes are waived (vendor-PHY skeleton tie-offs,
 # testbench-only unused status/ID signals, timescale-on-some-modules, empty status pin taps).
 VFLAGS=(--binary --timing -Wall
         -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINCONNECTEMPTY
         -Wno-TIMESCALEMOD -Wno-INITIALDLY -Wno-fatal
-        -I"$RTL" -I"$RTL/if" -I"$RTL/phy" -j 0)
+        -I"$RTL" -I"$RTL/if" -I"$RTL/phy" -j 4)
 
 overall=0
 
@@ -75,8 +82,29 @@ run_one tb_axi.sv      tb_axi
 run_one tb_fixed2x.sv  tb_fixed2x
 run_one tb_timeout.sv  tb_timeout
 run_one tb_preamble.sv tb_preamble
+run_one tb_preamble_generic.sv tb_preamble_generic
 run_one tb_bw.sv       tb_bw         "${BENCH_SRCS[@]}"
 run_one tb_multiburst.sv tb_multiburst "${BENCH_SRCS[@]}"
+run_one tb_multiburst_generic.sv tb_multiburst_generic "${BENCH_SRCS[@]}"
+# Runtime PHY read-eye calibration (issue #10): live REG_CAL preamble-skip flip, no recompile.
+run_one tb_cal.sv      tb_cal        "${BENCH_SRCS[@]}"
+# Spec-coverage TBs (issue #4): chop, native wrapped/legacy/hybrid bursts, byte-masked writes +
+# write-underrun, true variable (alternating 1x/2x) latency, CR1/ID1 + POR dwell + runtime-reset
+# register restore + DIFF_CK, and AXI WRAP-write + AR/AW round-robin arbiter.
+run_one tb_chop.sv     tb_chop
+run_one tb_wrap.sv     tb_wrap
+run_one tb_masked.sv   tb_masked
+run_one tb_varlat.sv   tb_varlat
+run_one tb_reg.sv      tb_reg
+run_one tb_axi_wrap.sv tb_axi_wrap
+run_one tb_xilinx.sv   tb_xilinx     "${XILINX_SIM_SRCS[@]}"
+run_one tb_commit.sv     tb_commit     "${BENCH_SRCS[@]}"
+# Spec-feature TBs (issue #5): CR1 init write, POR/reset AC-timing, Deep-Power-Down enter/exit, and
+# active clock-stop on read back-pressure.
+run_one tb_cr1init.sv    tb_cr1init      # issue #5 A3: CR1 init write
+run_one tb_por_timing.sv tb_por_timing   # issue #5 A4: POR/reset AC-timing
+run_one tb_dpd.sv        tb_dpd          # issue #5 A1: Deep Power-Down enter/exit
+run_one tb_clkstop.sv    tb_clkstop      # issue #5 A2: active clock-stop
 
 echo "=================================================================="
 if [ "$overall" -eq 0 ]; then

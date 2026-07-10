@@ -2,11 +2,13 @@
 #
 # The on-chip control/clock backbone for the AXC3000 HyperBus bandwidth test:
 #   * 25 MHz board clock in  (CLK_25M_C)
-#   * Agilex-3 IOPLL: outclk0 = clk (~50 MHz, 0 deg = HyperBus CK word clock),
-#                     outclk1 = clk2x (~100 MHz, 0 deg = SDR byte clock).
-#     (The export interface is still named "clk90"; for the SDR PHY it carries the 100 MHz 2x byte
-#      clock, NOT a 90 deg phase — that phase is what the OLD DDIO PHY could not route into Bank 3A,
-#      Fitter err 24403/24404. The SDR PHY needs only ONE clock in the I/O periphery.)
+#   * Agilex-3 IOPLL: outclk0 = clk (CK_MHZ, 0 deg = HyperBus CK word clock; the ONLY clock in the
+#                     I/O periphery — clocks the controller, fabric, and ALL of the DDIO PHY's I/O
+#                     cells under CK_SCHEME="CLK_DLY", issue #8),
+#                     outclk1 = (CK_MHZ, +90 deg) CORE-ONLY RX sampling clock (LOCAL1X eye phase)
+#                     + the hyperbus_capture debug sampler. It clocks NO I/O cell. (The export interface is still named "clk90" for the frozen port
+#                     list; it is NOT a 90 deg phase — that second phase is exactly what the DDIO
+#                     PHY could not route into Bank 3A, Fitter err 24403/24404.)
 #   * reset bridge + reset controller (synchronous, active-high fabric reset, 50 MHz domain)
 #   * Altera JTAG-to-Avalon-MM master bridge — its Avalon-MM master is EXPORTED to top.sv,
 #     where it drives the hyperram_bw_test CSR slave (LEN/BASE/CTRL/STATUS/…).
@@ -16,10 +18,10 @@
 #   qsys-generate qsys/bw_sys.qsys --synthesis=VERILOG --family="Agilex 3" \
 #       --part=A3CY100BM16AE7S --output-directory=qsys/bw_sys
 #
-# CLOCK PLAN (SDR): the frozen controller is WORD-per-clk, so the fabric byte engine runs at 2x CK.
-# clk = 50 MHz drives the controller/fabric/Qsys backbone; clk2x = 100 MHz (0 deg) is the ONLY clock
-# at the Bank-3A SDR I/O registers + hb_ck generator. hb_ck = clk2x/2 = 50 MHz => ~100 MB/s per
-# direction on the x8 bus. Chosen low on purpose so the un-calibrated read eye is wide.
+# CLOCK PLAN (DDIO, issue #8): the frozen controller is WORD-per-clk and the DDIO PHY moves 2 bytes
+# per clk on both CK edges, so EVERYTHING — controller, fabric, Qsys backbone, and every I/O-cell
+# DDIO register — runs on outclk0 = CK_MHZ. hb_ck = CK_MHZ (DDIO-forwarded, delay-centred at the
+# pin). outclk1 (same freq, 0 deg) only clocks the fabric debug capture.
 
 package require -exact qsys 26.1
 
@@ -36,14 +38,19 @@ set_instance_parameter_value clk_in EXPLICIT_CLOCK_RATE {25000000.0}
 set_instance_parameter_value clk_in NUM_CLOCK_OUTPUTS   {1}
 
 # ===========================================================================
-# IOPLL: 25 MHz ref -> outclk0 = 50 MHz @0deg (clk, CK word clock),
-#                      outclk1 = 100 MHz @0deg (clk2x, SDR byte clock — exported as "clk90")
-# Both outputs are 0 deg: there is NO second PLL phase into the I/O periphery (the SDR PHY derives
-# the CK-centring quarter-period shift from clk2x's own negedge). This is the 24403/24404 fix.
+# IOPLL: 25 MHz ref -> outclk0 = CK_MHZ @0deg (clk: CK word clock + ALL I/O periphery),
+#                      outclk1 = CK_MHZ @0deg (fabric-only debug-capture clock — exported as "clk90")
+# Both outputs are 0 deg: there is NO second PLL phase into the I/O periphery (CK eye-centring is a
+# hard output-delay on the hb_ck pin, bw.qsf). This is the 24403/24404 fix (issue #8).
 # ===========================================================================
-# SPEED-RAMP knob: CK_MHZ = hb_ck target (= clk word clock = outclk0). outclk1 (byte clock) = 2*CK_MHZ.
-# hb_ck = clk2x/2 = CK_MHZ.  Peak throughput ~= 2 bytes * CK_MHZ MB/s per direction.
-#   50 -> ~100 MB/s (bring-up) | 100 -> ~200 | 150 -> ~300 | 200 -> ~400 (W957D8NB device ceiling).
+# SPEED-RAMP knob: CK_MHZ = hb_ck target (= clk word clock = outclk0).
+# DDIO PHY clock plan (issue #8, CK_SCHEME="CLK_DLY"): the I/O runs at 1x CK — the DQ *and* CK DDIOs
+# are all clocked by outclk0 (ONE periphery clock, no 24403/24404; CK eye-centring comes from the
+# hard output-delay assignment on the hb_ck pin in bw.qsf). outclk1 is no longer a 2x byte clock:
+# it only feeds the hyperbus_capture debug sampler in the fabric, so it runs at 1x CK too (a 2x
+# clock would be 400 MHz at the 200 MHz device ceiling — unclosable and unneeded).
+# Peak throughput ~= 2 bytes * CK_MHZ MB/s per direction (DDR x8).
+#   50 -> ~100 MB/s | 100 -> ~200 | 175 -> ~350 (SDR ceiling was here) | 200 -> ~400 (device max).
 set CK_MHZ   175.0
 set BYTE_MHZ [expr {2.0 * $CK_MHZ}]
 

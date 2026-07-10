@@ -32,8 +32,32 @@ Every module below declares these (defaults from `hyperbus_pkg`):
 
 Additional parameters: `LATENCY_CLOCKS` (default `HB_LATENCY_CLOCKS_DEFAULT`=6),
 `FIXED_LATENCY` (default 1), `MAX_BURST_WORDS` (default 0 = no chop; else tCSM/tCK),
-`PROGRAM_CR` (default 1 = program CR0 at init), `POR_DELAY_CYCLES` (default 0 in sim),
-`INIT_LATENCY_CODE` / `INIT_CR0` (CR image written at init).
+`BURST_BOUNDARY_WORDS` (default 0 = off; else a linear segment is chopped so it never crosses this
+WORD-aligned boundary — the W957D8NB bus-release quirk), `WR_COMMIT_READ` (default 0 = off; when 1,
+after each split memory-write segment the controller self-issues an internal commit-read spanning the
+last written word — **documented-ineffective for write→write streams since v9/2026-07-10 silicon**;
+kept for read-terminated traffic), `COMMIT_READ_WORDS` / `COMMIT_READ_MODE`
+(`"SPAN_END"`|`"FULL_BURST"`|`"NEXT_ROW"`, shape of that internal read), `WR_COALESCE` (default 0;
+when 1, a contiguous linear memory-write command arriving within `WR_COALESCE_WAIT` cycles of a
+completing write is spliced onto the SAME open CS# burst — no CS# boundary at all), `WR_CHOP_REPLAY`
+(default 0; v9 — when 1, every intra-command write chop reopens `min(WR_REPLAY_WORDS, words sent)`
+words early and re-sends them from an internal shadow, re-writing the pending tail the device drops
+at the chop; `WR_REPLAY_WORDS` default 4 = the W957D8NB pending depth), `PROGRAM_CR` (default 1 =
+program CR0 at init), `POR_DELAY_CYCLES` (default 0 in sim), `INIT_LATENCY_CODE` / `INIT_CR0` (CR
+image written at init). The device-quirk parameters default OFF so existing instantiations are
+bit-identical; they are threaded (defaulted) through `hyperram_avalon` / `hyperram_axi` /
+`hyperram_bw_top` (the coalesce/commit-shape/replay set through `hyperram_avalon`, and
+replay additionally through `hyperram_axi`).
+
+Spec-feature options (v8, all defaulted OFF = legacy behavior — no port changes):
+`PROGRAM_CR1` (default 0) / `INIT_CR1` (default `HB_CR1_RESET`) — optional second zero-latency register
+write of CR1 at init, after CR0 (§8.2). `CLK_FREQ_MHZ` (default 0 = legacy fixed counts) with
+`T_RP_NS`/`T_RPH_NS`/`T_RH_NS` (200/400/200) and `T_VCS_US` (150) — POR/reset AC-timing derived as
+`cycles = ceil(t/tCK)` when `CLK_FREQ_MHZ≠0` (else `RESET_CYCLES=8`, POR dwell = `POR_DELAY_CYCLES`;
+Table 8.3). `SUPPORT_DPD` (default 0) / `TDPDOUT_CYCLES` (default 0) — Deep-Power-Down: snoop a host
+CR0[15]=0 write, then guard the next command with a CS# wake pulse + tDPDOUT dwell (§5.2.1).
+`ACTIVE_CLK_STOP` (default 0) — pause CK on word boundaries while the read FIFO is above its high-water
+mark (caller back-pressure), instead of dropping words (§1).
 
 | Port | Dir | Width | Notes |
 |---|---|---|---|
@@ -82,8 +106,14 @@ Additional parameters: `LATENCY_CLOCKS` (default `HB_LATENCY_CLOCKS_DEFAULT`=6),
 ## `hyperbus_phy` — DDR SERDES + I/O (ctrl-facing slave ⇄ device pins)
 
 Parameters: common + `PHY_VARIANT` (string: `"GENERIC"` | `"SDR"` | `"INTEL"` | `"XILINX"`, default
-`"GENERIC"`), `DIFF_CK` (default 1: drive `hb_ck_n`; 0 = single-ended, `hb_ck_n` tied). All variants
-share this exact port list.
+`"GENERIC"`), `DIFF_CK` (default 1: drive `hb_ck_n`; 0 = single-ended, `hb_ck_n` tied), plus the
+**read-eye POR-seed** parameters `RD_PREAMBLE_SKIP` (SDR/GENERIC, v4) and `CAPTURE_PHASE` (SDR, v9) —
+each seeds the reset value of the matching runtime `cal_*` port and defaults to that variant's legacy
+compile-time default. (The DDIO knobs `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW` remain per-variant
+compile-time parameters — ALTERA defaults 8/1, XILINX 16/0 — their `cal_*` ports are elaboration-only
+tie-offs until the runtime paths land, #3.) All variants share this exact port list, **including the
+four mandatory `cal_*` inputs** (v9) — they carry no SV default value (Verilator 5.020 rejects default
+port values), so every instantiation must wire them explicitly.
 
 **`"SDR"` variant clock note (does not change the port list):** the portable single-clock-phase SDR
 PHY (`hyperbus_phy_sdr.sv`, for FPGAs/fits where two clock phases cannot reach the I/O periphery)
@@ -107,6 +137,11 @@ are unchanged, so the frozen contract holds; only this variant's interpretation 
 | `phy_rwds_o` | I | 2 | |
 | `phy_rwds_oe` | I | 1 | |
 | `phy_rd_arm` | I | 1 | |
+| **— runtime read-eye calibration (mandatory, no default; quasi-static) (v9) —** | | | |
+| `cal_capture_phase` | I | 1 | live read-capture edge (SDR); reset-seeds from `CAPTURE_PHASE` |
+| `cal_preamble_skip` | I | `HB_CAL_PREAMBLE_SKIP_WIDTH` (=3) | live read-strobe preamble-skip (SDR); reset-seeds from `RD_PREAMBLE_SKIP` |
+| `cal_rx_tap` | I | `HB_CAL_RX_TAP_WIDTH` (=5) | live RWDS eye-centre tap (DDIO variants; tie-off until #3) |
+| `cal_pair_skew` | I | 1 | live byte-pairing select (DDIO variants; tie-off until #3) |
 | `phy_dq_i` | O | `PHYW` | recovered read word to ctrl |
 | `phy_dq_i_valid` | O | 1 | |
 | `phy_rwds_i` | O | 1 | synchronized RWDS level to ctrl |
@@ -233,10 +268,14 @@ ready/valid outputs are held Low during reset (AXI4 A3.1.2).
 ## `hyperram_axi` — TOP (AXI4 slave + HyperBus device pins)
 
 Parameters: union of `hyperbus_axi`, `hyperbus_ctrl`, `hyperbus_phy` (incl. `PHY_VARIANT`, `DIFF_CK`,
-`LATENCY_CLOCKS`, `FIXED_LATENCY`, `MAX_BURST_WORDS`, `PROGRAM_CR`, `POR_DELAY_CYCLES`). Instantiates
-`hyperbus_axi` + `hyperbus_ctrl` + `hyperbus_phy`.
+`LATENCY_CLOCKS`, `FIXED_LATENCY`, `MAX_BURST_WORDS`, `BURST_BOUNDARY_WORDS`, `WR_COMMIT_READ`,
+`PROGRAM_CR`, `POR_DELAY_CYCLES`, and the v8 spec-feature options `PROGRAM_CR1`/`INIT_CR1`/
+`CLK_FREQ_MHZ`/`T_RP_NS`/`T_RPH_NS`/`T_RH_NS`/`T_VCS_US`/`SUPPORT_DPD`/`TDPDOUT_CYCLES`/
+`ACTIVE_CLK_STOP`, all defaulted through to `hyperbus_ctrl`, and the read-eye POR seeds
+`RD_PREAMBLE_SKIP`/`CAPTURE_PHASE` (v9)). Instantiates `hyperbus_axi` + `hyperbus_ctrl` +
+`hyperbus_phy`.
 
-Ports = { clocking } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device pins of `hyperbus_phy` }:
+Ports = { clocking } ∪ { runtime cal } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device pins }:
 
 | Port | Dir | Width | Notes |
 |---|---|---|---|
@@ -244,6 +283,7 @@ Ports = { clocking } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device 
 | `clk90` | I | 1 | to PHY |
 | `clk_ref` | I | 1 | to PHY (tie for GENERIC) |
 | `rst` | I | 1 | |
+| `cal_capture_phase` / `cal_preamble_skip` / `cal_rx_tap` / `cal_pair_skew` (v9) | I | 1 / 3 / 5 / 1 | mandatory (no default); forwarded 1:1 to `hyperbus_phy` — tie to constants (POR-seed equivalents) or drive from a CSR |
 | *AXI4 slave* | | | every `aw*/w*/b*/ar*/r*` port from `hyperbus_axi`, same names/widths |
 | *device pins* | | | `hb_ck, hb_ck_n, hb_cs_n, hb_rst_n, hb_dq_o, hb_dq_oe, hb_dq_i, hb_rwds_o, hb_rwds_oe, hb_rwds_i` from `hyperbus_phy` |
 | `init_done` | O | 1 | from ctrl |
@@ -252,7 +292,8 @@ Ports = { clocking } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device 
 
 ## `hyperram_avalon` — TOP (Avalon-MM slave + HyperBus device pins)
 
-Same structure as `hyperram_axi` but with the Avalon-MM slave of `hyperbus_avalon`.
+Same structure as `hyperram_axi` but with the Avalon-MM slave of `hyperbus_avalon`. Same read-eye POR
+seed parameters and mandatory `cal_*` inputs (v9).
 
 | Port | Dir | Width | Notes |
 |---|---|---|---|
@@ -260,9 +301,11 @@ Same structure as `hyperram_axi` but with the Avalon-MM slave of `hyperbus_avalo
 | `clk90` | I | 1 | |
 | `clk_ref` | I | 1 | |
 | `rst` | I | 1 | |
+| `cal_capture_phase` / `cal_preamble_skip` / `cal_rx_tap` / `cal_pair_skew` (v9) | I | 1 / 3 / 5 / 1 | mandatory (no default); forwarded 1:1 to `hyperbus_phy` |
 | *Avalon-MM slave* | | | every `avs_*` port from `hyperbus_avalon`, same names/widths |
 | *device pins* | | | same 10 device-pin ports as `hyperram_axi` |
 | `init_done` | O | 1 | |
+| `err_underrun` | O | 1 | pulse: controller write-data underrun (v4). Avalon has no SLVERR channel, so the controller's `err_underrun` is surfaced here as a top-level status strobe |
 
 ---
 
@@ -311,3 +354,109 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   byte clock (0°, same PLL) instead of a 90° phase — see the "SDR variant clock note" above. It adds
   a non-frozen, defaulted read-eye tuning parameter `CAPTURE_PHASE`. Controller, front-ends, model,
   and all other module boundaries are unchanged.
+- **v4 (2026-07-09):** the `RD_PREAMBLE_SKIP` read-strobe-preamble parameter (added on `hyperbus_phy`
+  at v3, then implemented only by the `SDR` variant) now also reaches the `GENERIC` PHY variant
+  (`hyperbus_phy_generic.sv` — read-path preamble phantom-word skip, disarm FIFO flush, deeper RX
+  FIFO) and is exposed on the `hyperram_axi` top, joining `hyperram_avalon` which already forwarded
+  it. **Parameter-only change: no frozen port name, direction, or width changes.** `RD_PREAMBLE_SKIP`
+  keeps its name/meaning and its default `0`, which is bit-exact for every existing caller (the skip
+  branch never fires). `ALTERA`/`XILINX` variants still do not implement it — the wrapper simply never
+  forwards it to their branches, as before. Controller, front-ends, model, and all other module
+  boundaries are unchanged.
+- **v5 (2026-07-09):** `hyperram_avalon` gains one output — `err_underrun` — wired straight from the
+  existing `hyperbus_ctrl.err_underrun` pulse (previously left unconnected). The AXI top folds this
+  error into `BRESP=SLVERR`, but Avalon-MM has no response channel, so an Avalon integrator otherwise
+  had no visibility of a controller write-data underrun (issue #4, B6). This is an **additive output**;
+  existing instantiations that leave it unconnected are unaffected (unconnected outputs are legal). No
+  other port name/direction/width changed; `hyperbus_ctrl`, `hyperbus_avalon`, `hyperbus_phy`, and the
+  `hyperram_axi` boundary are unchanged.
+- **v6 (2026-07-09):** `PHY_VARIANT="XILINX"` (`hyperbus_phy_xilinx.sv`) is filled in as a real
+  AMD/Xilinx 7-series DDR datapath (`ODDR`/`IDDR`/`IDELAYE2`/`IDELAYCTRL`/`BUFIO`/`BUFR`/`OBUF`/
+  `OBUFDS`) that now **simulates** under Verilator through a compile-guarded shim
+  (`sim/model/xilinx_prims_sim.sv`, `` `ifdef VERILATOR ``) driven by `sim/tb_xilinx.sv`. **No frozen
+  port name, direction, or width changes.** It adds three **non-frozen, defaulted** parameters, so every
+  existing instantiation is bit-identical: `RX_STROBE_DLY_TAPS` (IDELAYE2 FIXED tap), `RX_PAIR_SKEW`
+  (IDDR byte-pairing escape hatch), and `RD_PREAMBLE_SKIP` (read-strobe preamble skip, mirroring the SDR
+  variant). `RD_PREAMBLE_SKIP` was already a wrapper (`hyperbus_phy`) parameter (v3); it is now also
+  threaded to the `g_xilinx` branch. `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW` stay internal to the variant
+  (the wrapper never overrides them, exactly as the Altera variant's `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW`).
+  Controller, front-ends, model, and all other module boundaries are unchanged.
+- **v7 (2026-07-09):** `hyperbus_ctrl` gains two device-quirk parameters for the Winbond W957D8NB
+  (AXC3000) split-multi-burst work-arounds — `BURST_BOUNDARY_WORDS` (default 0 = off; else chop a
+  linear segment at that WORD boundary) and `WR_COMMIT_READ` (default 0 = off; else interpose an
+  internal commit-read after each split memory-write segment). **Both default OFF, so every existing
+  instantiation is bit-identical; no frozen port name, direction, or width changed.** They are
+  threaded (defaulted) through `hyperram_avalon`, `hyperram_axi`, and `hyperram_bw_top`. The
+  behavioural device model `hyperram_model` gains matching, defaulted, non-frozen knobs
+  `WR_COMMIT_QUIRK` and `BURST_BOUNDARY_WORDS` (simulation-only); `hyperram_bw_test` adds the
+  runtime CSR `REG_RBURSTW` (word 12 / 0x30) for an independent read-phase burst length. Regression:
+  `sim/tb_commit.sv`.
+- **v8 (2026-07-09):** unimplemented HyperBus spec features added to `hyperbus_ctrl` as **defaulted
+  parameters only — no port name/direction/width changed on any module** (issue #5). New ctrl params
+  (all default OFF = prior behavior): `PROGRAM_CR1`/`INIT_CR1` (A3, CR1 init write); `CLK_FREQ_MHZ` +
+  `T_RP_NS`/`T_RPH_NS`/`T_RH_NS`/`T_VCS_US` (A4, ns-derived POR/reset AC-timing; `CLK_FREQ_MHZ=0`
+  reproduces the legacy `RESET_CYCLES=8` / raw `POR_DELAY_CYCLES` exactly); `SUPPORT_DPD`/
+  `TDPDOUT_CYCLES` (A1, Deep-Power-Down enter-detect + guarded wake); `ACTIVE_CLK_STOP` (A2, CK pause on
+  read back-pressure). The two top wrappers `hyperram_axi` and `hyperram_avalon` forward all of them to
+  `hyperbus_ctrl` (defaulted); the SIM model `hyperram_model` gains a defaulted `SUPPORT_DPD` (DPD
+  device state) — its frozen pin list is unchanged. `hyperbus_phy`, both front-ends, and the
+  FPGA-referenced `hyperram_bw_top` are untouched. Regression: `sim/tb_cr1init.sv`, `sim/tb_por_timing.sv`,
+  `sim/tb_dpd.sv`, `sim/tb_clkstop.sv`.
+- **v9 (2026-07-09):** `hyperbus_phy` (all four variants), `hyperram_avalon`, and `hyperram_axi` gain
+  **four mandatory runtime read-eye calibration inputs** — `cal_capture_phase` (1b), `cal_preamble_skip`
+  (`HB_CAL_PREAMBLE_SKIP_WIDTH`=3b), `cal_rx_tap` (`HB_CAL_RX_TAP_WIDTH`=5b), `cal_pair_skew` (1b) — so a
+  host can retune the read eye (preamble-skip / capture edge / RWDS tap / byte-pairing) by a CSR write
+  with **no recompile** (`REG_CAL`, word 13/0x34, in `hyperram_bw_test`; word 12 is v7's `REG_RBURSTW`).
+  The formerly compile-time SDR knobs `CAPTURE_PHASE`/`RD_PREAMBLE_SKIP` are demoted to **POR reset-seed**
+  values for the matching `cal_*` port (`CAPTURE_PHASE` is now also a wrapper/top parameter); every
+  parameter default reproduces the prior behaviour with zero call-site VALUE changes. The ports are
+  **mandatory (no SV default value)** because Verilator 5.020 hard-rejects default port values
+  (`%Error-UNSUPPORTED: Default value on module input`); consequently **every** call site (all sim TBs,
+  both tops, `hyperram_bw_top`, and the board `top.sv`) needs an explicit wiring edit — a forgotten one
+  is only a non-fatal `%Warning-PINMISSING` that silently ties the input to 0, so a
+  `grep PINMISSING sim/build/*/build.log` gate over the TB build logs guards it. The SDR variant feeds
+  `cal_preamble_skip` through a reset-seeded 2-flop `clk90` synchroniser (resampled at each read disarm)
+  and selects the capture edge with a reset-seeded registered mux (both sampling pipelines always live);
+  the ALTERA and XILINX DDIO variants carry the ports as elaboration-only tie-offs until #3 unblocks
+  their runtime paths (their `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW` stay compile-time, per-variant).
+  `hyperbus_ctrl`, the native/PHY data interfaces, and the model boundary are unchanged. Regression:
+  `sim/tb_cal.sv` (live REG_CAL preamble-skip flip: ERR=LEN-1 ⇒ ERR=0 with no rebuild).
+- **v10 (2026-07-09/10):** `hyperbus_ctrl` gains an EXPERIMENTAL, default-off write-boundary family —
+  `WR_CHOP_REPLAY`/`WR_REPLAY_WORDS`/`WR_REPLAY_PEND`/`WR_REPLAY_ALIGN`/`WR_REPLAY_MASK_LEAD`
+  (rollback replay: reopen a chopped write early, optionally row-aligned and mask-led, re-sending
+  the tail from a shadow; also fires at contiguous write→write command accepts) and
+  `WR_CHOP_PAUSE_CYCLES`/`WR_CHOP_PAUSE_CK` (post-write CS#-High dwell, optionally with CK
+  toggling). **Defaulted parameters only; no frozen port name, direction, or width changed on any
+  module.** Replay params threaded (defaulted) through `hyperram_avalon` and `hyperram_axi`. (This
+  entry also records the previously-unlogged 2026-07-09 ctrl parameters `COMMIT_READ_WORDS`/
+  `COMMIT_READ_MODE`/`WR_COALESCE`/`WR_COALESCE_WAIT`.)
+  SILICON VERDICT (W957D8NBRA4I, 2026-07-09 read-only-probe ladder — the reason all of the above is
+  default-OFF): the long-standing "write-commit quirk" story (burst tail held pending, discarded by
+  the next write, committed by covering reads) is FALSE. Measured truth: (1) write-burst tails
+  COMMIT to the array fine; (2) **any memory-space WRITE CS# opening at word address B wounds the
+  array at [B-4, B)** — zeroed (B 8-aligned) or garbled (else) — standalone writes included, and no
+  rollback (E-A), CS#-High pause (E-B), CK-toggling dwell (E-C), or RWDS-masked lead-in (E-D)
+  suppresses it: rollback merely relocates the wound below the new base; (3) READ CAs do not wound;
+  (4) ROW WRAP: linear bursts must NEVER cross the device's 1024-word row — writes WRAP back to the
+  row start (LEN=1536 single-burst: word 0 read back gen(1024) — 512+ words aliased; the early
+  "≥1024 hits tCSM" and interim "refresh starvation" readings were THIS, and the historic
+  "releases the bus when a read crosses 16 KB" was this same law at coarser granularity, 0x2000
+  being a row multiple); no tCSM effect was observed in range (5.9 µs bursts otherwise clean), and
+  `WR_CHOP_PAUSE_CYCLES`/`_CK` turned out to have no beneficial role on this device;
+  (5) END-AT-ROW GARBLE: a write burst ENDING exactly on a 1024-word row multiple garbles its own
+  last 4 words (persistent, foreign values).
+  OPTIMAL LEGAL CONFIGURATION (silicon-exact): row-aligned segments — `MAX_BURST_WORDS=1024` =
+  `BURST_BOUNDARY_WORDS='h400` + `WR_COALESCE=1`. In-row transfers are loss-free (768/768: 341.1 W
+  / 332.3 R MB/s @175 MHz, ERR=0, 25-run soak); every row TRANSITION costs exactly 4 words at
+  [row·1024-4, row·1024) — the closing burst's end-garble and the next open's wound coincide
+  (measured: 1024→4, 1536→4, 2048→8, 4096/256→16, stable across read-only re-probes).
+  Consequences: `WR_COMMIT_READ` is documented-ineffective for write→write streams; the ONLY
+  wound-free shape is chop avoidance (`WR_COALESCE` + `MAX_BURST_WORDS` ≤ the tCSM ceiling); streams
+  longer than one CS# budget pay a deterministic 4-word wound at every chop point [C-4, C). The SIM
+  model `hyperram_model` is rewritten (non-frozen, sim-only) from pending/discard to wound
+  semantics: `WR_WOUND_WORDS` (wound on write-CA open), `WR_WOUND_MASK_SUPPRESS` (counterfactual
+  knob, silicon says 0), `WR_BOUNDARY_END_GARBLE`. Regression: `sim/tb_commit.sv` rewritten against
+  the wound model (no-fix / coalesce / plain-replay-relocation / mask-led / command-edge /
+  boundary-end stacks). The replay/pause machinery is retained default-off: it documents the
+  falsification trail in-code and may genuinely help OTHER HyperBus devices with true
+  pending-discard semantics.

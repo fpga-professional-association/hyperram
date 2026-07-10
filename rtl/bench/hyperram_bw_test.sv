@@ -30,6 +30,8 @@
 //   byte off | word | name                 | access | bits / meaning
 //   ---------+------+----------------------+--------+------------------------------------------------
 //    0x00    |  0   | CTRL  (on write)     |  W     | bit0 = start (self-clearing strobe; ignored while busy)
+//            |      |                      |        | bit1 = READ-ONLY run (skip the write phase; score the
+//            |      |                      |        |         readback against gen_pattern — pending-buffer probe)
 //            |      | STATUS(on read)      |  R     | bit0 = busy, bit1 = done, bit2 = error
 //    0x04    |  1   | LEN                  |  R/W   | number of words to test (per phase)
 //    0x08    |  2   | BASE_ADDR            |  R/W   | starting WORD address (keep MSB=0 => memory space)
@@ -38,6 +40,16 @@
 //    0x14    |  5   | ERR_COUNT            |  R     | number of read words that mismatched
 //    0x18    |  6   | DATA_BYTES_PER_WORD  |  R     | constant = 2 (bytes per HyperBus word)
 //    0x1C    |  7   | VERSION / MAGIC      |  R     | constant identifier (default 0x48425754 = "HBWT")
+//    0x20    |  8   | ERR_ADDR             |  R     | WORD address of the first read mismatch
+//    0x24    |  9   | ERR_GOT              |  R     | read data returned at the first mismatch
+//    0x28    | 10   | ERR_EXP              |  R     | expected pattern at the first mismatch
+//    0x2C    | 11   | BURSTW               |  R/W   | WRITE-phase HyperBus burst length (words); 0 => default
+//    0x30    | 12   | RBURSTW              |  R/W   | READ-phase  HyperBus burst length (words); 0 => default
+//    0x34    | 13   | REG_CAL              |  R/W   | live PHY read-eye calibration image (drives cal_*):
+//            |      |                      |        |   [0]=cal_capture_phase  [3:1]=cal_preamble_skip
+//            |      |                      |        |   [8:4]=cal_rx_tap       [9]=cal_pair_skew
+//            |      |                      |        | plain R/W (NO 0=>default carve-out; 0 is a valid
+//            |      |                      |        | cal value); reset image = CAL_RESET parameter
 // =====================================================================================
 //
 // See docs/BW_TEST.md for the full narrative, the MB/s formula and the sim/hardware run notes.
@@ -50,7 +62,8 @@ module hyperram_bw_test
     parameter int unsigned LEN_WIDTH      = HB_LEN_WIDTH_DEFAULT,   // 16 — Avalon burstcount width
     parameter int unsigned BURST_WORDS    = HB_BURST_WORDS_DEFAULT, // 16 — words per Avalon burst
     parameter int unsigned CSR_ADDR_WIDTH = 4,                      // 16 word-registers (0x00..0x3C)
-    parameter logic [31:0] VERSION_MAGIC  = 32'h4842_5754           // "HBWT"
+    parameter logic [31:0] VERSION_MAGIC  = 32'h4842_5754,          // "HBWT"
+    parameter logic [31:0] CAL_RESET      = 32'h0000_0000           // POR image of REG_CAL (cal_* seed)
 ) (
     input  logic                        clk,
     input  logic                        rst,          // synchronous, active-high
@@ -71,26 +84,39 @@ module hyperram_bw_test
     output logic [DATA_WIDTH-1:0]       m_writedata,
     input  logic [DATA_WIDTH-1:0]       m_readdata,
     input  logic                        m_readdatavalid,
-    input  logic                        m_waitrequest
+    input  logic                        m_waitrequest,
+
+    // ---- runtime PHY read-eye calibration (to hyperram_avalon's cal_* inputs) ----------------------
+    // Decoded from REG_CAL so a host CSR write retunes the read eye with NO recompile. Bit map (REG_CAL):
+    //   [0]=cal_capture_phase  [3:1]=cal_preamble_skip  [8:4]=cal_rx_tap  [9]=cal_pair_skew.
+    output logic                                  cal_capture_phase,
+    output logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+    output logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+    output logic                                  cal_pair_skew
 );
 
     // ---- derived constants --------------------------------------------------
     localparam int unsigned BYTES_PER_WORD = DATA_WIDTH / 8;   // = 2
 
-    // CSR word-register indices (byte offset >> 2).
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_CTRL   = 3'd0;   // W: CTRL / R: STATUS
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_LEN    = 3'd1;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BASE   = 3'd2;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_WRCYC  = 3'd3;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_RDCYC  = 3'd4;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRCNT = 4'd5;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BYTES  = 4'd6;
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_MAGIC  = 4'd7;
+    // CSR word-register indices (byte offset >> 2). Sized with an explicit cast so they are
+    // width-clean at any CSR_ADDR_WIDTH (indices >= 8 alias low registers when CSR_ADDR_WIDTH < 4 —
+    // harmless, those hosts only use the low 8 regs).
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_CTRL    = CSR_ADDR_WIDTH'(0);   // W: CTRL / R: STATUS
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_LEN     = CSR_ADDR_WIDTH'(1);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BASE    = CSR_ADDR_WIDTH'(2);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_WRCYC   = CSR_ADDR_WIDTH'(3);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_RDCYC   = CSR_ADDR_WIDTH'(4);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRCNT  = CSR_ADDR_WIDTH'(5);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BYTES   = CSR_ADDR_WIDTH'(6);
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_MAGIC   = CSR_ADDR_WIDTH'(7);
     // First-mismatch diagnostics (latched on the FIRST read mismatch of a run; cleared at start).
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRADDR = 4'd8;  // WORD address of the first mismatch
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRGOT  = 4'd9;  // read data returned at that address
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERREXP  = 4'd10; // expected pattern at that address
-    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BURSTW  = 4'd11; // R/W: HyperBus burst length (words), default BURST_WORDS
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRADDR = CSR_ADDR_WIDTH'(8);   // WORD address of first mismatch
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERRGOT  = CSR_ADDR_WIDTH'(9);   // read data at that address
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERREXP  = CSR_ADDR_WIDTH'(10);  // expected pattern there
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_BURSTW  = CSR_ADDR_WIDTH'(11);  // R/W: WRITE burst length (words)
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_RBURSTW = CSR_ADDR_WIDTH'(12);  // R/W: READ  burst length (words)
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_CAL     = CSR_ADDR_WIDTH'(13);  // R/W: live PHY read-eye cal
+                                                                              //      (see bit map above)
 
     // ------------------------------------------------------------------------
     // Deterministic, address-seeded per-word data pattern (xorshift32 folded to
@@ -121,6 +147,14 @@ module hyperram_bw_test
     logic [DATA_WIDTH-1:0] r_err_exp;     // expected value at the first mismatch
     logic                  r_err_latched; // first mismatch has been captured this run
 
+    // Runtime PHY read-eye calibration image (REG_CAL). Plain R/W — unlike REG_BURSTW there is NO
+    // "0 => default" carve-out, since 0 is a legitimate cal value. Drives the cal_* outputs live.
+    logic [31:0]           r_cal;
+    assign cal_capture_phase = r_cal[0];
+    assign cal_preamble_skip = r_cal[3:1];
+    assign cal_rx_tap        = r_cal[8:4];
+    assign cal_pair_skew     = r_cal[9];
+
     // ------------------------------------------------------------------------
     // Working state (the traffic sequencer)
     // ------------------------------------------------------------------------
@@ -135,19 +169,33 @@ module hyperram_bw_test
     state_e state;
 
     logic [ADDR_WIDTH-1:0] cur_addr;    // base word address of the current burst
+    // Pipelined data pattern (timing fix, 200 MHz fabric): gen_pattern() is a multi-level xorshift;
+    // computed combinationally from cur_addr/beat it was the design's WORST fabric path (bench
+    // address register -> xorshift -> Avalon -> ctrl -> PHY DQ I/O cell, Fmax 184 MHz). pat_q holds
+    // the CURRENT write beat's pattern, exp_q the CURRENT read beat's expected value; both are
+    // computed one cycle ahead at every (cur_addr, beat) change, so the xorshift terminates in a
+    // local register instead of the I/O launch path.
+    logic [DATA_WIDTH-1:0] pat_q;       // gen_pattern(cur_addr + beat) for the write phase
+    logic [DATA_WIDTH-1:0] exp_q;       // gen_pattern(cur_addr + beat) for the read phase
     logic [31:0]           words_left;  // words remaining in the current phase
     logic [LEN_WIDTH-1:0]  beat;        // words done within the current burst
     logic                  wr_started;  // WR_CYCLES gate (first cmd asserted .. last beat)
     logic                  rd_started;  // RD_CYCLES gate (first cmd asserted .. last word)
 
-    // Words in the current burst = min(r_burstw, words_left). r_burstw is RUNTIME-programmable
-    // (REG_BURSTW, default BURST_WORDS) so the host can sweep the HyperBus burst length without a
-    // recompile — used to find the device's single-burst (tCSM) ceiling and the write-boundary point.
+    // Words in the current burst = min(active_burstw, words_left). The WRITE phase uses r_burstw and
+    // the READ phase uses r_rburstw — both RUNTIME-programmable (REG_BURSTW / REG_RBURSTW, default
+    // BURST_WORDS) so the host can sweep write and read burst lengths INDEPENDENTLY without a
+    // recompile: e.g. write a single (correct) burst while splitting the read into many, isolating the
+    // multi-burst READ path from the split-WRITE commit quirk (issue #2).
     logic [LEN_WIDTH-1:0]  r_burstw;
+    logic [LEN_WIDTH-1:0]  r_rburstw;
+    wire                   in_read_phase = (state == S_RSTART) || (state == S_RCMD) ||
+                                           (state == S_RDATA);
+    wire [LEN_WIDTH-1:0]   active_burstw = in_read_phase ? r_rburstw : r_burstw;
     logic [LEN_WIDTH-1:0]  this_burst;
     always_comb begin
-        if (words_left >= 32'(r_burstw)) this_burst = r_burstw;
-        else                             this_burst = words_left[LEN_WIDTH-1:0];
+        if (words_left >= 32'(active_burstw)) this_burst = active_burstw;
+        else                                  this_burst = words_left[LEN_WIDTH-1:0];
     end
 
     // CSR start strobe: a write of CTRL bit0 while the CSR bus is ready.
@@ -169,7 +217,7 @@ module hyperram_bw_test
         m_burstcount = this_burst;
         m_read       = (state == S_RCMD);
         m_write      = (state == S_WBEAT);
-        m_writedata  = gen_pattern(cur_addr + ADDR_WIDTH'(beat));
+        m_writedata  = pat_q;   // pipelined gen_pattern (see pat_q declaration)
     end
 
     // ------------------------------------------------------------------------
@@ -190,6 +238,8 @@ module hyperram_bw_test
             REG_ERRGOT:  csr_readdata = 32'(r_err_got);
             REG_ERREXP:  csr_readdata = 32'(r_err_exp);
             REG_BURSTW:  csr_readdata = 32'(r_burstw);
+            REG_RBURSTW: csr_readdata = 32'(r_rburstw);
+            REG_CAL:     csr_readdata = r_cal;
             default:    csr_readdata = 32'h0;
         endcase
     end
@@ -213,6 +263,8 @@ module hyperram_bw_test
             r_err_exp     <= '0;
             r_err_latched <= 1'b0;
             r_burstw    <= LEN_WIDTH'(BURST_WORDS);   // default; host may reprogram via REG_BURSTW
+            r_rburstw   <= LEN_WIDTH'(BURST_WORDS);   // default; host may reprogram via REG_RBURSTW
+            r_cal       <= CAL_RESET;                 // POR cal image; host may reprogram via REG_CAL
             cur_addr    <= '0;
             words_left  <= 32'd0;
             beat        <= '0;
@@ -226,9 +278,13 @@ module hyperram_bw_test
                 unique case (csr_address)
                     REG_LEN:    r_len    <= csr_writedata;
                     REG_BASE:   r_base   <= csr_writedata[ADDR_WIDTH-1:0];
-                    REG_BURSTW: r_burstw <= (csr_writedata[LEN_WIDTH-1:0] == '0)
-                                            ? LEN_WIDTH'(BURST_WORDS)         // 0 => reset to default
-                                            : csr_writedata[LEN_WIDTH-1:0];
+                    REG_BURSTW: r_burstw  <= (csr_writedata[LEN_WIDTH-1:0] == '0)
+                                             ? LEN_WIDTH'(BURST_WORDS)        // 0 => reset to default
+                                             : csr_writedata[LEN_WIDTH-1:0];
+                    REG_RBURSTW: r_rburstw <= (csr_writedata[LEN_WIDTH-1:0] == '0)
+                                             ? LEN_WIDTH'(BURST_WORDS)        // 0 => reset to default
+                                             : csr_writedata[LEN_WIDTH-1:0];
+                    REG_CAL:    r_cal      <= csr_writedata;                  // plain R/W (no 0-carve-out)
                     default:  /* CTRL + read-only regs: no stored effect */ ;
                 endcase
             end
@@ -250,7 +306,11 @@ module hyperram_bw_test
                         beat        <= '0;
                         wr_started  <= 1'b0;
                         rd_started  <= 1'b0;
-                        state       <= S_WSTART;
+                        // CTRL bit1 = READ-ONLY run: skip the write phase and score the readback
+                        // against the pattern of a PREVIOUS normal run over the same LEN/BASE.
+                        // The device-pending-buffer probe: read a region back later, WITHOUT the
+                        // usual rewrite, to see what actually reached the memory array.
+                        state       <= csr_writedata[1] ? S_RSTART : S_WSTART;
                     end
                 end
 
@@ -265,6 +325,7 @@ module hyperram_bw_test
                         state      <= S_RSTART;
                     end else begin
                         beat       <= '0;
+                        pat_q      <= gen_pattern(cur_addr);   // beat 0 pattern, ready on S_WBEAT entry
                         wr_started <= 1'b1;
                         state      <= S_WBEAT;
                     end
@@ -282,7 +343,8 @@ module hyperram_bw_test
                                 wr_started <= 1'b0;         // last burst -> stop counting after this cycle
                             state      <= S_WSTART;
                         end else begin
-                            beat <= beat + LEN_WIDTH'(1);
+                            beat  <= beat + LEN_WIDTH'(1);
+                            pat_q <= gen_pattern(cur_addr + ADDR_WIDTH'(beat) + ADDR_WIDTH'(1));
                         end
                     end
                 end
@@ -297,6 +359,7 @@ module hyperram_bw_test
                         state   <= S_IDLE;
                     end else begin
                         beat       <= '0;
+                        exp_q      <= gen_pattern(cur_addr);   // beat 0 expectation, ready before data
                         rd_started <= 1'b1;
                         state      <= S_RCMD;
                     end
@@ -311,14 +374,14 @@ module hyperram_bw_test
                 S_RDATA: begin
                     r_rd_cycles <= r_rd_cycles + 32'd1;
                     if (m_readdatavalid) begin
-                        if (m_readdata != gen_pattern(cur_addr + ADDR_WIDTH'(beat))) begin
+                        if (m_readdata != exp_q) begin
                             r_err_count <= r_err_count + 32'd1;
                             st_error    <= 1'b1;
                             if (!r_err_latched) begin       // capture the FIRST mismatch only
                                 r_err_latched <= 1'b1;
                                 r_err_addr    <= cur_addr + ADDR_WIDTH'(beat);
                                 r_err_got     <= m_readdata;
-                                r_err_exp     <= gen_pattern(cur_addr + ADDR_WIDTH'(beat));
+                                r_err_exp     <= exp_q;
                             end
                         end
                         if (beat + LEN_WIDTH'(1) == this_burst) begin
@@ -328,7 +391,8 @@ module hyperram_bw_test
                                 rd_started <= 1'b0;         // last burst -> stop counting after this cycle
                             state      <= S_RSTART;
                         end else begin
-                            beat <= beat + LEN_WIDTH'(1);
+                            beat  <= beat + LEN_WIDTH'(1);
+                            exp_q <= gen_pattern(cur_addr + ADDR_WIDTH'(beat) + ADDR_WIDTH'(1));
                         end
                     end
                 end

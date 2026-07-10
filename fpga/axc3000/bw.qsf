@@ -22,6 +22,17 @@ set_global_assignment -name IP_FILE  qsys/ip/bw_sys/bw_sys_rst_ctrl.ip
 set_global_assignment -name IP_FILE  qsys/ip/bw_sys/bw_sys_rst_out.ip
 set_global_assignment -name IP_FILE  qsys/ip/bw_sys/bw_sys_jtag_master.ip
 
+# ---- vendor GPIO I/O cells for the 200 MHz DDIO build (qsys/hbgpio.qsys) ----
+set_global_assignment -name QIP_FILE qsys/hbgpio/hbgpio.qip
+set_global_assignment -name IP_FILE  qsys/ip/hbgpio/hbgpio_ck_cell.ip
+set_global_assignment -name IP_FILE  qsys/ip/hbgpio/hbgpio_dq_cell.ip
+
+# Fitter/synthesis aggressiveness for 200 MHz fabric closure. MAXIMUM PLACEMENT EFFORT added
+# 2026-07-09: the integrated replay+cal build missed setup by -0.055 ns on 9 paths into ONE
+# rd_fifo M20K input register (u_bw S_RSTART -> u_ctrl) at the Slow-0C corner — placement luck,
+# not architecture; the higher effort closes it without RTL churn.
+set_global_assignment -name OPTIMIZATION_MODE "SUPERIOR PERFORMANCE WITH MAXIMUM PLACEMENT EFFORT"
+
 # ---- HyperBus master IP + bandwidth harness (package FIRST) ----
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/hyperbus_pkg.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/hyperbus_ctrl.sv
@@ -37,6 +48,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/bench/hyperram_bw_top.s
 
 # ---- board files ----
 set_global_assignment -name SYSTEMVERILOG_FILE hyperbus_pads_altera.sv
+set_global_assignment -name SYSTEMVERILOG_FILE hyperbus_gpio_io.sv
 set_global_assignment -name SYSTEMVERILOG_FILE hyperbus_capture.sv
 set_global_assignment -name SYSTEMVERILOG_FILE top.sv
 
@@ -44,3 +56,25 @@ set_global_assignment -name SYSTEMVERILOG_FILE top.sv
 set_global_assignment -name SDC_FILE bw.sdc
 source pins.tcl
 set_global_assignment -name LAST_QUARTUS_VERSION "26.1.0 Pro Edition"
+
+# ---- hb_ck output-delay centring (issue #8, CK_SCHEME="CLK_DLY") -------------------------------
+# The CK-forwarding DDIO launches on the SAME clk as the DQ DDIOs (one periphery clock, no
+# 24403/24404); the quarter-period eye-centring shift (~tCK/4: 1.43 ns @175, 1.25 ns @200 MHz) is
+# applied here as a hard per-pin OUTPUT delay on hb_ck. DISCOVERY ([FIT]-1): candidate assignment
+# names below — the compile logs identify which one this Quartus/family accepts (unknown names are
+# reported/ignored); remove the rejected ones once identified.
+# KILL-TEST: delay chain suspected of killing the CK output entirely (capture shows no RWDS data strobe ever)
+set_instance_assignment -name D5_DELAY 15 -to hb_ck -entity top
+
+# ---- hb_rwds input-delay eye-centring (issue #9, RX HARD_CHAIN) --------------------------------
+# The ALTERA PHY's fabric keep-buffer RWDS delay line is DELETED by Quartus Pro synthesis
+# (REMOVE_REDUNDANT_LOGIC_CELLS ignores the keep attribute — see Info 17016 in the syn log), so
+# rx_strobe had ZERO eye-centring delay and read capture sampled DQ at its transition edge.
+# Apply the ~tCK/4 shift as a hard per-pin INPUT delay on hb_rwds instead (the DQ pins stay at 0,
+# so the delayed strobe lands mid-eye). Same hard-delay mechanism as hb_ck's OUTPUT_DELAY_CHAIN.
+# GPIO build: dq_cell's DDIO_WITH_DELAY provides the data-vs-strobe margin in-cell
+# set_instance_assignment -name INPUT_DELAY_CHAIN 8 -to hb_rwds
+
+# DQ0 write-eye nudge (200 MHz): the only marginal bit on silicon — byte-B slot, reads-as-1,
+# count varies run-to-run, read path proven stable (ID0 12/12). Shift DQ0's launch a fraction
+# of the eye so the device's CK falling-edge latch clears the transition.

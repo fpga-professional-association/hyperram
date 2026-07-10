@@ -57,6 +57,8 @@ module tb_fixed2x;
     .PHY_VARIANT ("GENERIC"), .DIFF_CK (1'b1)
   ) dut (
     .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    // runtime read-eye calibration tied to POR-equivalent constants (reproduces pre-cal behaviour)
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd0), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
     .awid (awid), .awaddr (awaddr), .awlen (awlen), .awsize (awsize), .awburst (awburst),
     .awvalid (awvalid), .awready (awready),
     .wdata (wdata), .wstrb (wstrb), .wlast (wlast), .wvalid (wvalid), .wready (wready),

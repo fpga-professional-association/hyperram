@@ -106,6 +106,12 @@ module hyperbus_phy_sdr
     input  logic [1:0]          phy_rwds_o,   // write byte-mask: [1]=1st phase, [0]=2nd phase
     input  logic                phy_rwds_oe,
     input  logic                phy_rd_arm,   // arm receiver for a read-data phase
+    // ---- runtime read-eye calibration (mandatory, no defaults; quasi-static — change only while the
+    //      controller is idle / STATUS.busy=0). Reset-seeded from the legacy parameters; see REG_CAL. ----
+    input  logic                              cal_capture_phase, // live CAPTURE_PHASE (read-capture edge)
+    input  logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip, // live RD_PREAMBLE_SKIP (rwds-rise edges)
+    input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,        // (unused in SDR — DDIO tap select)
+    input  logic                              cal_pair_skew,     // (unused in SDR — DDIO byte-pairing)
     output logic [2*DQ_WIDTH-1:0] phy_dq_i,   // recovered, clk-synchronised read word (byte A hi half)
     output logic                phy_dq_i_valid,
     output logic                phy_rwds_i,   // synchronised RWDS level to ctrl
@@ -251,28 +257,35 @@ module hyperbus_phy_sdr
   //  (CAPTURE_PHASE), then RWDS-edge-detected byte pairing. hb_rwds_i toggles like CK during read data;
   //  its rising edge tags byte A, its falling edge tags byte B and completes the 16-bit word.
   // ==================================================================================================
+  // Read-capture eye phase is now RUNTIME-selectable (was a generate-if on CAPTURE_PHASE). BOTH sampling
+  // pipelines are always instantiated and a registered select (cap_phase_q) chooses between them live, so
+  // the host can retune the read eye by a CSR write with no recompile. cap_phase_q resets to the legacy
+  // CAPTURE_PHASE parameter (POR seed), then tracks cal_capture_phase. It is the clk->clk90 synchroniser
+  // for that 1-bit quasi-static knob (host changes cal_capture_phase only while STATUS.busy=0), so a
+  // single flop is sufficient. dq_cap/rwds_cap are muxes of registered samples => stable per clk90 cycle.
+  logic [DQ_WIDTH-1:0] dq_pos;                 // posedge sample (centre eye at nominal flight delay)
+  logic                rwds_pos;
+  logic [DQ_WIDTH-1:0] dq_neg, dq_neg_al;      // negedge pre-sample (half-clk90 earlier), then aligned
+  logic                rwds_neg, rwds_neg_al;  //   into the posedge domain
+  always_ff @(posedge clk90) begin
+    dq_pos   <= hb_dq_i;
+    rwds_pos <= hb_rwds_i;
+  end
+  always_ff @(negedge clk90) begin
+    dq_neg   <= hb_dq_i;
+    rwds_neg <= hb_rwds_i;
+  end
+  always_ff @(posedge clk90) begin
+    dq_neg_al   <= dq_neg;
+    rwds_neg_al <= rwds_neg;
+  end
+  logic cap_phase_q;
+  always_ff @(posedge clk90) cap_phase_q <= rst2x ? CAPTURE_PHASE : cal_capture_phase;
+
   logic [DQ_WIDTH-1:0] dq_cap;
   logic                rwds_cap;
-  generate
-    if (CAPTURE_PHASE) begin : g_cap_neg
-      // Pre-sample half a clk90 earlier (negedge), then align into the posedge domain.
-      logic [DQ_WIDTH-1:0] dq_neg;
-      logic                rwds_neg;
-      always_ff @(negedge clk90) begin
-        dq_neg   <= hb_dq_i;
-        rwds_neg <= hb_rwds_i;
-      end
-      always_ff @(posedge clk90) begin
-        dq_cap   <= dq_neg;
-        rwds_cap <= rwds_neg;
-      end
-    end else begin : g_cap_pos
-      always_ff @(posedge clk90) begin
-        dq_cap   <= hb_dq_i;
-        rwds_cap <= hb_rwds_i;
-      end
-    end
-  endgenerate
+  assign dq_cap   = cap_phase_q ? dq_neg_al   : dq_pos;
+  assign rwds_cap = cap_phase_q ? rwds_neg_al : rwds_pos;
 
   // Arm the receiver: bring phy_rd_arm (clk domain) into clk90.
   logic rdarm_s1, rdarm_s2;
@@ -295,11 +308,27 @@ module hyperbus_phy_sdr
   logic [RXF_AW:0]     wptr_bin;                  // clk90-domain binary write pointer (extra MSB)
   logic [RXF_AW:0]     rptr_bin;                  // clk-domain binary read pointer
 
-  // Leading rwds-rise edges still to be discarded as read-strobe preamble for this burst. Loaded to
-  // RD_PREAMBLE_SKIP each time the receiver is disarmed, so every read transaction (each CS# / each
-  // ST_LAT->ST_READ arm) re-skips its own preamble.
-  localparam int unsigned SKIPW = (RD_PREAMBLE_SKIP == 0) ? 1 : $clog2(RD_PREAMBLE_SKIP + 1);
+  // Leading rwds-rise edges still to be discarded as read-strobe preamble for this burst. Loaded from
+  // the RUNTIME cal_preamble_skip each time the receiver is disarmed, so every read transaction (each
+  // CS# / each ST_LAT->ST_READ arm) re-skips whatever preamble length the host has programmed.
+  // SKIPW is a FIXED width (HB_CAL_PREAMBLE_SKIP_WIDTH), NOT derived from RD_PREAMBLE_SKIP's value — a
+  // value-derived width (1 bit at the board's RD_PREAMBLE_SKIP=1) would truncate a wider runtime skip.
+  localparam int unsigned SKIPW = HB_CAL_PREAMBLE_SKIP_WIDTH;
   logic [SKIPW-1:0]    pre_skip;
+
+  // 2-flop synchronise the runtime cal_preamble_skip (clk / r_cal domain) into clk90, reset-seeded from
+  // the RD_PREAMBLE_SKIP POR value so out-of-reset behaviour matches the legacy parameter. Quasi-static
+  // (host changes it only while STATUS.busy=0), so the multi-bit 2-flop sync is safe. Mirrors rdarm_s1/2.
+  logic [SKIPW-1:0]    cal_skip_s1, cal_skip_s2;
+  always_ff @(posedge clk90) begin
+    if (rst2x) begin
+      cal_skip_s1 <= SKIPW'(RD_PREAMBLE_SKIP);
+      cal_skip_s2 <= SKIPW'(RD_PREAMBLE_SKIP);
+    end else begin
+      cal_skip_s1 <= cal_preamble_skip;
+      cal_skip_s2 <= cal_skip_s1;
+    end
+  end
 
   wire rwds_rise = rwds_cap & ~rwds_cap_q;        // start of byte A
   wire rwds_fall = ~rwds_cap & rwds_cap_q;        // start of byte B (word complete)
@@ -319,7 +348,7 @@ module hyperbus_phy_sdr
         // preamble edges AND any trailing words the device streamed past the master's burst count
         // (which would otherwise leak into the next read). Paired with the read-side rptr reset below.
         have_a   <= 1'b0;
-        pre_skip <= SKIPW'(RD_PREAMBLE_SKIP);
+        pre_skip <= cal_skip_s2;   // re-arm to the LIVE programmed skip (was SKIPW'(RD_PREAMBLE_SKIP))
         wptr_bin <= '0;
       end else begin
         if (rwds_rise) begin
@@ -407,10 +436,11 @@ module hyperbus_phy_sdr
     end
   end
 
-  // clk_ref / ADDR_WIDTH / LEN_WIDTH / PHY_VARIANT are contract-only for this variant.
+  // clk_ref / ADDR_WIDTH / LEN_WIDTH / PHY_VARIANT are contract-only for this variant; cal_rx_tap and
+  // cal_pair_skew are DDIO-PHY read-eye knobs with no meaning in the SDR datapath (tie-off).
   logic _unused_ok;
   /* verilator lint_off UNUSEDSIGNAL */
-  assign _unused_ok = &{1'b0, clk_ref};
+  assign _unused_ok = &{1'b0, clk_ref, cal_rx_tap, cal_pair_skew};
   /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule

@@ -85,6 +85,8 @@ module tb_sdr;
     .DIFF_CK          (1'b1)
   ) dut (
     .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    // runtime read-eye calibration tied to POR-equivalent constants (reproduces pre-cal behaviour)
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd0), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
     .avs_address       (avs_address),
     .avs_read          (avs_read),
     .avs_write         (avs_write),
@@ -97,7 +99,7 @@ module tb_sdr;
     .hb_ck (hb_ck), .hb_ck_n (hb_ck_n), .hb_cs_n (hb_cs_n), .hb_rst_n (hb_rst_n),
     .hb_dq_o (phy_dq_o), .hb_dq_oe (phy_dq_oe), .hb_dq_i (dq_line_dly),
     .hb_rwds_o (phy_rwds_o), .hb_rwds_oe (phy_rwds_oe), .hb_rwds_i (rwds_line_dly),
-    .init_done (init_done)
+    .init_done (init_done), .err_underrun (/* unused */), .dbg_bus ()
   );
 
   // --------------------------------------------------------------------

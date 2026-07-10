@@ -39,6 +39,18 @@ package hyperbus_pkg;
   localparam int unsigned HB_BURST_WORDS_DEFAULT = 16;    // default user burst length (words)
 
   // ------------------------------------------------------------------------
+  // Runtime PHY read-eye CALIBRATION port widths (docs/INTERFACES.md v9). The frozen `hyperbus_phy`
+  // contract carries four *mandatory* cal_* inputs so a host can retune the read eye by a CSR write
+  // (REG_CAL, see hyperram_bw_test) with no recompile. These widths size the two multi-bit knobs:
+  //   * cal_preamble_skip : leading rwds-rise edges to discard as read-strobe preamble (SDR PHY).
+  //                         3 bits => 0..7 (fixed width; do NOT derive from a parameter's value).
+  //   * cal_rx_tap        : RWDS eye-centring delay-line tap index (Agilex DDIO PHY). 5 bits =>
+  //                         0..31 ⊇ the 17 valid tap indices of RX_STROBE_MAX_TAPS+1 @ default.
+  // (cal_capture_phase and cal_pair_skew are 1 bit each and need no width localparam.)
+  localparam int unsigned HB_CAL_PREAMBLE_SKIP_WIDTH = 3;
+  localparam int unsigned HB_CAL_RX_TAP_WIDTH        = 5;
+
+  // ------------------------------------------------------------------------
   // Device register-space word addresses + reset values.
   // [device, not generic spec] — W957D8NB / HyperRAM family, cross-checked against
   // agilex_3_ai_benchmarks/sim/hyperbus/w957d8nb_bfm.sv (SPEC_DIGEST §8.4).

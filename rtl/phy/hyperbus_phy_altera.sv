@@ -80,7 +80,33 @@ module hyperbus_phy_altera
     // sample} where the falling sample belongs to the PRECEDING rising edge; RX_PAIR_SKEW=1 re-pairs
     // byteA(n) with the falling byteB that FOLLOWS it (matches the generic PHY's {A, next-B} order).
     // If a hardware read-eye sweep shows the halves swapped, build with RX_PAIR_SKEW=0.
-    parameter bit          RX_PAIR_SKEW       = 1'b1
+    parameter bit          RX_PAIR_SKEW       = 1'b1,
+    // Read-strobe PREAMBLE skip (non-frozen, defaulted 0) — same semantics as hyperbus_phy_sdr.sv:
+    // a real HyperRAM (Winbond W957D8NB) toggles RWDS for RD_PREAMBLE_SKIP CK cycles with DQ Hi-Z
+    // (=0x00) BEFORE the first read-data byte. Each preamble cycle is one rx_strobe rising edge here;
+    // without the skip those edges push phantom {0x00,0x00} words and shift the whole burst
+    // (on-silicon fingerprint: ERR_COUNT = LEN-1). Ignore the first RD_PREAMBLE_SKIP rising edges
+    // after each arm. 0 = spec-ideal device (no preamble). GitHub issue #7.
+    parameter int unsigned RD_PREAMBLE_SKIP   = 0,
+    // HyperBus CK forwarding scheme (GitHub issue #8, parent #3 direction 1):
+    //   "CLK90"   — (legacy default) CK DDIOs clocked by clk90 (+90 deg IOPLL phase). Centres CK in
+    //               the DQ eye by construction but needs TWO clock phases in the I/O periphery —
+    //               the Agilex-3 Bank-3A Fitter blocker (err 24403/24404).
+    //   "CLK_DLY" — CK DDIOs clocked by the SAME clk as the DQ DDIOs (ONE periphery clock, no
+    //               24403/24404). CK leaves the pin edge-aligned with the DQ launch; the required
+    //               quarter-period eye-centring shift is applied OFF-FABRIC by a hard per-pin
+    //               output-delay-chain assignment on the hb_ck pin (board .qsf; ~tCK/4, e.g.
+    //               1.25 ns @ 200 MHz). clk90 is unused in this scheme (tie to clk at the board top).
+    parameter              CK_SCHEME          = "CLK90",
+    // Read DQ capture scheme:
+    //   "LOCAL2X" (default) — the SDR PHY's RX front-end verbatim: DQ/RWDS registered into the
+    //       free-running 2x core clock (clk90 in FABRIC2X guise), RWDS edges DETECTED (not used as
+    //       a clock), byte pairing + preamble skip + synchronous disarm flush — the structure
+    //       proven on this board's silicon to a 350 MHz capture clock with zero tuning.
+    //   "FABRIC" — strobe-clocked fabric regs. Worked at 50 MHz; at 175 MHz the undelayed strobe
+    //       races the byte transitions (one-byte slip, INPUT_DELAY_CHAIN taps too small to fix).
+    //   "IOREG" — tennm_ph2_ddio_in in the I/O cell — read back constant zeros on the AXC3000.
+    parameter              RX_CAP_SCHEME      = "LOCAL2X"
 ) (
     input  logic                clk,
     input  logic                clk90,
@@ -96,6 +122,13 @@ module hyperbus_phy_altera
     input  logic [1:0]          phy_rwds_o,   // [1]=1st phase mask, [0]=2nd phase mask
     input  logic                phy_rwds_oe,
     input  logic                phy_rd_arm,
+    // ---- runtime read-eye calibration (mandatory, no defaults; shared port contract, docs/INTERFACES.md
+    //      v9). Elaboration-only tie-offs here until #3 unblocks the Agilex fit: the RX tap / byte-pairing
+    //      stay the compile-time RX_STROBE_DLY_TAPS / RX_PAIR_SKEW parameters (no RX/TX/CK changes). ----
+    input  logic                              cal_capture_phase,
+    input  logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+    input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+    input  logic                              cal_pair_skew,
     output logic [2*DQ_WIDTH-1:0] phy_dq_i,   // recovered read word (byte A in high half)
     output logic                phy_dq_i_valid,
     output logic                phy_rwds_i,
@@ -139,6 +172,15 @@ module hyperbus_phy_altera
   //  falling edge). The DDIO registers both halves on the clk rising edge and serialises them onto the
   //  pin across the following cycle → exactly the generic PHY's 1-cycle launch latency & A-then-B order.
   // ==================================================================================================
+  // One-clk delay of the byte-B (LO) TX streams — pairs each word's byte B with the FABRIC2X CK
+  // falling edge that arrives one half-slot into the following cycle (see the CK generate below).
+  logic [DQ_WIDTH-1:0] dq_b_dly;
+  logic                rwds_b_dly;
+  always_ff @(posedge clk) begin
+    dq_b_dly   <= phy_dq_o[DQ_WIDTH-1:0];
+    rwds_b_dly <= phy_rwds_o[0];
+  end
+
   genvar gi;
   generate
     for (gi = 0; gi < DQ_WIDTH; gi = gi + 1) begin : g_dq_out
@@ -148,10 +190,15 @@ module hyperbus_phy_altera
         .sclr_ena  ("SCLR_ENA_NONE")
       ) u_dq_ddio_out (
         .ena      (1'b1),
-        .areset   (1'b0),
+        .areset   (1'b1),   // ACTIVE-LOW reset_n on ph2 atoms (vendor altera_gpio ties ~aclr = 1'b1;
+                        // tying 0 holds the atom in async clear — DDIO_IN then reads constant 0)
         .sreset   (1'b0),
-        .datainhi (phy_dq_o[DQ_WIDTH + gi]),  // byte A bit i (1st edge, CK high)
-        .datainlo (phy_dq_o[gi]),             // byte B bit i (2nd edge, CK low)
+        // ON-SILICON ALIGNMENT (AXC3000, 2026-07-09): with the FABRIC2X CK generator, the CK
+        // falling edge lands in the NEXT cycle's LO half-slot, so byte B rides a one-clk-delayed
+        // LO stream (dq_b_dly) to meet it; byte A stays on datainhi where the rising edge samples
+        // it. Verified against wire capture: without the delay the device stores {A(k), B(k+1)}.
+        .datainhi (phy_dq_o[DQ_WIDTH + gi]),  // byte A bit i
+        .datainlo (dq_b_dly[gi]),             // byte B bit i, delayed one clk
         .dataout  (hb_dq_o[gi]),
         .clk      (clk)
       );
@@ -167,10 +214,12 @@ module hyperbus_phy_altera
     .sclr_ena  ("SCLR_ENA_NONE")
   ) u_rwds_ddio_out (
     .ena      (1'b1),
-    .areset   (1'b0),
+    .areset   (1'b1),   // ACTIVE-LOW reset_n on ph2 atoms (vendor altera_gpio ties ~aclr = 1'b1;
+                        // tying 0 holds the atom in async clear — DDIO_IN then reads constant 0)
     .sreset   (1'b0),
+    // Same one-clk LO-stream delay as the DQ DDIOs (see dq_b_dly note).
     .datainhi (phy_rwds_o[1]),   // 1st-phase write mask
-    .datainlo (phy_rwds_o[0]),   // 2nd-phase write mask
+    .datainlo (rwds_b_dly),      // 2nd-phase write mask, delayed one clk
     .dataout  (hb_rwds_o),
     .clk      (clk)
   );
@@ -203,40 +252,96 @@ module hyperbus_phy_altera
   //  edge — a moment when clk90 is Low — so a pulse is never chopped and CK idles Low (SPEC_DIGEST §1).
   //  This mirrors the generic PHY's `hb_ck = ck_en_q ? clk90 : 0`, realised in the I/O cell.
   // ==================================================================================================
-  tennm_ph2_ddio_out #(
-    .mode      ("MODE_DDR"),
-    .asclr_ena ("ASCLR_ENA_NONE"),
-    .sclr_ena  ("SCLR_ENA_NONE")
-  ) u_ck_ddio_out (
-    .ena      (1'b1),
-    .areset   (1'b0),
-    .sreset   (1'b0),
-    .datainhi (ck_en_q),   // high sub-phase follows clk90 when enabled
-    .datainlo (1'b0),      // low  sub-phase forced Low → clean single pulse, idles Low
-    .dataout  (hb_ck),
-    .clk      (clk90)
-  );
-
+  // CK generation, selected by CK_SCHEME (issue #8):
+  //   "FABRIC2X" — (recommended on Agilex-3) port of the SILICON-PROVEN SDR-PHY CK generator
+  //       (hyperbus_phy_sdr.sv, clean to a 350 MHz fabric clock on this board): the clk90 port
+  //       carries a 2x-CK, 0-deg, CORE-ONLY fabric clock; a clk-domain toggle is synchronised into
+  //       it, and hb_ck is emitted from an ordinary fabric register on the clk90 NEGEDGE — rising
+  //       edge at T/4, falling at 3T/4 of the word period, i.e. centred in both byte eyes BY
+  //       CONSTRUCTION. No I/O-cell CK register, no pin delay chain, and the I/O periphery still
+  //       sees exactly ONE clock (clk, on the DQ/RWDS DDIOs) — hb_ck reaches its pad as data.
+  //   "CLK_DLY"  — CK DDIO_OUT clocked by the same clk as the DQ DDIOs + hard output-delay-chain
+  //       centring on the pin (bw.qsf). On the AXC3000 this produced NO observable CK activity on
+  //       the wire (device never clocked a CA in; RWDS never strobed) — kept for future dissection.
+  //   "CLK90"    — legacy: CK DDIO_OUT on a +90 deg IOPLL phase; needs two periphery clock phases
+  //       (Fitter 24403/24404 on Bank 3A) — unbuildable on this board.
   generate
-    if (DIFF_CK) begin : g_ckn
-      // Complementary clock: inverted DDR phases (datainhi=0, datainlo=ck_en_q) → 180° of hb_ck.
-      // The AXC3000 HyperRAM is single-ended (no hb_ck_n board pin); keep this for pseudo-diff boards
-      // and drive it from its own DDIO so both legs share the clk90 launch path.
+    if (CK_SCHEME == "FABRIC2X") begin : g_ck_fab2x
+      // 2-flop reset into the clk90 (2x) domain (structure ported from hyperbus_phy_sdr.sv).
+      logic rst2x_meta, rst2x;
+      always_ff @(posedge clk90) begin
+        rst2x_meta <= rst;
+        rst2x      <= rst2x_meta;
+      end
+      // clk-domain word-phase toggle → synchronise + edge-detect in clk90 → beat_a marks the
+      // byte-A (first) half of each clk word period.
+      logic tgl;
+      always_ff @(posedge clk) tgl <= rst ? 1'b0 : ~tgl;
+      logic tgl_s1, tgl_s2, tgl_s3;
+      always_ff @(posedge clk90) begin
+        if (rst2x) begin tgl_s1 <= 1'b0; tgl_s2 <= 1'b0; tgl_s3 <= 1'b0; end
+        else       begin tgl_s1 <= tgl;  tgl_s2 <= tgl_s1; tgl_s3 <= tgl_s2; end
+      end
+      wire beat_a = tgl_s2 ^ tgl_s3;
+      logic beat_a_d1;
+      always_ff @(posedge clk90) beat_a_d1 <= rst2x ? 1'b0 : beat_a;
+      // Latch the CK enable per word at beat_a so a pulse is never chopped (glitch-free gating).
+      logic cken_w;
+      always_ff @(posedge clk90) begin
+        if (rst2x)       cken_w <= 1'b0;
+        else if (beat_a) cken_w <= ck_en_q;
+      end
+      // Emit CK on the clk90 negedge (beat_a_d1 view — the EXACT generator that runs the bus on
+      // silicon). Its edges land one half-slot later than the DQ DDIO's word boundary: the rising
+      // edge samples the wire's HI half-slot (byte A — correct) and the falling edge samples the
+      // NEXT cycle's LO half-slot. The TX datapath below compensates by delaying the byte-B (LO)
+      // stream one clk, so that late falling edge lands on the CURRENT word's byte B. Empirical:
+      // moving the CK edge earlier instead (beat_a direct, with or without an early cken preload)
+      // kills the CA entirely on silicon — do not "simplify" this back.
+      logic ck_r;
+      always_ff @(negedge clk90) ck_r <= rst2x ? 1'b0 : (cken_w & beat_a_d1);
+      assign hb_ck   = ck_r;
+      assign hb_ck_n = DIFF_CK ? ~ck_r : 1'b1;
+    end else begin : g_ck_ddio
+      wire ck_launch_clk;
+      if (CK_SCHEME == "CLK_DLY") begin : g_ck_clkdly
+        assign ck_launch_clk = clk;     // one periphery clock; centring via pin output-delay (~tCK/4)
+      end else begin : g_ck_clk90
+        assign ck_launch_clk = clk90;   // legacy: +90 deg phase centres CK in the DQ eye directly
+      end
+
       tennm_ph2_ddio_out #(
         .mode      ("MODE_DDR"),
         .asclr_ena ("ASCLR_ENA_NONE"),
         .sclr_ena  ("SCLR_ENA_NONE")
-      ) u_ckn_ddio_out (
+      ) u_ck_ddio_out (
         .ena      (1'b1),
-        .areset   (1'b0),
+        .areset   (1'b1),   // ACTIVE-LOW reset_n on ph2 atoms (vendor altera_gpio ties ~aclr = 1'b1)
         .sreset   (1'b0),
-        .datainhi (1'b0),
-        .datainlo (ck_en_q),
-        .dataout  (hb_ck_n),
-        .clk      (clk90)
+        .datainhi (ck_en_q),   // high sub-phase follows the launch clock when enabled
+        .datainlo (1'b0),      // low  sub-phase forced Low → clean single pulse, idles Low
+        .dataout  (hb_ck),
+        .clk      (ck_launch_clk)
       );
-    end else begin : g_ckn_tie
-      assign hb_ck_n = 1'b1;   // single-ended: idle CK Low ⇒ idle CK# High
+
+      if (DIFF_CK) begin : g_ckn
+        // Complementary clock: inverted DDR phases (datainhi=0, datainlo=ck_en_q) → 180° of hb_ck.
+        tennm_ph2_ddio_out #(
+          .mode      ("MODE_DDR"),
+          .asclr_ena ("ASCLR_ENA_NONE"),
+          .sclr_ena  ("SCLR_ENA_NONE")
+        ) u_ckn_ddio_out (
+          .ena      (1'b1),
+          .areset   (1'b1),   // ACTIVE-LOW reset_n on ph2 atoms (vendor altera_gpio ties ~aclr = 1'b1)
+          .sreset   (1'b0),
+          .datainhi (1'b0),
+          .datainlo (ck_en_q),
+          .dataout  (hb_ck_n),
+          .clk      (ck_launch_clk)
+        );
+      end else begin : g_ckn_tie
+        assign hb_ck_n = 1'b1;   // single-ended: idle CK Low ⇒ idle CK# High
+      end
     end
   endgenerate
 
@@ -268,30 +373,58 @@ module hyperbus_phy_altera
   wire rx_strobe = rwds_dly_line[RX_TAP];   // phase-shifted RWDS = read-capture clock
 
   // ==================================================================================================
-  //  RX : DDR read capture — one tennm_ph2_ddio_in per DQ bit, clocked by the shifted RWDS strobe.
-  //  regouthi = sample at the strobe RISING edge (byte A), regoutlo = sample at the FALLING edge.
-  //  Both are retimed to the rising edge, so a full {A,B} pair is available once per strobe period in
-  //  the RWDS-strobe clock domain.
+  //  RX : DDR read capture, selected by RX_CAP_SCHEME:
+  //    "FABRIC" (default) — plain fabric registers on both edges of the shifted strobe, sampling the
+  //        DQ ibuf outputs directly. Same structure class the SDR PHY proved on silicon to a 350 MHz
+  //        capture clock with zero tuning; needs no I/O-cell input register, so the DQ pad's raw
+  //        input can route to core with no P2X-term conflict. Pairing: at rising edge n+1 the push
+  //        process's pre-edge view is {rx_hi = byte A(n), rx_lo = byte B(n)} — a matched same-word
+  //        pair, so the effective pair skew is forced to 0 in this scheme (EFF_PAIR_SKEW below).
+  //    "IOREG" — one tennm_ph2_ddio_in per DQ bit in the I/O cell (the original scheme). On this
+  //        board it read back constant zeros through five build variants (areset polarity, strobe
+  //        delay, preamble skip all swept) — kept for reference/other devices, not trusted on
+  //        Agilex-3 until the atom's fabric-clock + regout semantics are vendor-clarified.
   // ==================================================================================================
-  logic [DQ_WIDTH-1:0] rx_hi;   // rising-edge captured byte (byte A of this period)
+  logic [DQ_WIDTH-1:0] rx_hi;   // rising-edge captured byte (byte A)
   logic [DQ_WIDTH-1:0] rx_lo;   // falling-edge captured byte
   generate
-    for (gi = 0; gi < DQ_WIDTH; gi = gi + 1) begin : g_dq_in
-      tennm_ph2_ddio_in #(
-        .mode      ("MODE_DDR"),
-        .asclr_ena ("ASCLR_ENA_NONE"),
-        .sclr_ena  ("SCLR_ENA_NONE")
-      ) u_dq_ddio_in (
-        .ena      (1'b1),
-        .areset   (1'b0),
-        .sreset   (1'b0),
-        .datain   (hb_dq_i[gi]),
-        .clk      (rx_strobe),
-        .regouthi (rx_hi[gi]),
-        .regoutlo (rx_lo[gi])
-      );
+    if (RX_CAP_SCHEME == "IOREG") begin : g_rx_ioreg
+      for (gi = 0; gi < DQ_WIDTH; gi = gi + 1) begin : g_dq_in
+        tennm_ph2_ddio_in #(
+          .mode      ("MODE_DDR"),
+          .asclr_ena ("ASCLR_ENA_NONE"),
+          .sclr_ena  ("SCLR_ENA_NONE")
+        ) u_dq_ddio_in (
+          .ena      (1'b1),
+          .areset   (1'b1),   // ACTIVE-LOW reset_n on ph2 atoms (vendor altera_gpio ties ~aclr = 1'b1)
+          .sreset   (1'b0),
+          .datain   (hb_dq_i[gi]),
+          .clk      (rx_strobe),
+          .regouthi (rx_hi[gi]),
+          .regoutlo (rx_lo[gi])
+        );
+      end
+    end else if (RX_CAP_SCHEME == "LOCAL2X") begin : g_rx_local2x_tie
+      // LOCAL2X does its capture inside the write-side generate below (clk90 domain);
+      // the strobe-clocked rx_hi/rx_lo rails are unused.
+      assign rx_hi = '0;
+      assign rx_lo = '0;
+    end else begin : g_rx_fabric
+      // Reset-less datapath capture registers (Hyperflex discipline): byte A on the strobe rising
+      // edge, byte B on the falling edge. Downstream pairing reads them one edge later (pre-edge
+      // view), which yields matched {A(n), B(n)} words with EFF_PAIR_SKEW = 0.
+      logic [DQ_WIDTH-1:0] rx_hi_r, rx_lo_r;
+      always_ff @(posedge rx_strobe) rx_hi_r <= hb_dq_i;
+      /* verilator lint_off SYNCASYNCNET */
+      always_ff @(negedge rx_strobe) rx_lo_r <= hb_dq_i;
+      /* verilator lint_on SYNCASYNCNET */
+      assign rx_hi = rx_hi_r;
+      assign rx_lo = rx_lo_r;
     end
   endgenerate
+
+  // Effective byte pairing for the scheme in use (see header note above the generate).
+  localparam bit EFF_PAIR_SKEW = (RX_CAP_SCHEME == "IOREG") ? RX_PAIR_SKEW : 1'b0;
 
   // ==================================================================================================
   //  RX : byte pairing + RWDS→clk elastic FIFO  (the one true CDC of the system, DESIGN §2)
@@ -306,7 +439,10 @@ module hyperbus_phy_altera
   //  it} order, hold byte A one strobe and pair it with the next regoutlo (RX_PAIR_SKEW=1). If a
   //  hardware sweep shows the halves swapped, RX_PAIR_SKEW=0 pairs {rx_hi, rx_lo} of the same edge.
   // ==================================================================================================
-  localparam int unsigned RXF_DEPTH = 8;
+  localparam int unsigned RXF_DEPTH = 32;  // elastic read FIFO. Deepened from 8 (matching the SDR
+                                           // PHY's silicon fix, issue #7) so a full board read burst
+                                           // plus device over-stream plus the strobe->clk gray-pointer
+                                           // hand-off latency never laps the pointer.
   localparam int unsigned RXF_AW    = $clog2(RXF_DEPTH);
 
   logic [PHYW-1:0]     rxf_mem [RXF_DEPTH];
@@ -315,34 +451,121 @@ module hyperbus_phy_altera
   logic [RXF_AW:0]     wptr_bin;                  // strobe-domain binary write pointer (+1 wrap MSB)
   logic [RXF_AW:0]     rptr_bin;                  // clk-domain binary read pointer
 
-  wire  [PHYW-1:0] rx_word_pair = RX_PAIR_SKEW ? {rx_hi_hold, rx_lo}   // {byteA(n-1), byteB(n-1)}
-                                               : {rx_hi,      rx_lo};  // {byteA(n),   byteB(n)}
-  wire             rx_push_ok   = RX_PAIR_SKEW ? rx_prime : 1'b1;
+  // Leading rx_strobe rising edges still to discard as read-strobe preamble (issue #7). Reloaded by
+  // rx_flush_q between bursts, so every armed read re-skips its own device preamble.
+  localparam int unsigned SKIPW = (RD_PREAMBLE_SKIP == 0) ? 1 : $clog2(RD_PREAMBLE_SKIP + 1);
+  logic [SKIPW-1:0]    pre_skip = SKIPW'(RD_PREAMBLE_SKIP);
 
-  /* verilator lint_off SYNCASYNCNET */
-  always_ff @(posedge rx_strobe or posedge rst) begin
-    if (rst) begin
-      wptr_bin   <= '0;
-      rx_hi_hold <= '0;
-      rx_prime   <= 1'b0;
-    end else if (phy_rd_arm) begin
-      rx_hi_hold <= rx_hi;
-      rx_prime   <= 1'b1;
-      if (rx_push_ok) begin
-        rxf_mem[wptr_bin[RXF_AW-1:0]] <= rx_word_pair;
-        wptr_bin                      <= wptr_bin + 1'b1;
+  generate
+    if (RX_CAP_SCHEME == "LOCAL2X") begin : g_rxw_local2x
+      // =============================================================================================
+      // SDR-PHY RX front-end, ported verbatim (hyperbus_phy_sdr.sv — silicon-proven at 350 MHz on
+      // this board): DQ/RWDS registered into the free-running 2x clock (clk90), RWDS edges DETECTED
+      // in that domain, rising edge captures byte A, falling edge completes {A,B} and pushes. The
+      // disarm flush and preamble reload are SYNCHRONOUS (free-running clock — no async apparatus).
+      // =============================================================================================
+      logic rxrst_meta, rxrst;
+      always_ff @(posedge clk90) begin
+        rxrst_meta <= rst;
+        rxrst      <= rxrst_meta;
       end
-    end else begin
-      rx_prime <= 1'b0;   // re-prime the skew pipeline for the next armed read burst
+
+      logic [DQ_WIDTH-1:0] dq_cap;
+      logic                rwds_cap, rwds_cap_q;
+      logic [DQ_WIDTH-1:0] rx_byte_a;
+      logic                have_a;
+      logic                rdarm_s1, rdarm_s2;
+
+      always_ff @(posedge clk90) begin
+        dq_cap   <= hb_dq_i;      // registered input sampling on the local 2x clock
+        rwds_cap <= hb_rwds_i;
+        if (rxrst) begin rdarm_s1 <= 1'b0; rdarm_s2 <= 1'b0; end
+        else       begin rdarm_s1 <= phy_rd_arm; rdarm_s2 <= rdarm_s1; end
+      end
+
+      wire rwds_rise = rwds_cap & ~rwds_cap_q;   // start of byte A
+      wire rwds_fall = ~rwds_cap & rwds_cap_q;   // start of byte B (word completes)
+
+      always_ff @(posedge clk90) begin
+        if (rxrst) begin
+          rx_byte_a  <= '0;
+          have_a     <= 1'b0;
+          rwds_cap_q <= 1'b0;
+          wptr_bin   <= '0;
+          pre_skip   <= SKIPW'(RD_PREAMBLE_SKIP);
+        end else begin
+          rwds_cap_q <= rwds_cap;
+          if (!rdarm_s2) begin
+            // Between bursts: flush the write side, re-arm the preamble skip (SDR PHY semantics).
+            have_a   <= 1'b0;
+            pre_skip <= SKIPW'(RD_PREAMBLE_SKIP);
+            wptr_bin <= '0;
+          end else begin
+            if (rwds_rise) begin
+              if (pre_skip != '0) begin
+                pre_skip <= pre_skip - 1'b1;   // discard preamble rise (DQ Hi-Z here)
+                have_a   <= 1'b0;
+              end else begin
+                rx_byte_a <= dq_cap;
+                have_a    <= 1'b1;
+              end
+            end else if (rwds_fall && have_a) begin
+              rxf_mem[wptr_bin[RXF_AW-1:0]] <= {rx_byte_a, dq_cap};   // {byte A, byte B}
+              wptr_bin                      <= wptr_bin + 1'b1;
+              have_a                        <= 1'b0;
+            end
+          end
+        end
+      end
+    end else begin : g_rxw_strobe
+      // Strobe-clocked write side (FABRIC / IOREG capture schemes). rx_strobe only toggles inside a
+      // burst's data window, so disarm-time reload is done by an ASYNC hold (rx_flush_q, a
+      // clk-registered glitch-free level; single async control per flop). Release timing is safe by
+      // protocol construction: first strobe edge >= CA + initial latency after phy_rd_arm rises.
+      logic rx_flush_q;
+      always_ff @(posedge clk) begin
+        if (rst) rx_flush_q <= 1'b1;
+        else     rx_flush_q <= ~phy_rd_arm;
+      end
+
+      wire  [PHYW-1:0] rx_word_pair = EFF_PAIR_SKEW ? {rx_hi_hold, rx_lo}   // {byteA(n-1), byteB(n-1)}
+                                                    : {rx_hi,      rx_lo};  // {byteA(n),   byteB(n)}
+      wire             rx_push_ok   = (RX_CAP_SCHEME == "IOREG") ? (EFF_PAIR_SKEW ? rx_prime : 1'b1)
+                                                                 : rx_prime;
+
+      /* verilator lint_off SYNCASYNCNET */
+      always_ff @(posedge rx_strobe or posedge rx_flush_q) begin
+        if (rx_flush_q) begin
+          wptr_bin   <= '0;
+          rx_hi_hold <= '0;
+          rx_prime   <= 1'b0;
+          pre_skip   <= SKIPW'(RD_PREAMBLE_SKIP);
+        end else if (pre_skip != '0) begin
+          pre_skip   <= pre_skip - 1'b1;
+          rx_hi_hold <= rx_hi;
+          rx_prime   <= 1'b0;
+        end else begin
+          rx_hi_hold <= rx_hi;
+          rx_prime   <= 1'b1;
+          if (rx_push_ok) begin
+            rxf_mem[wptr_bin[RXF_AW-1:0]] <= rx_word_pair;
+            wptr_bin                      <= wptr_bin + 1'b1;
+          end
+        end
+      end
+      /* verilator lint_on SYNCASYNCNET */
     end
-  end
-  /* verilator lint_on SYNCASYNCNET */
+  endgenerate
 
   // Gray-code the write pointer and 2-flop synchronise it into clk (standard async-FIFO CDC).
+  // While the receiver is disarmed the write side is flushed to 0 by rx_flush_q — a MULTI-BIT gray
+  // transition a plain 2-flop sync can mis-sample mid-flight (the SDR PHY's on-silicon multi-burst
+  // leak, issue #7). Force the synchronised copy to 0 while disarmed (the source is 0 anyway) so
+  // rxf_empty is deterministic; normal +1 gray sync resumes from 0 when the next read arms.
   wire  [RXF_AW:0] wptr_gray = wptr_bin ^ (wptr_bin >> 1);
   logic [RXF_AW:0] wgray_s1, wgray_s2;
   always_ff @(posedge clk) begin
-    if (rst) begin
+    if (rst || !phy_rd_arm) begin
       wgray_s1 <= '0;
       wgray_s2 <= '0;
     end else begin
@@ -360,7 +583,9 @@ module hyperbus_phy_altera
   wire [RXF_AW:0] wptr_bin_s = gray2bin(wgray_s2);
   wire            rxf_empty  = (rptr_bin == wptr_bin_s);
 
-  // Read side (clk domain): one recovered word + valid pulse per FIFO entry.
+  // Read side (clk domain): one recovered word + valid pulse per FIFO entry. While the receiver is
+  // disarmed hold the read pointer at 0 — paired with the rx_flush_q write-side flush above, both
+  // sides start every read burst at 0, discarding trailing over-streamed words (issue #7).
   always_ff @(posedge clk) begin
     if (rst) begin
       rptr_bin       <= '0;
@@ -368,7 +593,9 @@ module hyperbus_phy_altera
       phy_dq_i_valid <= 1'b0;
     end else begin
       phy_dq_i_valid <= 1'b0;
-      if (!rxf_empty) begin
+      if (!phy_rd_arm) begin
+        rptr_bin <= '0;
+      end else if (!rxf_empty) begin
         phy_dq_i       <= rxf_mem[rptr_bin[RXF_AW-1:0]];
         phy_dq_i_valid <= 1'b1;
         rptr_bin       <= rptr_bin + 1'b1;
@@ -392,9 +619,12 @@ module hyperbus_phy_altera
   end
 
   // Contract-only / calibration-reference tie-offs (kept so all PHY variants share one port+param list).
+  // The four runtime cal_* knobs are accumulated here too: they are elaboration-only for this variant
+  // until #3 lands (see the port comment); the tap / pairing stay the compile-time params above.
   logic _unused_ok;
   assign _unused_ok = &{1'b0, clk_ref, ADDR_WIDTH[0], LEN_WIDTH[0], DATA_WIDTH[0],
-                        PHY_VARIANT == "INTEL"};
+                        PHY_VARIANT == "INTEL",
+                        cal_capture_phase, cal_preamble_skip, cal_rx_tap, cal_pair_skew};
 
 endmodule
 /* verilator lint_on DECLFILENAME */

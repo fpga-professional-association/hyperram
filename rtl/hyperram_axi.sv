@@ -28,19 +28,55 @@ module hyperram_axi
   parameter int unsigned LATENCY_CLOCKS    = HB_LATENCY_CLOCKS_DEFAULT,  // CA1->data, clocks
   parameter bit          FIXED_LATENCY     = HB_FIXED_LATENCY_DEFAULT,   // 1 = fixed (POR default)
   parameter int unsigned MAX_BURST_WORDS   = 0,                         // 0 = no chop; else tCSM/tCK
+  parameter int unsigned BURST_BOUNDARY_WORDS = 0,                       // 0 = off; else chop at this
+                                                                         //   WORD boundary (W957D8NB)
+  parameter bit          WR_COMMIT_READ    = 1'b0,                       // interpose commit-read after
+                                                                         //   each split memory write
+  parameter bit          WR_CHOP_REPLAY    = 1'b0,                       // re-send the last words at
+                                                                         //   intra-command write chops
+                                                                         //   (issue #1 direction 5)
+  parameter int unsigned WR_REPLAY_WORDS   = 4,
+  parameter int unsigned WR_REPLAY_PEND    = 4,                          // device pending depth (align floor)
+  parameter int unsigned WR_REPLAY_ALIGN   = 0,                          // row-aligned rollback (0 = legacy)
+  parameter int unsigned WR_REPLAY_MASK_LEAD = 0,                        // masked lead-in beats on reopen
+  parameter int unsigned WR_CHOP_PAUSE_CYCLES = 0,                       // post-write CS#-High dwell
+  parameter bit          WR_CHOP_PAUSE_CK  = 1'b0,                       // CK toggling through the dwell                          // replay depth (= device
+                                                                         //   pending depth; W957D8NB: 4)
   parameter bit          PROGRAM_CR        = 1'b1,                       // program CR0 at init
   parameter int unsigned POR_DELAY_CYCLES  = 0,                         // POR init delay (sim: 0)
   parameter logic [3:0]  INIT_LATENCY_CODE = hb_clocks_to_latency_code(LATENCY_CLOCKS),
   parameter logic [15:0] INIT_CR0          = HB_CR0_RESET,               // CR0 image written at init
+  // ---- spec-feature options (hyperbus_ctrl; all default OFF = legacy behavior) -----------
+  parameter bit          PROGRAM_CR1       = 1'b0,                       // A3: also program CR1 at init
+  parameter logic [15:0] INIT_CR1          = HB_CR1_RESET,               // A3: CR1 image written at init
+  parameter int unsigned CLK_FREQ_MHZ      = 0,                          // A4: CK freq (MHz); 0 = legacy POR
+  parameter int unsigned T_RP_NS           = 200,                        // A4: tRP  RST# pulse   (>=200 ns)
+  parameter int unsigned T_RPH_NS          = 400,                        // A4: tRPH RST#->CS#    (>=400 ns)
+  parameter int unsigned T_RH_NS           = 200,                        // A4: tRH  RST#hi->CS#  (>=200 ns)
+  parameter int unsigned T_VCS_US          = 150,                        // A4: tVCS VCC->access  (<=150 µs)
+  parameter bit          SUPPORT_DPD       = 1'b0,                       // A1: Deep-Power-Down enter/exit
+  parameter int unsigned TDPDOUT_CYCLES    = 0,                          // A1: tDPDOUT exit dwell (cycles)
+  parameter bit          ACTIVE_CLK_STOP   = 1'b0,                       // A2: pause CK on RD back-pressure
   // ---- PHY (hyperbus_phy) -------------------------------------------------
   parameter              PHY_VARIANT       = "GENERIC",                  // GENERIC | INTEL | XILINX
-  parameter bit          DIFF_CK           = 1'b1                        // drive hb_ck_n
+  parameter bit          DIFF_CK           = 1'b1,                       // drive hb_ck_n
+  parameter int unsigned RD_PREAMBLE_SKIP  = 0,                          // SDR/GENERIC/INTEL PHY:
+                                                                         // preamble rwds-rise edges to skip
+  parameter              CK_SCHEME         = "CLK90",                    // INTEL PHY only (issue #8)
+  // POR seed for the runtime cal_capture_phase knob (forwarded to hyperbus_phy; default = legacy).
+  parameter bit          CAPTURE_PHASE     = 1'b0                        // SDR read-capture edge seed
 ) (
   // ---- clocking / reset ---------------------------------------------------
   input  logic                        clk,       // aclk = system + bus word clock
   input  logic                        clk90,     // 90-deg phase, to PHY (CK/write centering)
   input  logic                        clk_ref,   // PHY delay/SERDES ref (tie for GENERIC)
   input  logic                        rst,       // synchronous, active-high (invert of aresetn)
+
+  // ---- runtime PHY read-eye calibration (mandatory, no defaults; quasi-static). See INTERFACES.md v9. ----
+  input  logic                                  cal_capture_phase,
+  input  logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+  input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+  input  logic                                  cal_pair_skew,
 
   // ---- AXI4 slave ---------------------------------------------------------
   // AW
@@ -218,10 +254,29 @@ module hyperram_axi
     .LATENCY_CLOCKS    (LATENCY_CLOCKS),
     .FIXED_LATENCY     (FIXED_LATENCY),
     .MAX_BURST_WORDS   (MAX_BURST_WORDS),
+    .BURST_BOUNDARY_WORDS (BURST_BOUNDARY_WORDS),
+    .WR_COMMIT_READ    (WR_COMMIT_READ),
+    .WR_CHOP_REPLAY    (WR_CHOP_REPLAY),
+    .WR_REPLAY_WORDS   (WR_REPLAY_WORDS),
+    .WR_REPLAY_PEND    (WR_REPLAY_PEND),
+    .WR_REPLAY_ALIGN   (WR_REPLAY_ALIGN),
+    .WR_REPLAY_MASK_LEAD (WR_REPLAY_MASK_LEAD),
+    .WR_CHOP_PAUSE_CYCLES (WR_CHOP_PAUSE_CYCLES),
+    .WR_CHOP_PAUSE_CK  (WR_CHOP_PAUSE_CK),
     .PROGRAM_CR        (PROGRAM_CR),
     .POR_DELAY_CYCLES  (POR_DELAY_CYCLES),
     .INIT_LATENCY_CODE (INIT_LATENCY_CODE),
-    .INIT_CR0          (INIT_CR0)
+    .INIT_CR0          (INIT_CR0),
+    .PROGRAM_CR1       (PROGRAM_CR1),
+    .INIT_CR1          (INIT_CR1),
+    .CLK_FREQ_MHZ      (CLK_FREQ_MHZ),
+    .T_RP_NS           (T_RP_NS),
+    .T_RPH_NS          (T_RPH_NS),
+    .T_RH_NS           (T_RH_NS),
+    .T_VCS_US          (T_VCS_US),
+    .SUPPORT_DPD       (SUPPORT_DPD),
+    .TDPDOUT_CYCLES    (TDPDOUT_CYCLES),
+    .ACTIVE_CLK_STOP   (ACTIVE_CLK_STOP)
   ) u_ctrl (
     .clk            (clk),
     .rst            (rst),
@@ -261,7 +316,11 @@ module hyperram_axi
     // PHY RX
     .phy_dq_i       (phy_dq_i),
     .phy_dq_i_valid (phy_dq_i_valid),
-    .phy_rwds_i     (phy_rwds_i)
+    .phy_rwds_i     (phy_rwds_i),
+    // debug taps (bring-up only; unused in the AXI top)
+    .dbg_state      (),
+    .dbg_rd_wptr    (),
+    .dbg_rd_rptr    ()
   );
 
   // -------------------------------------------------------------------------
@@ -273,12 +332,20 @@ module hyperram_axi
     .ADDR_WIDTH   (ADDR_WIDTH),
     .LEN_WIDTH    (LEN_WIDTH),
     .PHY_VARIANT  (PHY_VARIANT),
-    .DIFF_CK      (DIFF_CK)
+    .DIFF_CK      (DIFF_CK),
+    .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP),
+    .CK_SCHEME    (CK_SCHEME),
+    .CAPTURE_PHASE (CAPTURE_PHASE)
   ) u_phy (
     .clk            (clk),
     .clk90          (clk90),
     .clk_ref        (clk_ref),
     .rst            (rst),
+    // runtime read-eye calibration (forwarded 1:1 to the PHY)
+    .cal_capture_phase (cal_capture_phase),
+    .cal_preamble_skip (cal_preamble_skip),
+    .cal_rx_tap        (cal_rx_tap),
+    .cal_pair_skew     (cal_pair_skew),
     // ctrl-facing (slave, mirror of ctrl TX/RX)
     .phy_cs_n       (phy_cs_n),
     .phy_rst_n      (phy_rst_n),
