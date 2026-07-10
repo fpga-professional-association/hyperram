@@ -36,6 +36,17 @@ module hyperram_axi
   parameter int unsigned POR_DELAY_CYCLES  = 0,                         // POR init delay (sim: 0)
   parameter logic [3:0]  INIT_LATENCY_CODE = hb_clocks_to_latency_code(LATENCY_CLOCKS),
   parameter logic [15:0] INIT_CR0          = HB_CR0_RESET,               // CR0 image written at init
+  // ---- spec-feature options (hyperbus_ctrl; all default OFF = legacy behavior) -----------
+  parameter bit          PROGRAM_CR1       = 1'b0,                       // A3: also program CR1 at init
+  parameter logic [15:0] INIT_CR1          = HB_CR1_RESET,               // A3: CR1 image written at init
+  parameter int unsigned CLK_FREQ_MHZ      = 0,                          // A4: CK freq (MHz); 0 = legacy POR
+  parameter int unsigned T_RP_NS           = 200,                        // A4: tRP  RST# pulse   (>=200 ns)
+  parameter int unsigned T_RPH_NS          = 400,                        // A4: tRPH RST#->CS#    (>=400 ns)
+  parameter int unsigned T_RH_NS           = 200,                        // A4: tRH  RST#hi->CS#  (>=200 ns)
+  parameter int unsigned T_VCS_US          = 150,                        // A4: tVCS VCC->access  (<=150 µs)
+  parameter bit          SUPPORT_DPD       = 1'b0,                       // A1: Deep-Power-Down enter/exit
+  parameter int unsigned TDPDOUT_CYCLES    = 0,                          // A1: tDPDOUT exit dwell (cycles)
+  parameter bit          ACTIVE_CLK_STOP   = 1'b0,                       // A2: pause CK on RD back-pressure
   // ---- PHY (hyperbus_phy) -------------------------------------------------
   parameter              PHY_VARIANT       = "GENERIC",                  // GENERIC | INTEL | XILINX
   parameter bit          DIFF_CK           = 1'b1,                       // drive hb_ck_n
@@ -230,7 +241,17 @@ module hyperram_axi
     .PROGRAM_CR        (PROGRAM_CR),
     .POR_DELAY_CYCLES  (POR_DELAY_CYCLES),
     .INIT_LATENCY_CODE (INIT_LATENCY_CODE),
-    .INIT_CR0          (INIT_CR0)
+    .INIT_CR0          (INIT_CR0),
+    .PROGRAM_CR1       (PROGRAM_CR1),
+    .INIT_CR1          (INIT_CR1),
+    .CLK_FREQ_MHZ      (CLK_FREQ_MHZ),
+    .T_RP_NS           (T_RP_NS),
+    .T_RPH_NS          (T_RPH_NS),
+    .T_RH_NS           (T_RH_NS),
+    .T_VCS_US          (T_VCS_US),
+    .SUPPORT_DPD       (SUPPORT_DPD),
+    .TDPDOUT_CYCLES    (TDPDOUT_CYCLES),
+    .ACTIVE_CLK_STOP   (ACTIVE_CLK_STOP)
   ) u_ctrl (
     .clk            (clk),
     .rst            (rst),

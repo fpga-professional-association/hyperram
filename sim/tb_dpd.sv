@@ -1,0 +1,229 @@
+// tb_dpd — self-checking Verilator TB for A1: Deep-Power-Down enter/exit with tDPDOUT sequencing.
+//
+// The controller had no DPD path: a host that wrote CR0[15]=0 got no low-power behavior and, crucially,
+// no exit sequencing, so the next access hit a still-asleep device. hyperbus_ctrl now (SUPPORT_DPD)
+// snoops a host CR0 write — CR0[15]=0 latches an internal DPD flag — and GUARDS the next command with a
+// wake: a CS# wake pulse (device leaves DPD) followed by a tDPDOUT dwell before the command reaches the
+// bus (SPEC_DIGEST §5.2.1). The device model (SUPPORT_DPD) makes DPD real: while asleep it drives NOTHING
+// (no read strobe/data), so an un-guarded read stalls out.
+//
+// Two datapaths share one stimulus; BOTH models are DPD-capable, the controllers differ:
+//   * DUT_DPD   (SUPPORT_DPD=1): after CR0[15]=0, a read is auto-woken (FSM visits ST_DPD_WAKE/OUT,
+//                                waits tDPDOUT) and returns CORRECT data with no timeout.
+//   * DUT_NODPD (SUPPORT_DPD=0): after CR0[15]=0, the read is issued straight into the sleeping device,
+//                                which drives nothing -> the read times out (err_timeout) / wrong data.
+// PASS iff DPD is both SUFFICIENT (DUT_DPD reads correctly, wake FSM ran, tDPDOUT honored) and NECESSARY
+// (DUT_NODPD's post-DPD read fails). A pre-DPD baseline read succeeds on both.
+//
+// Runs under: verilator --binary --timing (5.020).
+`timescale 1ns/1ps
+module tb_dpd;
+  import hyperbus_pkg::*;
+
+  localparam int unsigned DQ_WIDTH   = HB_DQ_WIDTH_DEFAULT;   // 8
+  localparam int unsigned DATA_WIDTH = 2 * DQ_WIDTH;          // 16
+  localparam int unsigned ADDR_WIDTH = HB_ADDR_WIDTH;         // 32
+  localparam int unsigned LEN_WIDTH  = HB_LEN_WIDTH_DEFAULT;  // 16
+  localparam int unsigned STRB_WIDTH = DATA_WIDTH / 8;        // 2
+
+  localparam logic [15:0] TB_INIT_CR0 = {1'b1, 3'b000, 4'b1111, 4'b0001, 1'b1, 3'b111}; // 0x8F1F (bit15=1 normal)
+  localparam logic [15:0] TB_DPD_CR0  = {1'b0, 3'b000, 4'b1111, 4'b0001, 1'b1, 3'b111}; // 0x0F1F (bit15=0 => DPD)
+  localparam int unsigned TB_TDPDOUT  = 16;   // tDPDOUT exit dwell (cycles)
+
+  // enum ordinals (state_e in hyperbus_ctrl): ST_RESET..ST_RECOVER occupy 0..13 on ddio-200 (this
+  // branch's hyperbus_ctrl already has ST_WR_COALESCE ahead of ST_TAIL/ST_RECOVER — see rtl/hyperbus_ctrl.sv),
+  // so the two DPD states appended at the tail land at ST_DPD_WAKE=14, ST_DPD_OUT=15 (not 13/14).
+  localparam logic [3:0] S_DPD_WAKE = 4'd14;
+  localparam logic [3:0] S_DPD_OUT  = 4'd15;
+
+  logic clk, clk90, clk_ref, rst;
+  initial begin clk    = 1'b0; forever #5.0 clk    = ~clk;   end
+  initial begin #2.5; clk90 = 1'b0; forever #5.0 clk90 = ~clk90; end
+  initial begin clk_ref = 1'b0; forever #2.5 clk_ref = ~clk_ref; end
+
+  logic                    sel;   // 0 = DUT_DPD, 1 = DUT_NODPD
+  logic                    s_cmd_valid, s_cmd_read, s_cmd_reg, s_cmd_wrap;
+  logic [ADDR_WIDTH-1:0]   s_cmd_addr;
+  logic [LEN_WIDTH-1:0]    s_cmd_len;
+  logic                    s_wr_valid;
+  logic [DATA_WIDTH-1:0]   s_wr_data;
+  logic [STRB_WIDTH-1:0]   s_wr_strb;
+  logic                    s_wr_last, s_rd_ready;
+
+  logic                    m_cmd_ready, m_wr_ready, m_rd_valid, m_rd_last;
+  logic [DATA_WIDTH-1:0]   m_rd_data;
+
+  // ====================================================================
+  //  One datapath (ctrl + generic PHY + model). DPD_EN gates the controller's DPD support; the model
+  //  is ALWAYS DPD-capable. dbg_state is tapped out so the TB can watch the wake FSM.
+  // ====================================================================
+  `define MK_DUT(PFX, DPD_EN, ACT)                                                                  \
+    logic                    PFX``_cmd_ready, PFX``_wr_ready, PFX``_rd_valid, PFX``_rd_last;         \
+    logic [DATA_WIDTH-1:0]   PFX``_rd_data;                                                          \
+    logic                    PFX``_init_done, PFX``_busy, PFX``_eu, PFX``_et;                        \
+    logic [3:0]              PFX``_dbg;                                                              \
+    logic                    PFX``_cs_n, PFX``_rn, PFX``_cke;                                        \
+    logic [DATA_WIDTH-1:0]   PFX``_dq_o; logic PFX``_dq_oe;                                          \
+    logic [1:0]              PFX``_rwds_o; logic PFX``_rwds_oe, PFX``_rd_arm;                        \
+    logic [DATA_WIDTH-1:0]   PFX``_dq_i; logic PFX``_dq_iv, PFX``_rwds_i;                            \
+    logic                    PFX``_ck, PFX``_ckn, PFX``_hcs, PFX``_hrn;                              \
+    logic [DQ_WIDTH-1:0]     PFX``_pdo; logic PFX``_pdoe;                                            \
+    logic                    PFX``_pro; logic PFX``_proe;                                            \
+    logic [DQ_WIDTH-1:0]     PFX``_mdo; logic PFX``_mdoe;                                            \
+    logic                    PFX``_mro; logic PFX``_mroe;                                            \
+    wire [DQ_WIDTH-1:0] PFX``_dql = PFX``_mdoe ? PFX``_mdo : (PFX``_pdoe ? PFX``_pdo : '0);          \
+    wire                PFX``_rwl = PFX``_mroe ? PFX``_mro : (PFX``_proe ? PFX``_pro : 1'b0);        \
+    wire [DQ_WIDTH-1:0] PFX``_dqd; assign #3.0 PFX``_dqd = PFX``_dql;                                \
+    wire                PFX``_rwd; assign #3.0 PFX``_rwd = PFX``_rwl;                                \
+    hyperbus_ctrl #(.LATENCY_CLOCKS(6), .FIXED_LATENCY(1'b1), .MAX_BURST_WORDS(0),                   \
+      .PROGRAM_CR(1'b1), .POR_DELAY_CYCLES(0), .INIT_CR0(TB_INIT_CR0),                               \
+      .SUPPORT_DPD(DPD_EN), .TDPDOUT_CYCLES(TB_TDPDOUT)) PFX``_ctrl (                                \
+      .clk(clk), .rst(rst),                                                                          \
+      .cmd_valid(s_cmd_valid & (ACT)), .cmd_ready(PFX``_cmd_ready),                                  \
+      .cmd_read(s_cmd_read), .cmd_reg(s_cmd_reg), .cmd_wrap(s_cmd_wrap),                             \
+      .cmd_addr(s_cmd_addr), .cmd_len(s_cmd_len),                                                    \
+      .wr_valid(s_wr_valid & (ACT)), .wr_ready(PFX``_wr_ready),                                      \
+      .wr_data(s_wr_data), .wr_strb(s_wr_strb), .wr_last(s_wr_last),                                 \
+      .rd_valid(PFX``_rd_valid), .rd_ready(s_rd_ready & (ACT)),                                      \
+      .rd_data(PFX``_rd_data), .rd_last(PFX``_rd_last),                                              \
+      .busy(PFX``_busy), .init_done(PFX``_init_done), .err_underrun(PFX``_eu), .err_timeout(PFX``_et),\
+      .phy_cs_n(PFX``_cs_n), .phy_rst_n(PFX``_rn), .phy_ck_en(PFX``_cke),                            \
+      .phy_dq_o(PFX``_dq_o), .phy_dq_oe(PFX``_dq_oe), .phy_rwds_o(PFX``_rwds_o),                     \
+      .phy_rwds_oe(PFX``_rwds_oe), .phy_rd_arm(PFX``_rd_arm),                                        \
+      .phy_dq_i(PFX``_dq_i), .phy_dq_i_valid(PFX``_dq_iv), .phy_rwds_i(PFX``_rwds_i),                \
+      .dbg_state(PFX``_dbg), .dbg_rd_wptr(), .dbg_rd_rptr());                                        \
+    hyperbus_phy_generic #(.DQ_WIDTH(DQ_WIDTH), .DATA_WIDTH(DATA_WIDTH), .DIFF_CK(1'b1)) PFX``_phy ( \
+      .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),                                        \
+      .phy_cs_n(PFX``_cs_n), .phy_rst_n(PFX``_rn), .phy_ck_en(PFX``_cke),                            \
+      .phy_dq_o(PFX``_dq_o), .phy_dq_oe(PFX``_dq_oe), .phy_rwds_o(PFX``_rwds_o),                     \
+      .phy_rwds_oe(PFX``_rwds_oe), .phy_rd_arm(PFX``_rd_arm),                                        \
+      .phy_dq_i(PFX``_dq_i), .phy_dq_i_valid(PFX``_dq_iv), .phy_rwds_i(PFX``_rwds_i),                \
+      .hb_ck(PFX``_ck), .hb_ck_n(PFX``_ckn), .hb_cs_n(PFX``_hcs), .hb_rst_n(PFX``_hrn),              \
+      .hb_dq_o(PFX``_pdo), .hb_dq_oe(PFX``_pdoe), .hb_dq_i(PFX``_dqd),                               \
+      .hb_rwds_o(PFX``_pro), .hb_rwds_oe(PFX``_proe), .hb_rwds_i(PFX``_rwd));                        \
+    hyperram_model #(.DQ_WIDTH(DQ_WIDTH), .MEM_WORDS(1<<16), .LATENCY_CLOCKS(6), .FIXED_LATENCY(1'b1),\
+      .ROW_WORDS(0), .ROW_PENALTY(4), .REFRESH_EVERY(0), .SUPPORT_DPD(1'b1)) PFX``_model (           \
+      .hb_ck(PFX``_ck), .hb_ck_n(PFX``_ckn), .hb_cs_n(PFX``_hcs), .hb_rst_n(PFX``_hrn),              \
+      .hb_dq_i(PFX``_dql), .hb_dq_ie(PFX``_pdoe), .hb_dq_o(PFX``_mdo), .hb_dq_oe(PFX``_mdoe),        \
+      .hb_rwds_i(PFX``_rwl), .hb_rwds_ie(PFX``_proe), .hb_rwds_o(PFX``_mro), .hb_rwds_oe(PFX``_mroe))
+
+  `MK_DUT(a, 1'b1, ~sel);   // DUT_DPD   (active when sel==0)
+  `MK_DUT(b, 1'b0,  sel);   // DUT_NODPD (active when sel==1)
+
+  always_comb begin
+    m_cmd_ready = sel ? b_cmd_ready : a_cmd_ready;
+    m_wr_ready  = sel ? b_wr_ready  : a_wr_ready;
+    m_rd_valid  = sel ? b_rd_valid  : a_rd_valid;
+    m_rd_data   = sel ? b_rd_data   : a_rd_data;
+    m_rd_last   = sel ? b_rd_last   : a_rd_last;
+  end
+
+  // Monitors: DUT_DPD wake-FSM visits + tDPDOUT dwell; per-DUT sticky err_timeout.
+  logic saw_wake, saw_out; int unsigned tdpdout_cyc; logic a_et_l, b_et_l;
+  always @(posedge clk) begin
+    if (rst) begin saw_wake<=0; saw_out<=0; tdpdout_cyc<=0; a_et_l<=0; b_et_l<=0; end
+    else begin
+      if (a_dbg == S_DPD_WAKE) saw_wake <= 1'b1;
+      if (a_dbg == S_DPD_OUT) begin saw_out <= 1'b1; tdpdout_cyc <= tdpdout_cyc + 1; end
+      if (a_et) a_et_l <= 1'b1;
+      if (b_et) b_et_l <= 1'b1;
+    end
+  end
+
+  int unsigned errors = 0, checks = 0;
+  function automatic logic [DATA_WIDTH-1:0] genword(input logic [ADDR_WIDTH-1:0] a);
+    return (a[15:0] * 16'h9E37) ^ 16'hBEEF ^ {a[7:0], a[7:0]};
+  endfunction
+  task automatic chk(input logic cond, input string msg);
+    checks = checks + 1;
+    if (!cond) begin $display("[%0t] ERROR: %s", $time, msg); errors = errors + 1; end
+  endtask
+  task automatic idle();
+    @(negedge clk);
+    s_cmd_valid=0; s_cmd_read=0; s_cmd_reg=0; s_cmd_wrap=0; s_cmd_addr=0; s_cmd_len=0;
+    s_wr_valid=0; s_wr_data=0; s_wr_strb='1; s_wr_last=0; s_rd_ready=0;
+  endtask
+
+  // Register write (used to program CR0 to enter/exit DPD).
+  task automatic reg_write(input logic [ADDR_WIDTH-1:0] a, input logic [DATA_WIDTH-1:0] d);
+    int unsigned g;
+    @(negedge clk); s_cmd_valid=1; s_cmd_read=0; s_cmd_reg=1; s_cmd_wrap=0; s_cmd_addr=a; s_cmd_len=LEN_WIDTH'(1);
+    g=0; forever begin @(posedge clk); g=g+1; if (m_cmd_ready) break; if (g>3000) begin errors=errors+1; break; end end
+    @(negedge clk); s_cmd_valid=0; s_wr_valid=1; s_wr_data=d; s_wr_strb='1; s_wr_last=1;
+    g=0; forever begin @(posedge clk); g=g+1; if (m_wr_ready) break; if (g>3000) begin errors=errors+1; break; end end
+    @(negedge clk); s_wr_valid=0; s_wr_last=0; repeat (40) @(posedge clk);
+  endtask
+
+  task automatic mem_write1(input logic [ADDR_WIDTH-1:0] a, input logic [DATA_WIDTH-1:0] d);
+    int unsigned g;
+    @(negedge clk); s_cmd_valid=1; s_cmd_read=0; s_cmd_reg=0; s_cmd_wrap=0; s_cmd_addr=a; s_cmd_len=LEN_WIDTH'(1);
+    g=0; forever begin @(posedge clk); g=g+1; if (m_cmd_ready) break; if (g>3000) begin errors=errors+1; break; end end
+    @(negedge clk); s_cmd_valid=0; s_wr_valid=1; s_wr_data=d; s_wr_strb='1; s_wr_last=1;
+    g=0; forever begin @(posedge clk); g=g+1; if (m_wr_ready) break; if (g>3000) begin errors=errors+1; break; end end
+    @(negedge clk); s_wr_valid=0; s_wr_last=0; repeat (40) @(posedge clk);
+  endtask
+
+  // Bounded single-word read: returns data + whether a beat arrived (always true here — the abort path
+  // still delivers a final rd_last beat, so `got` is 1 even on timeout; the DATA distinguishes ok/fail).
+  task automatic mem_read1(input logic [ADDR_WIDTH-1:0] a, output logic [DATA_WIDTH-1:0] d, output logic got);
+    int unsigned g;
+    @(negedge clk); s_cmd_valid=1; s_cmd_read=1; s_cmd_reg=0; s_cmd_wrap=0; s_cmd_addr=a; s_cmd_len=LEN_WIDTH'(1);
+    g=0; forever begin @(posedge clk); g=g+1; if (m_cmd_ready) break; if (g>3000) begin errors=errors+1; break; end end
+    @(negedge clk); s_cmd_valid=0; s_rd_ready=1;
+    d='0; got=1'b0; g=0;
+    forever begin @(posedge clk); g=g+1; if (m_rd_valid) begin d=m_rd_data; got=1'b1; break; end
+      if (g>4000) begin break; end end   // no beat at all within guard => got stays 0
+    @(negedge clk); s_rd_ready=0;
+  endtask
+
+  logic [DATA_WIDTH-1:0] rv; logic got;
+  initial begin
+    sel=0; idle();
+    rst=1'b1; repeat (5) @(posedge clk); @(negedge clk); rst=1'b0;
+    begin int unsigned g; g=0;
+      while (!(a_init_done && b_init_done) && g<100000) begin @(posedge clk); g=g+1; end end
+    chk(a_init_done && b_init_done, "init_done never asserted on both DUTs");
+    repeat (4) @(posedge clk);
+
+    // Seed a known word at 0x0200 on BOTH datapaths (separate memories) BEFORE any DPD.
+    sel=1'b0; mem_write1(32'h0000_0200, genword(32'h200));
+    sel=1'b1; mem_write1(32'h0000_0200, genword(32'h200));
+
+    // ---------- DUT_DPD ----------
+    sel = 1'b0;
+    // baseline read works
+    mem_read1(32'h0000_0200, rv, got);
+    chk(got && (rv === genword(32'h200)), "DUT_DPD baseline read failed");
+    // enter DPD (CR0[15]=0), then read -> controller must wake and return correct data
+    reg_write(HB_REG_CR0, DATA_WIDTH'(TB_DPD_CR0));
+    mem_read1(32'h0000_0200, rv, got);
+    $display("[%0t] DUT_DPD post-DPD read: got=%0b data=0x%04x (exp 0x%04x); saw_wake=%0b saw_out=%0b tdpdout=%0d et=%0b",
+             $time, got, rv, genword(32'h200), saw_wake, saw_out, tdpdout_cyc, a_et_l);
+    chk(got && (rv === genword(32'h200)), "DUT_DPD post-DPD read did not return correct data (wake failed)");
+    chk(saw_wake, "DUT_DPD wake FSM never entered ST_DPD_WAKE");
+    chk(saw_out,  "DUT_DPD wake FSM never entered ST_DPD_OUT");
+    chk(tdpdout_cyc >= TB_TDPDOUT, "DUT_DPD tDPDOUT dwell shorter than TDPDOUT_CYCLES");
+    chk(!a_et_l, "DUT_DPD post-DPD read timed out (should have woken cleanly)");
+
+    // ---------- DUT_NODPD (negative control) ----------
+    sel = 1'b1;
+    mem_read1(32'h0000_0200, rv, got);   // baseline
+    chk(got && (rv === genword(32'h200)), "DUT_NODPD baseline read failed");
+    reg_write(HB_REG_CR0, DATA_WIDTH'(TB_DPD_CR0));   // model goes to sleep; controller is unaware
+    mem_read1(32'h0000_0200, rv, got);
+    $display("[%0t] DUT_NODPD post-DPD read: got=%0b data=0x%04x (exp NOT 0x%04x); et=%0b",
+             $time, got, rv, genword(32'h200), b_et_l);
+    // Without a wake, the sleeping device drives nothing: the read must FAIL (timeout / wrong data).
+    chk(b_et_l || (rv !== genword(32'h200)),
+        "DUT_NODPD post-DPD read unexpectedly succeeded — DPD has no teeth / model not asleep");
+
+    repeat (8) @(posedge clk);
+    $display("==================================================================");
+    $display("[%0t] tb_dpd done: %0d checks, %0d errors", $time, checks, errors);
+    if (errors==0) begin $display("TB_RESULT: PASS"); $finish; end
+    else begin $display("TB_RESULT: FAIL"); $fatal(1, "tb_dpd: %0d errors", errors); end
+  end
+
+  initial begin #4_000_000; $display("[%0t] TB_RESULT: FAIL (global timeout)", $time);
+    $fatal(1, "tb_dpd: global timeout"); end
+endmodule

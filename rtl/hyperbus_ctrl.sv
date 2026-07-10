@@ -98,7 +98,33 @@ module hyperbus_ctrl
     // command's first real word lands exactly where it should. Default 0 = off (bit-identical to prior
     // instantiations).
     parameter bit          WR_COALESCE          = 1'b0,
-    parameter int unsigned WR_COALESCE_WAIT     = 8            // cycles to wait for a coalescing cmd
+    parameter int unsigned WR_COALESCE_WAIT     = 8,           // cycles to wait for a coalescing cmd
+    // ---- A3: optional CR1 programming at init (SPEC_DIGEST §5/§8.2). Default OFF = today's behavior
+    //          (CR0 only). When set, a SECOND zero-latency register write of CR1 follows the CR0 write
+    //          during init, before init_done. The device's distributed-refresh/PASR/hybrid-sleep fields
+    //          live in CR1; leaving it at reset is a tCSM/refresh risk on real silicon.
+    parameter bit          PROGRAM_CR1      = 1'b0,              // 1 = also program CR1 at init (after CR0)
+    parameter logic [15:0] INIT_CR1         = HB_CR1_RESET,      // CR1 image written at init
+    // ---- A4: POR / reset AC-timing (SPEC_DIGEST §9, Table 8.3). The reset-pulse and post-reset gaps
+    //          are DERIVED from ns/µs spec timings once CLK_FREQ_MHZ != 0 (cycles = ceil(t / tCK)).
+    //          CLK_FREQ_MHZ == 0 keeps the LEGACY fixed counts (RESET_CYCLES=8, POR dwell =
+    //          POR_DELAY_CYCLES) so every existing instantiation is bit-for-bit unchanged.
+    parameter int unsigned CLK_FREQ_MHZ     = 0,                 // CK word-clock frequency (MHz); 0 = derive-off
+    parameter int unsigned T_RP_NS          = 200,              // tRP  : RST# low pulse width      (spec >= 200 ns)
+    parameter int unsigned T_RPH_NS         = 400,              // tRPH : RST# low  -> first CS# low (spec >= 400 ns)
+    parameter int unsigned T_RH_NS          = 200,              // tRH  : RST# high -> first CS# low (spec >= 200 ns)
+    parameter int unsigned T_VCS_US         = 150,              // tVCS : VCC valid -> first access  (spec <= 150 µs)
+    // ---- A1: Deep Power-Down enter/exit (SPEC_DIGEST §5.2.1 / §8.7, CR0[15]). Default OFF. When set,
+    //          the controller snoops a host CR0 register-write: CR0[15]=0 latches an internal DPD flag;
+    //          the NEXT command is preceded by a guarded wake (CS# wake pulse + tDPDOUT dwell) before it
+    //          is allowed to reach the bus. CR0[15]=1 (via write) clears the flag (normal).
+    parameter bit          SUPPORT_DPD      = 1'b0,             // 1 = enable DPD enter-detect + guarded wake
+    parameter int unsigned TDPDOUT_CYCLES   = 0,               // tDPDOUT exit dwell (cycles = ceil(tDPDOUT/tCK))
+    // ---- A2: active clock-stop (SPEC_DIGEST §1). Default OFF. When set, CK (phy_ck_en) is paused on
+    //          word boundaries while the read holding-FIFO is above its high-water mark (caller back-
+    //          pressure via rd_ready), halting the device instead of dropping words; CK resumes when the
+    //          FIFO drains. Off = CK runs continuously through the read (today's behavior).
+    parameter bit          ACTIVE_CLK_STOP  = 1'b0
 ) (
     input  logic                    clk,
     input  logic                    rst,            // synchronous, active high
@@ -153,10 +179,34 @@ module hyperbus_ctrl
 );
 
   // ------------------------------------------------------------------------
+  // POR / reset AC-timing derivation (A4). Pure elaboration-time integer math (Verilator-clean, no
+  // reals): cycles = ceil(time / tCK) = ceil(t_ns * f_MHz / 1000). f_MHz == 0 disables derivation.
+  // ------------------------------------------------------------------------
+  function automatic int unsigned ns_to_cyc(input int unsigned t_ns, input int unsigned f_mhz);
+    return (f_mhz == 0) ? 0 : ((t_ns * f_mhz + 32'd999) / 32'd1000);   // ceil
+  endfunction
+  function automatic int unsigned max2(input int unsigned a, input int unsigned b);
+    return (a > b) ? a : b;
+  endfunction
+
+  // ------------------------------------------------------------------------
   // Derived widths / internal constants
   // ------------------------------------------------------------------------
   localparam int unsigned STRB_WIDTH       = DATA_WIDTH / 8;
-  localparam int unsigned RESET_CYCLES     = 8;                    // RST# low pulse (>= tRP, SPEC §9)
+  // RST# low pulse. Legacy fixed 8 cycles, or tRP-derived when CLK_FREQ_MHZ is given (>= 1 cycle).
+  localparam int unsigned RESET_CYCLES     = (CLK_FREQ_MHZ == 0) ? 8
+                                           : max2(1, ns_to_cyc(T_RP_NS, CLK_FREQ_MHZ)); // >= tRP (SPEC §9)
+  // tVCS (VCC-valid -> first access): 1 µs = f_MHz cycles exactly.
+  localparam int unsigned VCS_CYCLES       = (CLK_FREQ_MHZ == 0) ? 0 : (T_VCS_US * CLK_FREQ_MHZ);
+  // Post-reset gap before first CS#: must satisfy tRH AND (tRPH - tRP) from reset RELEASE.
+  localparam int unsigned RH_CYCLES        = (CLK_FREQ_MHZ == 0) ? 0
+             : max2(ns_to_cyc(T_RH_NS, CLK_FREQ_MHZ),
+                    (T_RPH_NS > T_RP_NS) ? ns_to_cyc(T_RPH_NS - T_RP_NS, CLK_FREQ_MHZ) : 0);
+  // ST_POR dwell = the largest post-reset requirement (tVCS dominates once derived), never below the
+  // caller's explicit POR_DELAY_CYCLES. Legacy mode uses POR_DELAY_CYCLES verbatim.
+  localparam int unsigned POR_CYCLES       = (CLK_FREQ_MHZ == 0) ? POR_DELAY_CYCLES
+                                           : max2(POR_DELAY_CYCLES, max2(RH_CYCLES, VCS_CYCLES));
+  localparam int unsigned DPD_WAKE_CYCLES  = 4;                    // A1: CS# wake-pulse width (DPD exit trigger)
   localparam int unsigned RECOVERY_CYCLES  = 4;                    // tCSHI + tRWR gap (SPEC §6)
   localparam int unsigned TAIL_CYCLES      = 2;                    // extra CS# Low after last word (tCSH note)
   localparam int unsigned READ_STALL_LIMIT = 32;                   // RWDS Low >= 32 clk => timeout (SPEC §4/§7)
@@ -184,6 +234,14 @@ module hyperbus_ctrl
                                                                     // words (bursts >=6 hung). 32 covers the
                                                                     // board's 16-word bursts with slack.
   localparam int unsigned RD_AW            = $clog2(RD_FIFO_DEPTH);
+  // A2 active clock-stop high-water mark: pause CK once the read FIFO reaches this occupancy (SPEC_DIGEST
+  // §1). Sized to two constraints: (a) leave slack BELOW full for words already in the PHY RX pipeline as
+  // CK winds down, so nothing is dropped mid-burst while stopping (DEPTH - level = plenty); (b) keep the
+  // residual small enough to drain within the post-burst window (ST_RD_DRAIN + tail + recovery) BEFORE
+  // ST_IDLE's unconditional FIFO flush, so a caller that keeps draining loses nothing. A permanently
+  // stalled sink can still lose the residual to that flush — the controller does not extend a completed
+  // transaction to wait for a dead sink (see docs). A quarter-depth balances both.
+  localparam logic [RD_AW:0] RD_STOP_LEVEL = (RD_AW+1)'(RD_FIFO_DEPTH / 4);
 
   typedef enum logic [3:0] {
     ST_RESET,   // device reset asserted
@@ -200,7 +258,9 @@ module hyperbus_ctrl
     ST_WR_COALESCE, // WR_COALESCE: burst held open past command end, CS# Low / CK STOPPED, waiting
                     // (up to WR_COALESCE_WAIT cycles) for a contiguous write command to splice in
     ST_TAIL,    // CS# held Low after last word (tCSH note)
-    ST_RECOVER  // CS# High, tCSHI/tRWR recovery
+    ST_RECOVER, // CS# High, tCSHI/tRWR recovery
+    ST_DPD_WAKE,// A1: Deep-Power-Down exit — CS# wake pulse (CK idle), device leaves DPD
+    ST_DPD_OUT  // A1: CS# High, waiting tDPDOUT before the pending command is issued
   } state_e;
 
   state_e                  state;
@@ -223,7 +283,9 @@ module hyperbus_ctrl
   logic [1:0]              ca_idx;       // CA word index 0..2
   logic                    rwds_hi;      // RWDS sampled High during CA (latency doubling indicator)
   logic                    lat_extra_done; // the additional (2x) latency count has been inserted
-  logic                    doing_init;   // current transaction is the internal CR0 write
+  logic                    doing_init;   // current transaction is an internal CR0/CR1 init write
+  logic                    init_cr1;     // A3: the internal init write in flight is CR1 (else CR0)
+  logic                    in_dpd;       // A1: device believed to be in Deep-Power-Down (needs wake)
 
   // -- Write-commit interpose (WR_COMMIT_READ). A memory-write burst's final word is only committed
   //    by the device when a subsequent read covers it; between two writes the master interposes an
@@ -271,8 +333,10 @@ module hyperbus_ctrl
   wire                     commit_gate = WR_COMMIT_READ & wr_pending_commit &
                                          cmd_valid & ~cmd_read & ~cmd_reg;
 
-  // write-data source: internal CR0 image during init, else the native write channel
-  wire [DATA_WIDTH-1:0]    wsrc_data  = doing_init ? INIT_CR0 : wr_data;
+  // write-data source: internal CR0/CR1 image during init (A3: CR1 when init_cr1), else native write.
+  wire [DATA_WIDTH-1:0]    wsrc_data  = doing_init ? (init_cr1 ? DATA_WIDTH'(INIT_CR1)
+                                                               : DATA_WIDTH'(INIT_CR0))
+                                                   : wr_data;
   wire [STRB_WIDTH-1:0]    wsrc_strb  = doing_init ? {STRB_WIDTH{1'b1}} : wr_strb;
   wire                     wsrc_valid = doing_init ? 1'b1 : wr_valid;
 
@@ -297,6 +361,12 @@ module hyperbus_ctrl
                                            (rd_wptr[RD_AW]     != rd_rptr[RD_AW]);
   wire [RD_AW-1:0]         rd_wa = rd_wptr[RD_AW-1:0];
   wire [RD_AW-1:0]         rd_ra = rd_rptr[RD_AW-1:0];
+
+  // A2 active clock-stop: read-FIFO occupancy and the "buffer nearly full -> pause CK" condition.
+  // rd_backpressure gates phy_ck_en during ST_READ (on word boundaries) and freezes the RWDS-Low
+  // stall counter so an INTENTIONAL pause is never mistaken for the >=32-clk error stall.
+  wire [RD_AW:0]           rd_occ = rd_wptr - rd_rptr;                 // occupancy 0..RD_FIFO_DEPTH
+  wire                     rd_backpressure = ACTIVE_CLK_STOP & (rd_occ >= RD_STOP_LEVEL);
 
   // 16-bit CA word selected by index (MSB word first, SPEC_DIGEST §2)
   function automatic logic [DATA_WIDTH-1:0] ca_slice(input logic [1:0] idx);
@@ -451,7 +521,7 @@ module hyperbus_ctrl
 
       ST_READ: begin
         phy_cs_n   = 1'b0;
-        phy_ck_en  = 1'b1;
+        phy_ck_en  = ~rd_backpressure;   // A2: pause CK on word boundary while the RD FIFO is full-ish
         phy_rd_arm = 1'b1;
         busy       = ~doing_init;
       end
@@ -505,6 +575,15 @@ module hyperbus_ctrl
         busy       = ~doing_init;
       end
 
+      ST_DPD_WAKE: begin
+        // A1: Deep-Power-Down exit trigger — assert CS# Low with CK idle (no CA, no data). The device
+        // wakes on this CS# activity; the master then holds CS# High for tDPDOUT (ST_DPD_OUT).
+        phy_cs_n = 1'b0;
+        busy     = 1'b1;
+      end
+
+      ST_DPD_OUT: busy = 1'b1;   // A1: CS# High (default), counting out tDPDOUT before the command
+
       default: ; // ST_POR, ST_INIT: idle bus
     endcase
 
@@ -546,6 +625,8 @@ module hyperbus_ctrl
       drain_dwell  <= '0;
       init_done    <= 1'b0;
       doing_init   <= 1'b0;
+      init_cr1     <= 1'b0;
+      in_dpd       <= 1'b0;
       doing_commit <= 1'b0;
       wr_pending_commit <= 1'b0;
       commit_resume     <= 1'b0;
@@ -576,9 +657,10 @@ module hyperbus_ctrl
       unique case (state)
         // ---------------- POR / init ----------------
         ST_RESET: begin
+          // RST# held Low for RESET_CYCLES (>= tRP). Then the post-reset gap (>= tRH / tRPH / tVCS).
           if (cnt == 32'd0) begin
             state <= ST_POR;
-            cnt   <= 32'(POR_DELAY_CYCLES);
+            cnt   <= 32'(POR_CYCLES);
           end else begin
             cnt <= cnt - 1'b1;
           end
@@ -590,17 +672,21 @@ module hyperbus_ctrl
         end
 
         ST_INIT: begin
-          if (PROGRAM_CR) begin
-            // internal register-space (zero-latency) write of CR0
+          // Launch the internal register-space (zero-latency) init write(s): CR0 first, then CR1
+          // (A3) if requested. CR1 follows CR0 in ST_RECOVER; if only CR1 is requested, start there.
+          if (PROGRAM_CR || PROGRAM_CR1) begin
             doing_init <= 1'b1;
+            init_cr1   <= ~PROGRAM_CR;   // CR0 unless CR0 is disabled and only CR1 is programmed
             cur_read   <= 1'b0;
             cur_reg    <= 1'b1;
             cur_wrap   <= 1'b0;
-            cur_addr   <= HB_REG_CR0[ADDR_WIDTH-1:0];
+            cur_addr   <= PROGRAM_CR ? HB_REG_CR0[ADDR_WIDTH-1:0] : HB_REG_CR1[ADDR_WIDTH-1:0];
             rem_left   <= LEN_WIDTH'(1);
             seg_left   <= LEN_WIDTH'(1);
             seg_count  <= LEN_WIDTH'(1);
-            ca_reg     <= hb_pack_ca(1'b0, 1'b1, 1'b1, HB_REG_CR0[ADDR_WIDTH-1:0]);
+            ca_reg     <= hb_pack_ca(1'b0, 1'b1, 1'b1,
+                                     PROGRAM_CR ? HB_REG_CR0[ADDR_WIDTH-1:0]
+                                                : HB_REG_CR1[ADDR_WIDTH-1:0]);
             rwds_hi    <= 1'b0;
             ca_idx     <= 2'd0;
             state      <= ST_CS;
@@ -643,7 +729,14 @@ module hyperbus_ctrl
               ca_idx    <= 2'd0;
               wr_pending_commit <= 1'b0;           // a normally-accepted command clears the pending
                                                    //   flag (a covering read commits the prior write)
-              state     <= ST_CS;
+              // A1: if the device is in Deep-Power-Down, wake it (CS# pulse + tDPDOUT) BEFORE running
+              // the command; the context latched above is issued once the wake completes.
+              if (SUPPORT_DPD & in_dpd) begin
+                cnt   <= 32'(DPD_WAKE_CYCLES - 1);
+                state <= ST_DPD_WAKE;
+              end else begin
+                state <= ST_CS;
+              end
             end
           end
         end
@@ -715,7 +808,9 @@ module hyperbus_ctrl
               drain_dwell <= '0;
               state       <= ST_RD_DRAIN;
             end
-          end else if (!phy_rwds_i) begin
+          end else if (!phy_rwds_i & ~rd_backpressure) begin
+            // (A2: while we are deliberately clock-stopped, RWDS-Low is expected — do NOT count it as
+            //  the >=32-clk error stall; hold stall_cnt until CK resumes.)
             if (stall_cnt == 6'(READ_STALL_LIMIT - 1)) begin
               // RWDS stalled >= 32 clk (SPEC_DIGEST §4/§7): abort the read. Raise CS# (ST_RD_ABORT is
               // a bus-idle state) and, so the AXI/Avalon front-end's R channel still terminates with
@@ -771,6 +866,12 @@ module hyperbus_ctrl
         // ---------------- write data ----------------
         ST_WRITE: begin
           if (!wsrc_valid) err_underrun <= 1'b1;   // host underrun: word gets masked, burst continues
+          // A1: snoop a host CR0 register-write for the Deep-Power-Down bit (CR0[15]); 0 => the device
+          // will enter DPD, 1 => normal. Register writes are single-word / zero-latency, so the value
+          // is on the bus this cycle. The next command is then guarded by a wake (ST_DPD_WAKE).
+          if (SUPPORT_DPD & ~doing_init & cur_reg & ~cur_read &
+              (cur_addr == ADDR_WIDTH'(HB_REG_CR0)) & wsrc_valid)
+            in_dpd <= ~wsrc_data[15];
           seg_left     <= seg_left - 1'b1;
           rem_left     <= rem_left - 1'b1;
           // WR_COALESCE hw-cap tracking: one word of this still-open CS# burst's budget is spent every
@@ -890,6 +991,23 @@ module hyperbus_ctrl
               end else begin
                 state <= ST_IDLE;                     // deferred interpose done: take the pending cmd
               end
+            end else if (doing_init & ~init_cr1 & PROGRAM_CR1) begin
+              // A3: CR0 init write done -> chain the CR1 zero-latency register write before init_done.
+              // (Placed AFTER the doing_commit branch: doing_init/doing_commit are mutually exclusive —
+              // an internal commit-read is never in flight during init — so ordering vs. it is moot, but
+              // the commit/coalesce machinery above always gets first refusal of this cnt==0 event.)
+              init_cr1  <= 1'b1;
+              cur_read  <= 1'b0;
+              cur_reg   <= 1'b1;
+              cur_wrap  <= 1'b0;
+              cur_addr  <= HB_REG_CR1[ADDR_WIDTH-1:0];
+              rem_left  <= LEN_WIDTH'(1);
+              seg_left  <= LEN_WIDTH'(1);
+              seg_count <= LEN_WIDTH'(1);
+              ca_reg    <= hb_pack_ca(1'b0, 1'b1, 1'b1, HB_REG_CR1[ADDR_WIDTH-1:0]);
+              rwds_hi   <= 1'b0;
+              ca_idx    <= 2'd0;
+              state     <= ST_CS;
             end else begin
               // Normal user / init transaction complete.
               if (~cur_read & ~cur_reg & ~doing_init)
@@ -897,9 +1015,31 @@ module hyperbus_ctrl
               if (doing_init) begin
                 init_done  <= 1'b1;
                 doing_init <= 1'b0;
+                init_cr1   <= 1'b0;
               end
               state <= ST_IDLE;
             end
+          end else begin
+            cnt <= cnt - 1'b1;
+          end
+        end
+
+        // ---------------- Deep-Power-Down exit (A1) ----------------
+        ST_DPD_WAKE: begin
+          // Hold the CS# wake pulse for DPD_WAKE_CYCLES, then raise CS# and count out tDPDOUT.
+          if (cnt == 32'd0) begin
+            cnt   <= 32'(TDPDOUT_CYCLES);
+            state <= ST_DPD_OUT;
+          end else begin
+            cnt <= cnt - 1'b1;
+          end
+        end
+
+        ST_DPD_OUT: begin
+          // CS# High for tDPDOUT; the device returns to standby. Then issue the latched command.
+          if (cnt == 32'd0) begin
+            in_dpd <= 1'b0;
+            state  <= ST_CS;
           end else begin
             cnt <= cnt - 1'b1;
           end

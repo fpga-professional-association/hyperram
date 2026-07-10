@@ -40,6 +40,16 @@ last written word — the W957D8NB write-commit quirk), `PROGRAM_CR` (default 1 
 The two device-quirk parameters default OFF so existing instantiations are bit-identical; they are
 threaded (defaulted) through `hyperram_avalon` / `hyperram_axi` / `hyperram_bw_top`.
 
+Spec-feature options (v8, all defaulted OFF = legacy behavior — no port changes):
+`PROGRAM_CR1` (default 0) / `INIT_CR1` (default `HB_CR1_RESET`) — optional second zero-latency register
+write of CR1 at init, after CR0 (§8.2). `CLK_FREQ_MHZ` (default 0 = legacy fixed counts) with
+`T_RP_NS`/`T_RPH_NS`/`T_RH_NS` (200/400/200) and `T_VCS_US` (150) — POR/reset AC-timing derived as
+`cycles = ceil(t/tCK)` when `CLK_FREQ_MHZ≠0` (else `RESET_CYCLES=8`, POR dwell = `POR_DELAY_CYCLES`;
+Table 8.3). `SUPPORT_DPD` (default 0) / `TDPDOUT_CYCLES` (default 0) — Deep-Power-Down: snoop a host
+CR0[15]=0 write, then guard the next command with a CS# wake pulse + tDPDOUT dwell (§5.2.1).
+`ACTIVE_CLK_STOP` (default 0) — pause CK on word boundaries while the read FIFO is above its high-water
+mark (caller back-pressure), instead of dropping words (§1).
+
 | Port | Dir | Width | Notes |
 |---|---|---|---|
 | `clk` | I | 1 | system + bus word clock |
@@ -238,8 +248,11 @@ ready/valid outputs are held Low during reset (AXI4 A3.1.2).
 ## `hyperram_axi` — TOP (AXI4 slave + HyperBus device pins)
 
 Parameters: union of `hyperbus_axi`, `hyperbus_ctrl`, `hyperbus_phy` (incl. `PHY_VARIANT`, `DIFF_CK`,
-`LATENCY_CLOCKS`, `FIXED_LATENCY`, `MAX_BURST_WORDS`, `PROGRAM_CR`, `POR_DELAY_CYCLES`). Instantiates
-`hyperbus_axi` + `hyperbus_ctrl` + `hyperbus_phy`.
+`LATENCY_CLOCKS`, `FIXED_LATENCY`, `MAX_BURST_WORDS`, `BURST_BOUNDARY_WORDS`, `WR_COMMIT_READ`,
+`PROGRAM_CR`, `POR_DELAY_CYCLES`, and the v8 spec-feature options `PROGRAM_CR1`/`INIT_CR1`/
+`CLK_FREQ_MHZ`/`T_RP_NS`/`T_RPH_NS`/`T_RH_NS`/`T_VCS_US`/`SUPPORT_DPD`/`TDPDOUT_CYCLES`/
+`ACTIVE_CLK_STOP`, all defaulted through to `hyperbus_ctrl`). Instantiates `hyperbus_axi` +
+`hyperbus_ctrl` + `hyperbus_phy`.
 
 Ports = { clocking } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device pins of `hyperbus_phy` }:
 
@@ -354,3 +367,14 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   `WR_COMMIT_QUIRK` and `BURST_BOUNDARY_WORDS` (simulation-only); `hyperram_bw_test` adds the
   runtime CSR `REG_RBURSTW` (word 12 / 0x30) for an independent read-phase burst length. Regression:
   `sim/tb_commit.sv`.
+- **v8 (2026-07-09):** unimplemented HyperBus spec features added to `hyperbus_ctrl` as **defaulted
+  parameters only — no port name/direction/width changed on any module** (issue #5). New ctrl params
+  (all default OFF = prior behavior): `PROGRAM_CR1`/`INIT_CR1` (A3, CR1 init write); `CLK_FREQ_MHZ` +
+  `T_RP_NS`/`T_RPH_NS`/`T_RH_NS`/`T_VCS_US` (A4, ns-derived POR/reset AC-timing; `CLK_FREQ_MHZ=0`
+  reproduces the legacy `RESET_CYCLES=8` / raw `POR_DELAY_CYCLES` exactly); `SUPPORT_DPD`/
+  `TDPDOUT_CYCLES` (A1, Deep-Power-Down enter-detect + guarded wake); `ACTIVE_CLK_STOP` (A2, CK pause on
+  read back-pressure). The two top wrappers `hyperram_axi` and `hyperram_avalon` forward all of them to
+  `hyperbus_ctrl` (defaulted); the SIM model `hyperram_model` gains a defaulted `SUPPORT_DPD` (DPD
+  device state) — its frozen pin list is unchanged. `hyperbus_phy`, both front-ends, and the
+  FPGA-referenced `hyperram_bw_top` are untouched. Regression: `sim/tb_cr1init.sv`, `sim/tb_por_timing.sv`,
+  `sim/tb_dpd.sv`, `sim/tb_clkstop.sv`.

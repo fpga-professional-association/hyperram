@@ -101,7 +101,15 @@ module hyperram_model
     parameter logic [15:0] ID0_RESET      = HB_ID0_RESET,             // read-only device ID (mfr nibble)
     parameter logic [15:0] ID1_RESET      = HB_ID1_RESET,             // read-only device ID (type nibble)
     parameter logic [15:0] CR0_RESET      = HB_CR0_RESET,             // config register 0 reset image
-    parameter logic [15:0] CR1_RESET      = HB_CR1_RESET              // config register 1 reset image
+    parameter logic [15:0] CR1_RESET      = HB_CR1_RESET,             // config register 1 reset image
+    parameter bit          SUPPORT_DPD    = 1'b0                      // Deep-Power-Down modeling (SPEC_DIGEST
+                                                                      //   §5.2.1 / §8.7, CR0[15]). 0 = ignore
+                                                                      //   DPD (keeps all existing TBs aligned).
+                                                                      //   1 = a CR0[15]=0 write puts the device
+                                                                      //   asleep (drives NOTHING: no read strobe/
+                                                                      //   data, no CA latency indicator) until a
+                                                                      //   CS# wake pulse (or a CR0[15]=1 write)
+                                                                      //   returns it to standby.
 ) (
     input  logic                 hb_ck,      // clock from master
     input  logic                 hb_ck_n,    // complementary clock (tied if single-ended)
@@ -131,6 +139,7 @@ module hyperram_model
   // Config / ID registers (16-bit, always big-endian on the wire).
   logic [DATA_WIDTH-1:0] id0, id1, cr0, cr1;
   logic                  cr0_written; // once CR0 is programmed, latency follows the register
+  logic                  dpd_active;  // SUPPORT_DPD: device is in Deep-Power-Down (asleep, drives nothing)
 
   // ------------------------------------------------------------------------
   // Transaction state (all updated in the single CK-edge process below).
@@ -267,12 +276,17 @@ module hyperram_model
       ck_q        <= hb_ck;
       txn_cnt     <= '0;
       cr0_written <= 1'b0;
+      dpd_active  <= 1'b0;   // hardware reset forces exit from Deep-Power-Down (SPEC_DIGEST §8.7)
       id0         <= DATA_WIDTH'(ID0_RESET);
       id1         <= DATA_WIDTH'(ID1_RESET);
       cr0         <= DATA_WIDTH'(CR0_RESET);
       cr1         <= DATA_WIDTH'(CR1_RESET);
     end else if (hb_cs_n) begin
       // Idle between transactions: clear per-transaction state, keep registers.
+      // DPD exit: a CS# pulse that carried NO clock (beat still 0 at CS# rise) is the master's wake
+      // trigger — return from Deep-Power-Down to standby (SPEC_DIGEST §5.2.1). A real (clocked)
+      // transaction has beat > 0 here, so it never counts as a wake.
+      if (SUPPORT_DPD && dpd_active && (beat == 16'd0)) dpd_active <= 1'b0;
       beat  <= '0;
       ca_sr <= '0;
       pen   <= '0;
@@ -451,6 +465,8 @@ module hyperram_model
               if (cur_reg_addr == HB_REG_CR0) begin
                 cr0         <= {wr_hi, hb_dq_i};    // big-endian: A=high, B=low
                 cr0_written <= 1'b1;
+                // DPD enable/disable follows CR0[15] (= byte-A bit 7): 0 => enter DPD, 1 => normal.
+                if (SUPPORT_DPD) dpd_active <= ~wr_hi[DQ_WIDTH-1];
               end else if (cur_reg_addr == HB_REG_CR1) begin
                 cr1 <= {wr_hi, hb_dq_i};
               end
@@ -555,7 +571,10 @@ module hyperram_model
     hb_dq_oe  = 1'b0;
     hb_rwds_o = 1'b0;
     hb_rwds_oe= 1'b0;
-    if (busy) begin
+    // While in Deep-Power-Down the device is asleep and drives NOTHING (DQ/RWDS High-Z) — a read
+    // therefore returns no source-synchronous strobe and the master's read stalls out (SPEC_DIGEST
+    // §5.2.1). The master must wake the device (CS# pulse + tDPDOUT) before any access succeeds.
+    if (busy && !(SUPPORT_DPD && dpd_active)) begin
       if (beat < 16'd6) begin
         // Command-Address: slave drives the RWDS latency indicator (High = 2x latency count).
         // Variable mode: High only on a refresh collision. Fixed-2x variant (§5.2.4): always High.
