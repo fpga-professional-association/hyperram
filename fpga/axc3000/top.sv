@@ -291,7 +291,9 @@ module top (
     .INIT_CR0          (16'h8F1F),
     // Silicon findings, now first-class controller features (wave-1 ctrl-cluster):
     .BURST_BOUNDARY_WORDS (16'h2000),  // W957D8NB releases the bus when a burst crosses 16 KB
-    .WR_COMMIT_READ       (1'b1),      // issue #1: commit-read interposes on write->write splits
+    .WR_COMMIT_READ       (1'b0),      // A/B isolation: coalescing alone (config A)
+    .WR_COALESCE          (1'b1),      // issue #1 direction 4: merge contiguous writes into one CS#
+    .WR_COALESCE_WAIT     (8),
     .WR_LAT_TRIM          (3)          // silicon-measured: device write window opens 3 CK early
   ) u_ctrl (
     .clk            (clk),
@@ -344,7 +346,7 @@ module top (
     .RD_PREAMBLE_SKIP (1),
     .TX_B_DLY         (1'b1),   // proven config (reads+zlw work); CA margin comes from CK pin delay
     .CK_DIN_HI        (1'b1),
-    .CK_GEN           ("VENDOR")     // 200 MHz: vendor cell, DIN-gated (CKE gating is the proven write-killer)
+    .CK_GEN           ("FABRIC2X")   // proven-clean CK for the bursting A/B at 175
   ) u_io (
     .clk            (clk),
     .clk_smp        (clk2x),   // VENDOR-CK build: +90deg 1x RX sampling clock (LOCAL1X)
