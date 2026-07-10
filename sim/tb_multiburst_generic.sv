@@ -124,7 +124,9 @@ module tb_multiburst_generic;
     .m_writedata     (av_writedata),
     .m_readdata      (av_readdata),
     .m_readdatavalid (av_readdatavalid),
-    .m_waitrequest   (av_waitrequest)
+    .m_waitrequest   (av_waitrequest),
+    // REG_CAL outputs unused here — u_hyperram's cal is tied to constants below (empty = PINCONNECTEMPTY)
+    .cal_capture_phase (), .cal_preamble_skip (), .cal_rx_tap (), .cal_pair_skew ()
   );
 
   hyperram_avalon #(
@@ -143,6 +145,8 @@ module tb_multiburst_generic;
     .RD_PREAMBLE_SKIP (1)              // board setting: discard the W957D8NB read-strobe preamble edge
   ) u_hyperram (
     .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    // cal tied to constants reproducing RD_PREAMBLE_SKIP=1 (board setting; tie-off in GENERIC)
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd1), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
     .avs_address       (av_address),
     .avs_read          (av_read),
     .avs_write         (av_write),
@@ -155,7 +159,7 @@ module tb_multiburst_generic;
     .hb_ck (hb_ck), .hb_ck_n (hb_ck_n), .hb_cs_n (hb_cs_n), .hb_rst_n (hb_rst_n),
     .hb_dq_o (phy_dq_o), .hb_dq_oe (phy_dq_oe), .hb_dq_i (dq_line_dly),
     .hb_rwds_o (phy_rwds_o), .hb_rwds_oe (phy_rwds_oe), .hb_rwds_i (rwds_line_dly),
-    .init_done (init_done)
+    .init_done (init_done), .err_underrun (), .dbg_bus ()
   );
 
   // --------------------------------------------------------------------

@@ -109,6 +109,8 @@ module tb_por_timing;
     .DQ_WIDTH (DQ_WIDTH), .DATA_WIDTH (DATA_WIDTH), .DIFF_CK (1'b1)
   ) u_phy (
     .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    // runtime read-eye calibration tied to POR-equivalent constants (reproduces pre-cal behaviour)
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd0), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
     .phy_cs_n (phy_cs_n), .phy_rst_n (phy_rst_n), .phy_ck_en (phy_ck_en),
     .phy_dq_o (phy_dq_o), .phy_dq_oe (phy_dq_oe), .phy_rwds_o (phy_rwds_o), .phy_rwds_oe (phy_rwds_oe),
     .phy_rd_arm (phy_rd_arm), .phy_dq_i (phy_dq_i), .phy_dq_i_valid (phy_dq_i_valid), .phy_rwds_i (phy_rwds_i),

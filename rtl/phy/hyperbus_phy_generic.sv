@@ -72,6 +72,13 @@ module hyperbus_phy_generic
     input  logic [1:0]          phy_rwds_o,   // DDR RWDS out (write mask): [1]=1st phase, [0]=2nd
     input  logic                phy_rwds_oe,
     input  logic                phy_rd_arm,   // arm receiver for a read-data phase
+    // ---- runtime read-eye calibration (mandatory, no defaults; see docs/INTERFACES.md v9). The GENERIC
+    //      behavioural PHY keeps its RWDS-strobed capture compile-time (RD_PREAMBLE_SKIP reloads in the
+    //      rwds_dly async domain), so all four are tie-offs here (shared port contract). ----
+    input  logic                              cal_capture_phase,
+    input  logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+    input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+    input  logic                              cal_pair_skew,
     output logic [2*DQ_WIDTH-1:0] phy_dq_i,   // recovered, clk-synchronised read word (byte A hi half)
     output logic                phy_dq_i_valid,
     output logic                phy_rwds_i,   // synchronised RWDS level to ctrl
@@ -302,10 +309,11 @@ module hyperbus_phy_generic
     end
   end
 
-  // clk_ref / ADDR_WIDTH / LEN_WIDTH / PHY_VARIANT are contract-only for the generic variant.
+  // clk_ref / ADDR_WIDTH / LEN_WIDTH / PHY_VARIANT and the four runtime cal_* knobs are contract-only
+  // for the generic behavioural variant (tie-off).
   logic _unused_ok;
   /* verilator lint_off UNUSEDSIGNAL */
-  assign _unused_ok = &{1'b0, clk_ref};
+  assign _unused_ok = &{1'b0, clk_ref, cal_capture_phase, cal_preamble_skip, cal_rx_tap, cal_pair_skew};
   /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule

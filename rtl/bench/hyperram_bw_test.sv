@@ -43,6 +43,11 @@
 //    0x28    | 10   | ERR_EXP              |  R     | expected pattern at the first mismatch
 //    0x2C    | 11   | BURSTW               |  R/W   | WRITE-phase HyperBus burst length (words); 0 => default
 //    0x30    | 12   | RBURSTW              |  R/W   | READ-phase  HyperBus burst length (words); 0 => default
+//    0x34    | 13   | REG_CAL              |  R/W   | live PHY read-eye calibration image (drives cal_*):
+//            |      |                      |        |   [0]=cal_capture_phase  [3:1]=cal_preamble_skip
+//            |      |                      |        |   [8:4]=cal_rx_tap       [9]=cal_pair_skew
+//            |      |                      |        | plain R/W (NO 0=>default carve-out; 0 is a valid
+//            |      |                      |        | cal value); reset image = CAL_RESET parameter
 // =====================================================================================
 //
 // See docs/BW_TEST.md for the full narrative, the MB/s formula and the sim/hardware run notes.
@@ -55,7 +60,8 @@ module hyperram_bw_test
     parameter int unsigned LEN_WIDTH      = HB_LEN_WIDTH_DEFAULT,   // 16 — Avalon burstcount width
     parameter int unsigned BURST_WORDS    = HB_BURST_WORDS_DEFAULT, // 16 — words per Avalon burst
     parameter int unsigned CSR_ADDR_WIDTH = 4,                      // 16 word-registers (0x00..0x3C)
-    parameter logic [31:0] VERSION_MAGIC  = 32'h4842_5754           // "HBWT"
+    parameter logic [31:0] VERSION_MAGIC  = 32'h4842_5754,          // "HBWT"
+    parameter logic [31:0] CAL_RESET      = 32'h0000_0000           // POR image of REG_CAL (cal_* seed)
 ) (
     input  logic                        clk,
     input  logic                        rst,          // synchronous, active-high
@@ -76,7 +82,15 @@ module hyperram_bw_test
     output logic [DATA_WIDTH-1:0]       m_writedata,
     input  logic [DATA_WIDTH-1:0]       m_readdata,
     input  logic                        m_readdatavalid,
-    input  logic                        m_waitrequest
+    input  logic                        m_waitrequest,
+
+    // ---- runtime PHY read-eye calibration (to hyperram_avalon's cal_* inputs) ----------------------
+    // Decoded from REG_CAL so a host CSR write retunes the read eye with NO recompile. Bit map (REG_CAL):
+    //   [0]=cal_capture_phase  [3:1]=cal_preamble_skip  [8:4]=cal_rx_tap  [9]=cal_pair_skew.
+    output logic                                  cal_capture_phase,
+    output logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+    output logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+    output logic                                  cal_pair_skew
 );
 
     // ---- derived constants --------------------------------------------------
@@ -99,6 +113,8 @@ module hyperram_bw_test
     localparam logic [CSR_ADDR_WIDTH-1:0] REG_ERREXP  = CSR_ADDR_WIDTH'(10);  // expected pattern there
     localparam logic [CSR_ADDR_WIDTH-1:0] REG_BURSTW  = CSR_ADDR_WIDTH'(11);  // R/W: WRITE burst length (words)
     localparam logic [CSR_ADDR_WIDTH-1:0] REG_RBURSTW = CSR_ADDR_WIDTH'(12);  // R/W: READ  burst length (words)
+    localparam logic [CSR_ADDR_WIDTH-1:0] REG_CAL     = CSR_ADDR_WIDTH'(13);  // R/W: live PHY read-eye cal
+                                                                              //      (see bit map above)
 
     // ------------------------------------------------------------------------
     // Deterministic, address-seeded per-word data pattern (xorshift32 folded to
@@ -128,6 +144,14 @@ module hyperram_bw_test
     logic [DATA_WIDTH-1:0] r_err_got;     // value returned at the first mismatch
     logic [DATA_WIDTH-1:0] r_err_exp;     // expected value at the first mismatch
     logic                  r_err_latched; // first mismatch has been captured this run
+
+    // Runtime PHY read-eye calibration image (REG_CAL). Plain R/W — unlike REG_BURSTW there is NO
+    // "0 => default" carve-out, since 0 is a legitimate cal value. Drives the cal_* outputs live.
+    logic [31:0]           r_cal;
+    assign cal_capture_phase = r_cal[0];
+    assign cal_preamble_skip = r_cal[3:1];
+    assign cal_rx_tap        = r_cal[8:4];
+    assign cal_pair_skew     = r_cal[9];
 
     // ------------------------------------------------------------------------
     // Working state (the traffic sequencer)
@@ -213,6 +237,7 @@ module hyperram_bw_test
             REG_ERREXP:  csr_readdata = 32'(r_err_exp);
             REG_BURSTW:  csr_readdata = 32'(r_burstw);
             REG_RBURSTW: csr_readdata = 32'(r_rburstw);
+            REG_CAL:     csr_readdata = r_cal;
             default:    csr_readdata = 32'h0;
         endcase
     end
@@ -237,6 +262,7 @@ module hyperram_bw_test
             r_err_latched <= 1'b0;
             r_burstw    <= LEN_WIDTH'(BURST_WORDS);   // default; host may reprogram via REG_BURSTW
             r_rburstw   <= LEN_WIDTH'(BURST_WORDS);   // default; host may reprogram via REG_RBURSTW
+            r_cal       <= CAL_RESET;                 // POR cal image; host may reprogram via REG_CAL
             cur_addr    <= '0;
             words_left  <= 32'd0;
             beat        <= '0;
@@ -256,6 +282,7 @@ module hyperram_bw_test
                     REG_RBURSTW: r_rburstw <= (csr_writedata[LEN_WIDTH-1:0] == '0)
                                              ? LEN_WIDTH'(BURST_WORDS)        // 0 => reset to default
                                              : csr_writedata[LEN_WIDTH-1:0];
+                    REG_CAL:    r_cal      <= csr_writedata;                  // plain R/W (no 0-carve-out)
                     default:  /* CTRL + read-only regs: no stored effect */ ;
                 endcase
             end

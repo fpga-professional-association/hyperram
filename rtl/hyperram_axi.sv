@@ -57,13 +57,21 @@ module hyperram_axi
   parameter bit          DIFF_CK           = 1'b1,                       // drive hb_ck_n
   parameter int unsigned RD_PREAMBLE_SKIP  = 0,                          // SDR/GENERIC/INTEL PHY:
                                                                          // preamble rwds-rise edges to skip
-  parameter              CK_SCHEME         = "CLK90"                     // INTEL PHY only (issue #8)
+  parameter              CK_SCHEME         = "CLK90",                    // INTEL PHY only (issue #8)
+  // POR seed for the runtime cal_capture_phase knob (forwarded to hyperbus_phy; default = legacy).
+  parameter bit          CAPTURE_PHASE     = 1'b0                        // SDR read-capture edge seed
 ) (
   // ---- clocking / reset ---------------------------------------------------
   input  logic                        clk,       // aclk = system + bus word clock
   input  logic                        clk90,     // 90-deg phase, to PHY (CK/write centering)
   input  logic                        clk_ref,   // PHY delay/SERDES ref (tie for GENERIC)
   input  logic                        rst,       // synchronous, active-high (invert of aresetn)
+
+  // ---- runtime PHY read-eye calibration (mandatory, no defaults; quasi-static). See INTERFACES.md v9. ----
+  input  logic                                  cal_capture_phase,
+  input  logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+  input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+  input  logic                                  cal_pair_skew,
 
   // ---- AXI4 slave ---------------------------------------------------------
   // AW
@@ -298,7 +306,11 @@ module hyperram_axi
     // PHY RX
     .phy_dq_i       (phy_dq_i),
     .phy_dq_i_valid (phy_dq_i_valid),
-    .phy_rwds_i     (phy_rwds_i)
+    .phy_rwds_i     (phy_rwds_i),
+    // debug taps (bring-up only; unused in the AXI top)
+    .dbg_state      (),
+    .dbg_rd_wptr    (),
+    .dbg_rd_rptr    ()
   );
 
   // -------------------------------------------------------------------------
@@ -312,12 +324,18 @@ module hyperram_axi
     .PHY_VARIANT  (PHY_VARIANT),
     .DIFF_CK      (DIFF_CK),
     .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP),
-    .CK_SCHEME    (CK_SCHEME)
+    .CK_SCHEME    (CK_SCHEME),
+    .CAPTURE_PHASE (CAPTURE_PHASE)
   ) u_phy (
     .clk            (clk),
     .clk90          (clk90),
     .clk_ref        (clk_ref),
     .rst            (rst),
+    // runtime read-eye calibration (forwarded 1:1 to the PHY)
+    .cal_capture_phase (cal_capture_phase),
+    .cal_preamble_skip (cal_preamble_skip),
+    .cal_rx_tap        (cal_rx_tap),
+    .cal_pair_skew     (cal_pair_skew),
     // ctrl-facing (slave, mirror of ctrl TX/RX)
     .phy_cs_n       (phy_cs_n),
     .phy_rst_n      (phy_rst_n),

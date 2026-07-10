@@ -86,6 +86,8 @@ module tb_cr1init;
       .dbg_state(), .dbg_rd_wptr(), .dbg_rd_rptr());                                                 \
     hyperbus_phy_generic #(.DQ_WIDTH(DQ_WIDTH), .DATA_WIDTH(DATA_WIDTH), .DIFF_CK(1'b1)) PFX``_phy ( \
       .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),                                        \
+      .cal_capture_phase(1'b0), .cal_preamble_skip(3'd0), .cal_rx_tap(5'd0),                         \
+      .cal_pair_skew(1'b0), /* cal tie-offs (POR-equivalent; contract v9) */                        \
       .phy_cs_n(PFX``_cs_n), .phy_rst_n(PFX``_rn), .phy_ck_en(PFX``_cke),                            \
       .phy_dq_o(PFX``_dq_o), .phy_dq_oe(PFX``_dq_oe), .phy_rwds_o(PFX``_rwds_o),                     \
       .phy_rwds_oe(PFX``_rwds_oe), .phy_rd_arm(PFX``_rd_arm),                                        \

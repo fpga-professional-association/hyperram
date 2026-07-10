@@ -122,6 +122,13 @@ module hyperbus_phy_altera
     input  logic [1:0]          phy_rwds_o,   // [1]=1st phase mask, [0]=2nd phase mask
     input  logic                phy_rwds_oe,
     input  logic                phy_rd_arm,
+    // ---- runtime read-eye calibration (mandatory, no defaults; shared port contract, docs/INTERFACES.md
+    //      v9). Elaboration-only tie-offs here until #3 unblocks the Agilex fit: the RX tap / byte-pairing
+    //      stay the compile-time RX_STROBE_DLY_TAPS / RX_PAIR_SKEW parameters (no RX/TX/CK changes). ----
+    input  logic                              cal_capture_phase,
+    input  logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+    input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+    input  logic                              cal_pair_skew,
     output logic [2*DQ_WIDTH-1:0] phy_dq_i,   // recovered read word (byte A in high half)
     output logic                phy_dq_i_valid,
     output logic                phy_rwds_i,
@@ -612,9 +619,12 @@ module hyperbus_phy_altera
   end
 
   // Contract-only / calibration-reference tie-offs (kept so all PHY variants share one port+param list).
+  // The four runtime cal_* knobs are accumulated here too: they are elaboration-only for this variant
+  // until #3 lands (see the port comment); the tap / pairing stay the compile-time params above.
   logic _unused_ok;
   assign _unused_ok = &{1'b0, clk_ref, ADDR_WIDTH[0], LEN_WIDTH[0], DATA_WIDTH[0],
-                        PHY_VARIANT == "INTEL"};
+                        PHY_VARIANT == "INTEL",
+                        cal_capture_phase, cal_preamble_skip, cal_rx_tap, cal_pair_skew};
 
 endmodule
 /* verilator lint_on DECLFILENAME */

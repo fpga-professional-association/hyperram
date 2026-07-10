@@ -20,9 +20,10 @@ simulate cleanly under `verilator --binary --timing`.
 
 ## CSR map
 
-The CSR slave has eight 32-bit registers. `csr_address` is a **word address**: register `k` lives at
-host **byte offset `4*k`** (a byte-addressed JTAG-to-Avalon master uses the byte offsets below).
-`csr_waitrequest` is tied low (zero wait states); reads are combinational.
+The CSR slave has up to sixteen 32-bit registers (`CSR_ADDR_WIDTH=4`, the `hyperram_bw_test` /
+`hyperram_bw_top` default; the sim `tb_bw` narrows it to eight). `csr_address` is a **word address**:
+register `k` lives at host **byte offset `4*k`** (a byte-addressed JTAG-to-Avalon master uses the
+byte offsets below). `csr_waitrequest` is tied low (zero wait states); reads are combinational.
 
 | Byte off | Word | Name                  | Access | Bits / meaning |
 |----------|------|-----------------------|--------|----------------|
@@ -35,6 +36,23 @@ host **byte offset `4*k`** (a byte-addressed JTAG-to-Avalon master uses the byte
 | `0x14`   | 5    | `ERR_COUNT`           | R      | number of read words that mismatched |
 | `0x18`   | 6    | `DATA_BYTES_PER_WORD` | R      | constant `= 2` |
 | `0x1C`   | 7    | `VERSION` / `MAGIC`   | R      | constant identifier (default `0x48425754` = `"HBWT"`) |
+| `0x20`   | 8    | `ERR_ADDR`            | R      | WORD address of the first read mismatch |
+| `0x24`   | 9    | `ERR_GOT`             | R      | value returned at the first mismatch |
+| `0x28`   | 10   | `ERR_EXP`             | R      | expected value at the first mismatch |
+| `0x2C`   | 11   | `BURSTW`              | R/W    | WRITE-phase HyperBus burst length (words); `0` ⇒ reset to `BURST_WORDS` |
+| `0x30`   | 12   | `RBURSTW`             | R/W    | READ-phase HyperBus burst length (words); `0` ⇒ reset to `BURST_WORDS` (issue #2) |
+| `0x34`   | 13   | `REG_CAL`             | R/W    | live PHY read-eye calibration (drives `cal_*`); see bit map below |
+
+**`REG_CAL` (word 13 / `0x34`) bit map** — a plain R/W register (no `0 ⇒ default` carve-out; `0` is a
+valid cal value), reset to the `CAL_RESET` parameter. A host write retunes the read eye **with no
+recompile**:
+
+| Bits | `cal_*` output | Meaning |
+|------|----------------|---------|
+| `[0]`   | `cal_capture_phase` | SDR read-capture edge (0 = posedge/centre, 1 = negedge pre-sample) |
+| `[3:1]` | `cal_preamble_skip` | leading RWDS-rise edges to discard as read-strobe preamble (SDR), 0..7 |
+| `[8:4]` | `cal_rx_tap`        | RWDS eye-centre delay-line tap index (DDIO variants; tie-off until #3), 0..31 |
+| `[9]`   | `cal_pair_skew`     | byte-pairing / half-word framing select (DDIO variants; tie-off until #3) |
 
 ### Control / status semantics
 
