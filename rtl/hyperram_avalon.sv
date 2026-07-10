@@ -52,14 +52,23 @@ module hyperram_avalon
   parameter bit          DIFF_CK           = 1'b1,                       // drive hb_ck_n
   parameter int unsigned RD_PREAMBLE_SKIP  = 0,                          // SDR/INTEL PHY: read-strobe
                                                                          // preamble rwds-rise edges to ignore
-  parameter              CK_SCHEME         = "CLK90"                     // INTEL PHY only: "CLK90" |
+  parameter              CK_SCHEME         = "CLK90",                    // INTEL PHY only: "CLK90" |
                                                                          // "CLK_DLY" (issue #8)
+  // POR seed for the runtime cal_capture_phase knob (forwarded to hyperbus_phy; default = legacy).
+  parameter bit          CAPTURE_PHASE     = 1'b0                        // SDR read-capture edge seed
 ) (
   // ---- clocking / reset ---------------------------------------------------
   input  logic                        clk,       // system + bus word clock
   input  logic                        clk90,     // 90-deg phase, to PHY (CK/write centering)
   input  logic                        clk_ref,   // PHY delay/SERDES ref (tie for GENERIC)
   input  logic                        rst,       // synchronous, active-high
+
+  // ---- runtime PHY read-eye calibration (mandatory, no defaults; quasi-static — drive from REG_CAL
+  //      via hyperram_bw_test, or tie to constants reproducing the POR seeds). See docs/INTERFACES.md v9. ----
+  input  logic                                  cal_capture_phase,
+  input  logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+  input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+  input  logic                                  cal_pair_skew,
 
   // ---- Avalon-MM slave ----------------------------------------------------
   input  logic [ADDR_WIDTH-1:0]       avs_address,      // word address; MSB = register-space select
@@ -275,12 +284,18 @@ module hyperram_avalon
     .PHY_VARIANT  (PHY_VARIANT),
     .DIFF_CK      (DIFF_CK),
     .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP),
-    .CK_SCHEME    (CK_SCHEME)
+    .CK_SCHEME    (CK_SCHEME),
+    .CAPTURE_PHASE (CAPTURE_PHASE)
   ) u_phy (
     .clk            (clk),
     .clk90          (clk90),
     .clk_ref        (clk_ref),
     .rst            (rst),
+    // runtime read-eye calibration (forwarded 1:1 to the PHY)
+    .cal_capture_phase (cal_capture_phase),
+    .cal_preamble_skip (cal_preamble_skip),
+    .cal_rx_tap        (cal_rx_tap),
+    .cal_pair_skew     (cal_pair_skew),
     // ctrl-facing (slave, mirror of ctrl TX/RX)
     .phy_cs_n       (phy_cs_n),
     .phy_rst_n      (phy_rst_n),

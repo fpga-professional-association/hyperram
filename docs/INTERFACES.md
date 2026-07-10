@@ -97,8 +97,14 @@ mark (caller back-pressure), instead of dropping words (§1).
 ## `hyperbus_phy` — DDR SERDES + I/O (ctrl-facing slave ⇄ device pins)
 
 Parameters: common + `PHY_VARIANT` (string: `"GENERIC"` | `"SDR"` | `"INTEL"` | `"XILINX"`, default
-`"GENERIC"`), `DIFF_CK` (default 1: drive `hb_ck_n`; 0 = single-ended, `hb_ck_n` tied). All variants
-share this exact port list.
+`"GENERIC"`), `DIFF_CK` (default 1: drive `hb_ck_n`; 0 = single-ended, `hb_ck_n` tied), plus the
+**read-eye POR-seed** parameters `RD_PREAMBLE_SKIP` (SDR/GENERIC, v4) and `CAPTURE_PHASE` (SDR, v9) —
+each seeds the reset value of the matching runtime `cal_*` port and defaults to that variant's legacy
+compile-time default. (The DDIO knobs `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW` remain per-variant
+compile-time parameters — ALTERA defaults 8/1, XILINX 16/0 — their `cal_*` ports are elaboration-only
+tie-offs until the runtime paths land, #3.) All variants share this exact port list, **including the
+four mandatory `cal_*` inputs** (v9) — they carry no SV default value (Verilator 5.020 rejects default
+port values), so every instantiation must wire them explicitly.
 
 **`"SDR"` variant clock note (does not change the port list):** the portable single-clock-phase SDR
 PHY (`hyperbus_phy_sdr.sv`, for FPGAs/fits where two clock phases cannot reach the I/O periphery)
@@ -122,6 +128,11 @@ are unchanged, so the frozen contract holds; only this variant's interpretation 
 | `phy_rwds_o` | I | 2 | |
 | `phy_rwds_oe` | I | 1 | |
 | `phy_rd_arm` | I | 1 | |
+| **— runtime read-eye calibration (mandatory, no default; quasi-static) (v9) —** | | | |
+| `cal_capture_phase` | I | 1 | live read-capture edge (SDR); reset-seeds from `CAPTURE_PHASE` |
+| `cal_preamble_skip` | I | `HB_CAL_PREAMBLE_SKIP_WIDTH` (=3) | live read-strobe preamble-skip (SDR); reset-seeds from `RD_PREAMBLE_SKIP` |
+| `cal_rx_tap` | I | `HB_CAL_RX_TAP_WIDTH` (=5) | live RWDS eye-centre tap (DDIO variants; tie-off until #3) |
+| `cal_pair_skew` | I | 1 | live byte-pairing select (DDIO variants; tie-off until #3) |
 | `phy_dq_i` | O | `PHYW` | recovered read word to ctrl |
 | `phy_dq_i_valid` | O | 1 | |
 | `phy_rwds_i` | O | 1 | synchronized RWDS level to ctrl |
@@ -251,10 +262,11 @@ Parameters: union of `hyperbus_axi`, `hyperbus_ctrl`, `hyperbus_phy` (incl. `PHY
 `LATENCY_CLOCKS`, `FIXED_LATENCY`, `MAX_BURST_WORDS`, `BURST_BOUNDARY_WORDS`, `WR_COMMIT_READ`,
 `PROGRAM_CR`, `POR_DELAY_CYCLES`, and the v8 spec-feature options `PROGRAM_CR1`/`INIT_CR1`/
 `CLK_FREQ_MHZ`/`T_RP_NS`/`T_RPH_NS`/`T_RH_NS`/`T_VCS_US`/`SUPPORT_DPD`/`TDPDOUT_CYCLES`/
-`ACTIVE_CLK_STOP`, all defaulted through to `hyperbus_ctrl`). Instantiates `hyperbus_axi` +
-`hyperbus_ctrl` + `hyperbus_phy`.
+`ACTIVE_CLK_STOP`, all defaulted through to `hyperbus_ctrl`, and the read-eye POR seeds
+`RD_PREAMBLE_SKIP`/`CAPTURE_PHASE` (v9)). Instantiates `hyperbus_axi` + `hyperbus_ctrl` +
+`hyperbus_phy`.
 
-Ports = { clocking } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device pins of `hyperbus_phy` }:
+Ports = { clocking } ∪ { runtime cal } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device pins }:
 
 | Port | Dir | Width | Notes |
 |---|---|---|---|
@@ -262,6 +274,7 @@ Ports = { clocking } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device 
 | `clk90` | I | 1 | to PHY |
 | `clk_ref` | I | 1 | to PHY (tie for GENERIC) |
 | `rst` | I | 1 | |
+| `cal_capture_phase` / `cal_preamble_skip` / `cal_rx_tap` / `cal_pair_skew` (v9) | I | 1 / 3 / 5 / 1 | mandatory (no default); forwarded 1:1 to `hyperbus_phy` — tie to constants (POR-seed equivalents) or drive from a CSR |
 | *AXI4 slave* | | | every `aw*/w*/b*/ar*/r*` port from `hyperbus_axi`, same names/widths |
 | *device pins* | | | `hb_ck, hb_ck_n, hb_cs_n, hb_rst_n, hb_dq_o, hb_dq_oe, hb_dq_i, hb_rwds_o, hb_rwds_oe, hb_rwds_i` from `hyperbus_phy` |
 | `init_done` | O | 1 | from ctrl |
@@ -270,7 +283,8 @@ Ports = { clocking } ∪ { full AXI4 slave bus of `hyperbus_axi` } ∪ { device 
 
 ## `hyperram_avalon` — TOP (Avalon-MM slave + HyperBus device pins)
 
-Same structure as `hyperram_axi` but with the Avalon-MM slave of `hyperbus_avalon`.
+Same structure as `hyperram_axi` but with the Avalon-MM slave of `hyperbus_avalon`. Same read-eye POR
+seed parameters and mandatory `cal_*` inputs (v9).
 
 | Port | Dir | Width | Notes |
 |---|---|---|---|
@@ -278,6 +292,7 @@ Same structure as `hyperram_axi` but with the Avalon-MM slave of `hyperbus_avalo
 | `clk90` | I | 1 | |
 | `clk_ref` | I | 1 | |
 | `rst` | I | 1 | |
+| `cal_capture_phase` / `cal_preamble_skip` / `cal_rx_tap` / `cal_pair_skew` (v9) | I | 1 / 3 / 5 / 1 | mandatory (no default); forwarded 1:1 to `hyperbus_phy` |
 | *Avalon-MM slave* | | | every `avs_*` port from `hyperbus_avalon`, same names/widths |
 | *device pins* | | | same 10 device-pin ports as `hyperram_axi` |
 | `init_done` | O | 1 | |
@@ -378,3 +393,22 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   device state) — its frozen pin list is unchanged. `hyperbus_phy`, both front-ends, and the
   FPGA-referenced `hyperram_bw_top` are untouched. Regression: `sim/tb_cr1init.sv`, `sim/tb_por_timing.sv`,
   `sim/tb_dpd.sv`, `sim/tb_clkstop.sv`.
+- **v9 (2026-07-09):** `hyperbus_phy` (all four variants), `hyperram_avalon`, and `hyperram_axi` gain
+  **four mandatory runtime read-eye calibration inputs** — `cal_capture_phase` (1b), `cal_preamble_skip`
+  (`HB_CAL_PREAMBLE_SKIP_WIDTH`=3b), `cal_rx_tap` (`HB_CAL_RX_TAP_WIDTH`=5b), `cal_pair_skew` (1b) — so a
+  host can retune the read eye (preamble-skip / capture edge / RWDS tap / byte-pairing) by a CSR write
+  with **no recompile** (`REG_CAL`, word 13/0x34, in `hyperram_bw_test`; word 12 is v7's `REG_RBURSTW`).
+  The formerly compile-time SDR knobs `CAPTURE_PHASE`/`RD_PREAMBLE_SKIP` are demoted to **POR reset-seed**
+  values for the matching `cal_*` port (`CAPTURE_PHASE` is now also a wrapper/top parameter); every
+  parameter default reproduces the prior behaviour with zero call-site VALUE changes. The ports are
+  **mandatory (no SV default value)** because Verilator 5.020 hard-rejects default port values
+  (`%Error-UNSUPPORTED: Default value on module input`); consequently **every** call site (all sim TBs,
+  both tops, `hyperram_bw_top`, and the board `top.sv`) needs an explicit wiring edit — a forgotten one
+  is only a non-fatal `%Warning-PINMISSING` that silently ties the input to 0, so a
+  `grep PINMISSING sim/build/*/build.log` gate over the TB build logs guards it. The SDR variant feeds
+  `cal_preamble_skip` through a reset-seeded 2-flop `clk90` synchroniser (resampled at each read disarm)
+  and selects the capture edge with a reset-seeded registered mux (both sampling pipelines always live);
+  the ALTERA and XILINX DDIO variants carry the ports as elaboration-only tie-offs until #3 unblocks
+  their runtime paths (their `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW` stay compile-time, per-variant).
+  `hyperbus_ctrl`, the native/PHY data interfaces, and the model boundary are unchanged. Regression:
+  `sim/tb_cal.sv` (live REG_CAL preamble-skip flip: ERR=LEN-1 ⇒ ERR=0 with no rebuild).

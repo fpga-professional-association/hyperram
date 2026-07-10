@@ -23,7 +23,8 @@ module hyperram_bw_top
     parameter int unsigned LEN_WIDTH        = HB_LEN_WIDTH_DEFAULT,        // 16 (burstcount)
     // ---- bandwidth-test engine ---------------------------------------------
     parameter int unsigned BURST_WORDS      = HB_BURST_WORDS_DEFAULT,      // 16 words / Avalon burst
-    parameter int unsigned CSR_ADDR_WIDTH   = 3,                          // 8 CSR word-registers
+    parameter int unsigned CSR_ADDR_WIDTH   = 4,                          // 16 CSR word-registers (REG_CAL
+                                                                          //   at word 13 needs 4 addr bits)
     parameter logic [31:0] VERSION_MAGIC    = 32'h4842_5754,              // "HBWT"
     // ---- controller / PHY (defaults mirror sim/tb_avalon.sv) ---------------
     parameter int unsigned LATENCY_CLOCKS   = 6,
@@ -35,7 +36,11 @@ module hyperram_bw_top
     parameter int unsigned POR_DELAY_CYCLES = 0,
     parameter logic [15:0] INIT_CR0         = 16'h8F1F,                    // latency code 6, fixed
     parameter              PHY_VARIANT      = "GENERIC",
-    parameter bit          DIFF_CK          = 1'b1
+    parameter bit          DIFF_CK          = 1'b1,
+    // ---- runtime read-eye calibration (POR seeds + REG_CAL image; defaults reproduce today) --------
+    parameter int unsigned RD_PREAMBLE_SKIP = 0,                          // SDR PHY preamble-skip POR seed
+    parameter bit          CAPTURE_PHASE    = 1'b0,                       // SDR read-capture edge seed
+    parameter logic [31:0] CAL_RESET        = 32'h0000_0000               // POR image of REG_CAL
 ) (
     // ---- clocking / reset ---------------------------------------------------
     input  logic                        clk,        // system + bus word clock
@@ -83,6 +88,12 @@ module hyperram_bw_top
     logic [STRB_WIDTH-1:0] m_byteenable;
     assign m_byteenable = '1;
 
+    // ---- runtime read-eye calibration: bench REG_CAL image -> hyperram_avalon cal_* inputs ---------
+    logic                                  cal_capture_phase;
+    logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip;
+    logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap;
+    logic                                  cal_pair_skew;
+
     // ------------------------------------------------------------------------
     // Bandwidth-test engine (Avalon-MM master + CSR slave)
     // ------------------------------------------------------------------------
@@ -92,7 +103,8 @@ module hyperram_bw_top
         .LEN_WIDTH      (LEN_WIDTH),
         .BURST_WORDS    (BURST_WORDS),
         .CSR_ADDR_WIDTH (CSR_ADDR_WIDTH),
-        .VERSION_MAGIC  (VERSION_MAGIC)
+        .VERSION_MAGIC  (VERSION_MAGIC),
+        .CAL_RESET      (CAL_RESET)
     ) u_bw (
         .clk             (clk),
         .rst             (rst),
@@ -111,7 +123,12 @@ module hyperram_bw_top
         .m_writedata     (m_writedata),
         .m_readdata      (m_readdata),
         .m_readdatavalid (m_readdatavalid),
-        .m_waitrequest   (m_waitrequest)
+        .m_waitrequest   (m_waitrequest),
+        // runtime PHY read-eye calibration (REG_CAL image -> hyperram_avalon)
+        .cal_capture_phase (cal_capture_phase),
+        .cal_preamble_skip (cal_preamble_skip),
+        .cal_rx_tap        (cal_rx_tap),
+        .cal_pair_skew     (cal_pair_skew)
     );
 
     // ------------------------------------------------------------------------
@@ -131,12 +148,19 @@ module hyperram_bw_top
         .POR_DELAY_CYCLES (POR_DELAY_CYCLES),
         .INIT_CR0         (INIT_CR0),
         .PHY_VARIANT      (PHY_VARIANT),
-        .DIFF_CK          (DIFF_CK)
+        .DIFF_CK          (DIFF_CK),
+        .RD_PREAMBLE_SKIP (RD_PREAMBLE_SKIP),
+        .CAPTURE_PHASE    (CAPTURE_PHASE)
     ) u_hyperram (
         .clk               (clk),
         .clk90             (clk90),
         .clk_ref           (clk_ref),
         .rst               (rst),
+        // runtime read-eye calibration (from the bench REG_CAL image)
+        .cal_capture_phase (cal_capture_phase),
+        .cal_preamble_skip (cal_preamble_skip),
+        .cal_rx_tap        (cal_rx_tap),
+        .cal_pair_skew     (cal_pair_skew),
         // Avalon-MM slave (driven by the bench master)
         .avs_address       (m_address),
         .avs_read          (m_read),
@@ -160,7 +184,9 @@ module hyperram_bw_top
         .hb_rwds_i         (hb_rwds_i),
         // status
         .init_done         (init_done),
-        .err_underrun      (/* unused: bench engine streams full-rate, never underruns */)
+        .err_underrun      (/* unused: bench engine streams full-rate, never underruns */),
+        // debug tap (bring-up only; unused in this top)
+        .dbg_bus           ()
     );
 
 endmodule

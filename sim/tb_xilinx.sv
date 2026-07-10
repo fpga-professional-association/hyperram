@@ -92,13 +92,15 @@ module tb_xilinx;
     .RD_PREAMBLE_SKIP (0)
   ) dut_ideal (
     .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    // cal tied to constants reproducing RD_PREAMBLE_SKIP=0 (tie-off in the XILINX variant)
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd0), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
     .avs_address (s_address), .avs_read (s_read & ~sel), .avs_write (s_write & ~sel),
     .avs_writedata (s_writedata), .avs_byteenable (s_byteenable), .avs_burstcount (s_burstcount),
     .avs_readdata (a_readdata), .avs_readdatavalid (a_readdatavalid), .avs_waitrequest (a_waitrequest),
     .hb_ck (a_hb_ck), .hb_ck_n (a_hb_ck_n), .hb_cs_n (a_hb_cs_n), .hb_rst_n (a_hb_rst_n),
     .hb_dq_o (a_phy_dq_o), .hb_dq_oe (a_phy_dq_oe), .hb_dq_i (a_dq_dly),
     .hb_rwds_o (a_phy_rwds_o), .hb_rwds_oe (a_phy_rwds_oe), .hb_rwds_i (a_rwds_dly),
-    .init_done (a_init_done)
+    .init_done (a_init_done), .err_underrun (), .dbg_bus ()
   );
   hyperram_model #(
     .DQ_WIDTH (DQ_WIDTH), .MEM_WORDS (1 << 16), .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),
@@ -131,13 +133,15 @@ module tb_xilinx;
     .RD_PREAMBLE_SKIP (FIX_SKIP)
   ) dut_nonideal (
     .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    // cal tied to constants reproducing RD_PREAMBLE_SKIP=FIX_SKIP=1 (tie-off in the XILINX variant)
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd1), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
     .avs_address (s_address), .avs_read (s_read & sel), .avs_write (s_write & sel),
     .avs_writedata (s_writedata), .avs_byteenable (s_byteenable), .avs_burstcount (s_burstcount),
     .avs_readdata (n_readdata), .avs_readdatavalid (n_readdatavalid), .avs_waitrequest (n_waitrequest),
     .hb_ck (n_hb_ck), .hb_ck_n (n_hb_ck_n), .hb_cs_n (n_hb_cs_n), .hb_rst_n (n_hb_rst_n),
     .hb_dq_o (n_phy_dq_o), .hb_dq_oe (n_phy_dq_oe), .hb_dq_i (n_dq_dly),
     .hb_rwds_o (n_phy_rwds_o), .hb_rwds_oe (n_phy_rwds_oe), .hb_rwds_i (n_rwds_dly),
-    .init_done (n_init_done)
+    .init_done (n_init_done), .err_underrun (), .dbg_bus ()
   );
   hyperram_model #(
     .DQ_WIDTH (DQ_WIDTH), .MEM_WORDS (1 << 16), .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),

@@ -86,6 +86,8 @@ run_one tb_preamble_generic.sv tb_preamble_generic
 run_one tb_bw.sv       tb_bw         "${BENCH_SRCS[@]}"
 run_one tb_multiburst.sv tb_multiburst "${BENCH_SRCS[@]}"
 run_one tb_multiburst_generic.sv tb_multiburst_generic "${BENCH_SRCS[@]}"
+# Runtime PHY read-eye calibration (issue #10): live REG_CAL preamble-skip flip, no recompile.
+run_one tb_cal.sv      tb_cal        "${BENCH_SRCS[@]}"
 # Spec-coverage TBs (issue #4): chop, native wrapped/legacy/hybrid bursts, byte-masked writes +
 # write-underrun, true variable (alternating 1x/2x) latency, CR1/ID1 + POR dwell + runtime-reset
 # register restore + DIFF_CK, and AXI WRAP-write + AR/AW round-robin arbiter.

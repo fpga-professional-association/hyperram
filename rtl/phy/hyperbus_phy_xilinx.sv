@@ -85,6 +85,14 @@ module hyperbus_phy_xilinx
     input  logic [1:0]          phy_rwds_o,   // [1]=1st phase mask, [0]=2nd phase mask
     input  logic                phy_rwds_oe,
     input  logic                phy_rd_arm,
+    // ---- runtime read-eye calibration (mandatory, no defaults; shared port contract, docs/INTERFACES.md
+    //      v9). This variant's IDELAYE2 is FIXED-tap and its knobs stay the compile-time parameters above,
+    //      so all four are tie-offs (a live fill-in would move the IDELAYE2 to VAR_LOAD and wire cal_rx_tap
+    //      to CNTVALUEIN, and cal_pair_skew to the RX_PAIR_SKEW byte-pairing select). ----
+    input  logic                              cal_capture_phase,
+    input  logic [HB_CAL_PREAMBLE_SKIP_WIDTH-1:0] cal_preamble_skip,
+    input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
+    input  logic                              cal_pair_skew,
     output logic [2*DQ_WIDTH-1:0] phy_dq_i,   // recovered read word (byte A in high half)
     output logic                phy_dq_i_valid,
     output logic                phy_rwds_i,
@@ -419,10 +427,12 @@ module hyperbus_phy_xilinx
     end
   end
 
-  // Contract-only / calibration tie-offs (kept so all PHY variants share one port+param list).
+  // Contract-only / calibration tie-offs (kept so all PHY variants share one port+param list; the four
+  // runtime cal_* knobs are accumulated here too — see the port comment).
   logic _unused_ok;
   assign _unused_ok = &{1'b0, idelay_rdy, rx_lo, ADDR_WIDTH[0], LEN_WIDTH[0], DATA_WIDTH[0],
-                        PHY_VARIANT == "XILINX"};
+                        PHY_VARIANT == "XILINX",
+                        cal_capture_phase, cal_preamble_skip, cal_rx_tap, cal_pair_skew};
 
 endmodule
 /* verilator lint_on DECLFILENAME */

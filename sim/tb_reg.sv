@@ -58,13 +58,15 @@ module tb_reg;
     .PHY_VARIANT ("GENERIC"), .DIFF_CK (1'b1)
   ) dut (
     .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    // runtime read-eye calibration tied to POR-equivalent constants (reproduces pre-cal behaviour)
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd0), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
     .avs_address (avs_address), .avs_read (avs_read), .avs_write (avs_write),
     .avs_writedata (avs_writedata), .avs_byteenable (avs_byteenable), .avs_burstcount (avs_burstcount),
     .avs_readdata (avs_readdata), .avs_readdatavalid (avs_readdatavalid), .avs_waitrequest (avs_waitrequest),
     .hb_ck (hb_ck), .hb_ck_n (hb_ck_n), .hb_cs_n (hb_cs_n), .hb_rst_n (hb_rst_n),
     .hb_dq_o (phy_dq_o), .hb_dq_oe (phy_dq_oe), .hb_dq_i (dq_line_dly),
     .hb_rwds_o (phy_rwds_o), .hb_rwds_oe (phy_rwds_oe), .hb_rwds_i (rwds_line_dly),
-    .init_done (init_done), .err_underrun (err_underrun)
+    .init_done (init_done), .err_underrun (err_underrun), .dbg_bus ()
   );
 
   hyperram_model #(
@@ -98,13 +100,15 @@ module tb_reg;
     .PHY_VARIANT ("GENERIC"), .DIFF_CK (1'b0)                       // single-ended CK
   ) dut2 (
     .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    // runtime read-eye calibration tied to POR-equivalent constants (reproduces pre-cal behaviour)
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd0), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
     .avs_address (avs2_address), .avs_read (avs2_read), .avs_write (avs2_write),
     .avs_writedata (avs2_writedata), .avs_byteenable (avs2_byteenable), .avs_burstcount (avs2_burstcount),
     .avs_readdata (avs2_readdata), .avs_readdatavalid (avs2_readdatavalid), .avs_waitrequest (avs2_waitrequest),
     .hb_ck (hb_ck2), .hb_ck_n (hb_ck_n2), .hb_cs_n (hb_cs_n2), .hb_rst_n (hb_rst_n2),
     .hb_dq_o (phy2_dq_o), .hb_dq_oe (phy2_dq_oe), .hb_dq_i (dq2_line_dly),
     .hb_rwds_o (phy2_rwds_o), .hb_rwds_oe (phy2_rwds_oe), .hb_rwds_i (rwds2_line_dly),
-    .init_done (init_done2), .err_underrun (err_underrun2)
+    .init_done (init_done2), .err_underrun (err_underrun2), .dbg_bus ()
   );
 
   hyperram_model #(
