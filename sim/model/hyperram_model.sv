@@ -17,6 +17,11 @@
 //   * CR0/CR1 (writable) and ID0/ID1 (read-only) register space with reset values from the
 //     package, always big-endian (byte A = word[15:8]).
 //   * A backing memory array; optional mid-burst row-crossing latency gap (RWDS held Low).
+//   * W957D8NB silicon-fidelity quirks (all opt-in; 0/off = ideal device, keeps every existing TB
+//     aligned): a write-CA "wound" that zeroes N words below a memory write's CA base, optionally
+//     mask-suppressible (WR_WOUND_WORDS / WR_WOUND_MASK_SUPPRESS); an end-of-burst 0x2000-word
+//     garble (WR_BOUNDARY_END_GARBLE); a bus-release boundary quirk (BURST_BOUNDARY_WORDS); read
+//     preamble/over-stream timing artifacts; and Deep-Power-Down.
 //
 // This is a PROTOCOL-accurate model, not an AC-timing model. hb_ck is a real DDR clock: one DQ
 // byte is transferred on every CK edge (two bytes / cycle). Byte A (word[15:8]) is on the CK-High
@@ -74,33 +79,68 @@ module hyperram_model
                                                                       //   below stops the instant CK stops and never exercised
                                                                       //   this; the SELF-TIMED tail below reproduces it.
                                                                       //   0 = ideal device (keeps all existing TBs aligned).
-    parameter bit          WR_COMMIT_QUIRK = 1'b0,                     // W957D8NB SPLIT-WRITE commit quirk (issue #1,
-                                                                      //   CORRECTED to the 2026-07-10 silicon evidence):
-                                                                      //   when 1, the FINAL WR_PENDING_WORDS word(s) of
-                                                                      //   every memory WRITE burst are held pending (NOT
-                                                                      //   committed to mem[]). Reads of a pending address
-                                                                      //   return the held data (device-buffer readback —
-                                                                      //   the observable "commit" any trailing covering
-                                                                      //   read sees), but NO read ever FLUSHES the pending
-                                                                      //   words to the array; the next memory-space WRITE
-                                                                      //   CS# discards them regardless of any interposed
-                                                                      //   read (their array locations then read 0x0000 —
-                                                                      //   the silicon fingerprint). The pre-2026-07-10
-                                                                      //   model committed pend->mem on a covering read,
-                                                                      //   which made read-shaped interposes (SPAN_END /
-                                                                      //   FULL_BURST commit-reads) look like fixes; the
-                                                                      //   real device loses the words anyway when another
-                                                                      //   write follows, so that trigger was removed.
-                                                                      //   0 = ideal device (immediate commit; keeps TBs
-                                                                      //   aligned).
-    parameter int unsigned WR_PENDING_WORDS = 1,                      // depth of the pending-write delay line (words
-                                                                      //   held back at the tail of every write burst).
-                                                                      //   1 = original issue #1 model (default, keeps
-                                                                      //   all existing TBs aligned); 2026-07-09 silicon
-                                                                      //   (175 MHz GPIO-I/O image) measured 4 on the
-                                                                      //   real W957D8NB — ERR_COUNT = 4*(n_bursts-1),
-                                                                      //   always the LAST FOUR words of each non-final
-                                                                      //   write burst.
+    // ---- W957D8NB WRITE-CA "wound" (2026-07-09 silicon ladder). Supersedes the WR_COMMIT_QUIRK
+    //      pending/discard story further below, which read-only probing PROVED FALSE: a write burst's
+    //      tail commits to the array fine on its own — [508..511] of a 512-word burst read back
+    //      intact after 3 later writes elsewhere. The real defect is CA-time, not commit-time. ----
+    parameter int unsigned WR_WOUND_WORDS = 0,                         // W957D8NB WRITE-CA wound (silicon
+                                                                      //   ladder finding 2): ANY memory-
+                                                                      //   space WRITE CS# that opens at
+                                                                      //   word address B zeroes mem[B-N ..
+                                                                      //   B-1] — the N words immediately
+                                                                      //   BELOW its CA base — applied at
+                                                                      //   CA decode, BEFORE this burst's
+                                                                      //   own data beats land (so a burst
+                                                                      //   whose own range later covers the
+                                                                      //   wound zone heals it). READ CAs
+                                                                      //   never wound (finding 3). N=4
+                                                                      //   matches the real W957D8NB. 0 =
+                                                                      //   ideal device (keeps all existing
+                                                                      //   TBs aligned).
+    parameter bit          WR_WOUND_MASK_SUPPRESS = 1'b0,              // E-D hypothesis (2026-07-09):
+                                                                      //   does leading the reopened write
+                                                                      //   burst with fully byte-masked
+                                                                      //   beats suppress its OWN wound?
+                                                                      //   When 1, the armed wound (see
+                                                                      //   WR_WOUND_WORDS) is DISCARDED
+                                                                      //   instead of applied if this
+                                                                      //   burst's first data word (beat 0)
+                                                                      //   arrives with RWDS High on BOTH
+                                                                      //   phases (fully masked = no real
+                                                                      //   byte written). Resolved
+                                                                      //   retroactively: the wound zone is
+                                                                      //   recorded at CA time and only
+                                                                      //   actually applied to mem[] once
+                                                                      //   beat 0's mask is known. 0 =
+                                                                      //   unsuppressible (apply the wound
+                                                                      //   regardless of masking; keeps all
+                                                                      //   existing TBs aligned).
+    parameter bit          WR_BOUNDARY_END_GARBLE = 1'b0,              // silicon ladder finding 5 (a
+                                                                      //   separate, rarer defect from the
+                                                                      //   wound above): a memory WRITE
+                                                                      //   burst whose FINAL word address +
+                                                                      //   1 lands exactly on a 16'h2000-
+                                                                      //   WORD (16KB) boundary gets its own
+                                                                      //   last 4 words persistently
+                                                                      //   garbled to 16'h5050 at CS# close.
+                                                                      //   0 = disabled (keeps all existing
+                                                                      //   TBs aligned).
+                                                                      //   NOTE (v4/v5 silicon): the true
+                                                                      //   granularity is EVERY 1024-word ROW
+                                                                      //   multiple (0x2000 is one); the
+                                                                      //   model keeps 0x2000 to preserve the
+                                                                      //   TB's documented case — generalize
+                                                                      //   alongside a row-WRAP model if a
+                                                                      //   row-accurate device sim is needed
+                                                                      //   (the controller now never crosses
+                                                                      //   rows, so sim never exercises it).
+    // ---- DEPRECATED (2026-07-09): the split-write "commit quirk" (pending/discard on the next
+    //      write) this pair used to model is FALSIFIED on silicon — see WR_WOUND_WORDS above for the
+    //      real defect. Both names are kept, ACCEPTED BUT IGNORED (no-ops), only so any stale
+    //      instantiation still elaborates; no logic below reads them. Use WR_WOUND_WORDS /
+    //      WR_WOUND_MASK_SUPPRESS instead. ----
+    parameter bit          WR_COMMIT_QUIRK  = 1'b0,                    // DEPRECATED no-op (see above)
+    parameter int unsigned WR_PENDING_WORDS = 1,                       // DEPRECATED no-op (see above)
     parameter int unsigned BURST_BOUNDARY_WORDS = 0,                  // W957D8NB 0x2000-WORD boundary quirk: when a
                                                                       //   single burst crosses this WORD-aligned boundary
                                                                       //   the device RELEASES the bus (stops driving on
@@ -176,26 +216,15 @@ module hyperram_model
   logic [DQ_WIDTH-1:0]     wr_hi;           // captured byte A during a register write
   logic                    stall_done;      // read-stall (STALL_CLOCKS) already injected this txn
 
-  // ---- split-write commit quirk (WR_COMMIT_QUIRK / WR_PENDING_WORDS) ----
-  // `hold[]` is a WR_PENDING_WORDS-deep shift register of the most recent memory-write words within
-  // the CURRENT burst — index 0 = newest word, index WR_PENDING_WORDS-1 = oldest still-buffered word.
-  // Every new word evicts (commits to mem[]) whatever currently sits at the oldest slot and shifts the
-  // rest down, so a word commits only once WR_PENDING_WORDS newer words have arrived after it within
-  // the SAME burst: the burst's LAST WR_PENDING_WORDS words are therefore never committed here (they
-  // are still sitting in hold[] when CS# deasserts). At CS# deassert whatever remains valid in hold[]
-  // moves to `pend[]` — the just-closed burst's uncommitted tail. From there (2026-07-10 silicon
-  // semantics) pend[] entries serve READS of their addresses directly (buffer readback) but are never
-  // flushed to mem[]; they are discarded (and their array locations zeroed) the moment the next
-  // memory-space WRITE CS# opens — interposed reads notwithstanding.
-  logic                    hold_valid [WR_PENDING_WORDS];
-  logic [AW-1:0]           hold_addr  [WR_PENDING_WORDS];
-  logic [DATA_WIDTH-1:0]   hold_word  [WR_PENDING_WORDS];
-  logic [1:0]              hold_we    [WR_PENDING_WORDS]; // per-byte write-enable {A,B} (unmasked bytes)
-  logic                    whi_we;          // byte-A write-enable, captured on the rising edge
-  logic                    pend_valid [WR_PENDING_WORDS];
-  logic [AW-1:0]           pend_addr  [WR_PENDING_WORDS];
-  logic [DATA_WIDTH-1:0]   pend_word  [WR_PENDING_WORDS];
-  logic [1:0]              pend_we    [WR_PENDING_WORDS];
+  // ---- W957D8NB write-CA wound (WR_WOUND_WORDS / WR_WOUND_MASK_SUPPRESS) ----
+  // A memory WRITE's CA decode ARMS a candidate wound (base = this burst's own CA address); it is
+  // RESOLVED once beat 0 (word index 0 of this burst's data phase) is fully sampled: applied
+  // (mem[base-N .. base-1] zeroed) unless WR_WOUND_MASK_SUPPRESS is set AND beat 0 arrived fully
+  // byte-masked (RWDS High on both phases), in which case it is discarded. Resolving at beat 0 rather
+  // than at CA time itself is what lets WR_WOUND_MASK_SUPPRESS see the mask before deciding.
+  logic                    wound_pending;   // an armed, not-yet-resolved wound from this CS#'s CA decode
+  logic [AW-1:0]           wound_base;      // CA base (B) for the armed wound
+  logic                    wound_mask_hi;   // beat-0 byte-A (rising-edge) RWDS sample
 
   // ---- 0x2000-word boundary release quirk (BURST_BOUNDARY_WORDS) ----
   logic                    bnd_rel;         // this transaction crossed a boundary -> bus released
@@ -278,10 +307,9 @@ module hyperram_model
       pen_pending <= '0;
       wcnt        <= '0;
       stall_done  <= 1'b0;
-      for (int p = 0; p < WR_PENDING_WORDS; p++) begin
-        hold_valid[p] <= 1'b0;
-        pend_valid[p] <= 1'b0;
-      end
+      wound_pending <= 1'b0;
+      wound_base    <= '0;
+      wound_mask_hi <= 1'b0;
       bnd_rel     <= 1'b0;
       cs_q        <= 1'b1;
       ck_q        <= hb_ck;
@@ -306,19 +334,24 @@ module hyperram_model
       cs_q  <= 1'b1;
       ck_q  <= hb_ck;
       bnd_rel <= 1'b0;                         // boundary-release latch is per-transaction
-      // Split-write quirk: whatever remains valid in `hold[]` at CS# deassert is this burst's
-      // UNCOMMITTED tail (up to WR_PENDING_WORDS words). Move it to `pend[]` to await a covering read
-      // (commit) or the next write (drop). Idempotent.
-      if (WR_COMMIT_QUIRK) begin
-        for (int p = 0; p < WR_PENDING_WORDS; p++) begin
-          if (hold_valid[p]) begin
-            pend_valid[p] <= 1'b1;
-            pend_addr[p]  <= hold_addr[p];
-            pend_word[p]  <= hold_word[p];
-            pend_we[p]    <= hold_we[p];
-          end
-          hold_valid[p] <= 1'b0;
-        end
+      // WR_BOUNDARY_END_GARBLE (finding 5): a memory WRITE burst that just closed with its final word
+      // address + 1 landing exactly on a 0x2000-word boundary gets its own last 4 words persistently
+      // garbled. `addr`/`wcnt`/`cur_rw`/`cur_as` still hold the just-ended burst's values here (not yet
+      // reset — the resets below only take effect after this invocation); guard on wcnt!=0 so this
+      // only fires once per CS# (a re-invocation of this branch — e.g. from CK still toggling while
+      // CS# is High, WR_CHOP_PAUSE_CK — sees wcnt already cleared to 0 by the first pass).
+      if (WR_BOUNDARY_END_GARBLE && !cur_rw && !cur_as && (wcnt != 32'd0) &&
+          ((32'(addr) % 32'h2000) == 32'd0)) begin
+        for (int k = 1; k <= 4; k++)
+          if (addr >= AW'(k)) mem[addr - AW'(k)] <= 16'h5050;
+      end
+      // Safety net: a wound armed at CA decode is normally resolved at beat 0 of the data phase (see
+      // below) long before CS# can deassert. If CS# somehow closes with no data beats at all, apply
+      // the wound unconditionally here rather than lose it silently.
+      if (wound_pending) begin
+        for (int k = 1; k <= int'(WR_WOUND_WORDS); k++)
+          if (wound_base >= AW'(k)) mem[wound_base - AW'(k)] <= '0;
+        wound_pending <= 1'b0;
       end
     end else if (cs_q) begin
       // CS# just fell: start of transaction. Decide the refresh-collision for this transaction
@@ -363,18 +396,16 @@ module hyperram_model
           //   edge index = 6 + 2*eff + 1 = 7 + 2*eff.
           first_data_beat <= 16'd7 + (eff << 1);
 
-          // Split-write quirk: a NEW memory WRITE drops any pending (uncommitted) words from the
-          // previous write burst (models "a following WRITE leaves the pending word(s) uncommitted").
-          // Each array location then reads back 0x0000 on the W957D8NB (issue #1: the lost word(s)
-          // "read back as 0x0000"), so zero them here — this reproduces the exact silicon fingerprint
-          // AND is robust to any prior committed value at that address. This drop is UNCONDITIONAL on
-          // the next memory write (2026-07-10): interposed reads do not protect the pending words —
-          // reads only serve their data back (see the read side), they never flush pend[] to mem[].
-          if (WR_COMMIT_QUIRK && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca)) begin
-            for (int p = 0; p < WR_PENDING_WORDS; p++) begin
-              if (pend_valid[p]) mem[pend_addr[p]] <= '0;
-              pend_valid[p] <= 1'b0;
-            end
+          // Write-CA wound (WR_WOUND_WORDS, finding 2): ARM a candidate wound at this burst's own CA
+          // base. Resolution (apply, vs. WR_WOUND_MASK_SUPPRESS-discard) happens once beat 0 of the
+          // data phase is fully sampled (see the write data-phase handling below) — NOT here — so the
+          // mask-suppress decision can see beat 0's RWDS before committing to zeroing anything. Any
+          // non-memory-write CA (read or register) leaves no wound armed.
+          if ((WR_WOUND_WORDS != 0) && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca)) begin
+            wound_pending <= 1'b1;
+            wound_base    <= start_addr;
+          end else begin
+            wound_pending <= 1'b0;
           end
 
           // Data-phase address / burst setup.
@@ -409,34 +440,12 @@ module hyperram_model
             if ((BURST_BOUNDARY_WORDS != 0) && (wcnt != 32'd0) &&
                 ((32'(addr) % BURST_BOUNDARY_WORDS) == 32'd0))
               bnd_rel <= 1'b1;
-            // Split-write quirk: reading ANY currently-pending address returns its held (uncommitted)
-            // value — readback correctness, the device's internal buffer still has the right data even
-            // though the array doesn't yet. This buffer readback is the ONLY read-side behaviour
-            // (2026-07-10 silicon correction): the pre-2026-07-10 model additionally FLUSHED pend[]
-            // to mem[] when a read swept the whole pending range ("covering read commits"), which the
-            // FULL_BURST commit-read satisfied — making it look like a working fix. On silicon a
-            // FULL_BURST interpose between two writes still loses the pending words (~4 per chop), so
-            // that flush trigger is falsified and removed: reads serve pend[] data but never commit
-            // it; only the next memory-space WRITE CS# resolves pend[] (by discarding it — see the
-            // CA-decode hook). A trailing covering read still OBSERVES committed data (served from
-            // pend[]), which is exactly what the silicon "commits if the host performs any subsequent
-            // covering READ" observation can and does see.
-            if (WR_COMMIT_QUIRK) begin
-              logic                  addr_pending;
-              logic [DATA_WIDTH-1:0] pend_out;
-              addr_pending = 1'b0;
-              pend_out     = '0;
-              for (int p = 0; p < WR_PENDING_WORDS; p++) begin
-                if (pend_valid[p] && (pend_addr[p] == addr)) begin
-                  addr_pending = 1'b1;
-                  pend_out     = pend_word[p];
-                end
-              end
-              if (addr_pending) out_word <= pend_out;
-              else              out_word <= cur_as ? reg_val : mem[addr];
-            end else begin
-              out_word <= cur_as ? reg_val : mem[addr];
-            end
+            // READ CAs never wound and always see the array truthfully (finding 3: a read CA at 0x100
+            // mid-seeded-region left the array intact). No pending/buffer-readback machinery: the
+            // 2026-07-09 ladder proved a write burst's tail commits to the array fine on its own (a
+            // 512-word burst's [508..511] read back intact after 3 later writes elsewhere) — the write
+            // side's wound (WR_WOUND_WORDS above) is the only defect, and reads are simply truthful.
+            out_word <= cur_as ? reg_val : mem[addr];
             addr     <= next_addr(addr, wcnt);
             wcnt     <= wcnt + 32'd1;
           end else begin                           // falling edge: byte B just delivered
@@ -449,11 +458,13 @@ module hyperram_model
           if (hb_ck) begin                         // rising edge: byte A (word[15:8])
             if (cur_as)
               wr_hi <= hb_dq_i;
-            else if (WR_COMMIT_QUIRK) begin
-              wr_hi  <= hb_dq_i;                    // delayed-commit: buffer byte A + its mask
-              whi_we <= ~hb_rwds_i;
-            end else if (!hb_rwds_i && !bnd_rel)
-              mem[addr][DATA_WIDTH-1:DQ_WIDTH] <= hb_dq_i;
+            else begin
+              if (!hb_rwds_i && !bnd_rel)
+                mem[addr][DATA_WIDTH-1:DQ_WIDTH] <= hb_dq_i;
+              // Beat-0 byte-A mask sample for WR_WOUND_MASK_SUPPRESS (paired with byte B's sample,
+              // captured this same word's falling edge below, to decide the armed wound's fate).
+              if (wcnt == 32'd0) wound_mask_hi <= hb_rwds_i;
+            end
           end else begin                           // falling edge: byte B (word[7:0])
             // Boundary-release quirk (writes): once the burst steps onto a boundary the device stops
             // capturing for the rest of this CS# -> post-boundary words are never stored.
@@ -470,32 +481,21 @@ module hyperram_model
                 cr1 <= {wr_hi, hb_dq_i};
               end
               // ID0/ID1 are read-only: writes ignored.
-            end else if (WR_COMMIT_QUIRK) begin
-              // Commit the OLDEST held word (index WR_PENDING_WORDS-1 — never the current one), then
-              // shift every entry down one slot and push this word in at index 0. A burst's LAST
-              // WR_PENDING_WORDS words are therefore never committed here (still sitting in hold[] at
-              // CS# deassert). Honor per-byte masks; skip stores once bus-released. At WR_PENDING_WORDS=1
-              // this degenerates to exactly the original single-hold behavior (the shift loop is empty).
-              if (hold_valid[WR_PENDING_WORDS-1] && !bnd_rel) begin
-                if (hold_we[WR_PENDING_WORDS-1][1])
-                  mem[hold_addr[WR_PENDING_WORDS-1]][DATA_WIDTH-1:DQ_WIDTH]
-                      <= hold_word[WR_PENDING_WORDS-1][DATA_WIDTH-1:DQ_WIDTH];
-                if (hold_we[WR_PENDING_WORDS-1][0])
-                  mem[hold_addr[WR_PENDING_WORDS-1]][DQ_WIDTH-1:0]
-                      <= hold_word[WR_PENDING_WORDS-1][DQ_WIDTH-1:0];
+            end else begin
+              if (!hb_rwds_i && !bnd_rel) begin
+                mem[addr][DQ_WIDTH-1:0] <= hb_dq_i;
               end
-              for (int p = WR_PENDING_WORDS - 1; p > 0; p--) begin
-                hold_valid[p] <= hold_valid[p-1];
-                hold_addr[p]  <= hold_addr[p-1];
-                hold_word[p]  <= hold_word[p-1];
-                hold_we[p]    <= hold_we[p-1];
+              // Wound resolve (WR_WOUND_WORDS / WR_WOUND_MASK_SUPPRESS): beat 0 (word index 0 of this
+              // burst) is now fully sampled — byte A from this same word's rising edge (wound_mask_hi),
+              // byte B this edge (hb_rwds_i). Apply the wound armed at CA decode unless mask-suppress
+              // is enabled and beat 0 arrived fully byte-masked on both phases (the E-D hypothesis).
+              if (wound_pending && (wcnt == 32'd0)) begin
+                if (!(WR_WOUND_MASK_SUPPRESS && wound_mask_hi && hb_rwds_i)) begin
+                  for (int k = 1; k <= int'(WR_WOUND_WORDS); k++)
+                    if (wound_base >= AW'(k)) mem[wound_base - AW'(k)] <= '0;
+                end
+                wound_pending <= 1'b0;
               end
-              hold_valid[0] <= 1'b1;
-              hold_addr[0]  <= addr;
-              hold_word[0]  <= {wr_hi, hb_dq_i};
-              hold_we[0]    <= {whi_we, ~hb_rwds_i};
-            end else if (!hb_rwds_i && !bnd_rel) begin
-              mem[addr][DQ_WIDTH-1:0] <= hb_dq_i;
             end
             addr <= next_addr(addr, wcnt);
             wcnt <= wcnt + 32'd1;

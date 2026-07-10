@@ -421,27 +421,42 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   their runtime paths (their `RX_STROBE_DLY_TAPS`/`RX_PAIR_SKEW` stay compile-time, per-variant).
   `hyperbus_ctrl`, the native/PHY data interfaces, and the model boundary are unchanged. Regression:
   `sim/tb_cal.sv` (live REG_CAL preamble-skip flip: ERR=LEN-1 ⇒ ERR=0 with no rebuild).
-- **v10 (2026-07-10):** `hyperbus_ctrl` gains `WR_CHOP_REPLAY` (default 0) / `WR_REPLAY_WORDS`
-  (default 4) — the WRITE-CHOP REPLAY remedy for the W957D8NB write-commit quirk at boundaries that
-  MUST exist (tCSM `MAX_BURST_WORDS` / `BURST_BOUNDARY_WORDS` chops of one long write stream).
-  **Defaulted parameters only; no frozen port name, direction, or width changed on any module.**
-  Threaded (defaulted) through `hyperram_avalon` and `hyperram_axi`. (This entry also records the
-  previously-unlogged 2026-07-09 ctrl parameters `COMMIT_READ_WORDS`/`COMMIT_READ_MODE`/`WR_COALESCE`/
-  `WR_COALESCE_WAIT`, threaded through `hyperram_avalon`.) Background — 2026-07-10 silicon falsified
-  the read-commit hypothesis: on the real device a CS#-closing write boundary permanently loses the
-  final `WR_REPLAY_WORDS` (=4) words of the closed segment as soon as the next memory-space WRITE CS#
-  opens; NO read-shaped interpose (SPAN_END or FULL_BURST commit-read) prevents it, so
-  `WR_COMMIT_READ` is now documented-ineffective for write→write streams (RTL kept for
-  read-terminated traffic). With `WR_CHOP_REPLAY=1` the controller keeps a `WR_REPLAY_WORDS`-deep
-  shadow of the last words+strobes sent in the current write CS# and reopens every intra-command chop
-  `min(WR_REPLAY_WORDS, words sent)` words early, sourcing those beats from the shadow (no extra
-  front-end data consumed) — re-writing exactly the words the device discards. Composition: replay
-  covers intra-command chop boundaries; command-level write→write boundaries remain `WR_COALESCE`'s
-  job. At a `BURST_BOUNDARY_WORDS` chop the replayed reopen deliberately starts before the boundary
-  (budget taken from the pre-rollback base). RESIDUAL (inherent device behavior): the FINAL segment's
-  last `WR_REPLAY_WORDS` words still pend at stream end — they are observably committed by any
-  subsequent covering host READ, and are lost for write-then-idle-forever workloads. The SIM model
-  `hyperram_model`'s `WR_COMMIT_QUIRK` is corrected to match silicon (non-frozen, sim-only): pending
-  words serve reads (buffer readback) but are NEVER flushed to the array by a read; the next
-  memory-space WRITE CS# discards them (array reads 0x0000 there). Regression: `sim/tb_commit.sv`
-  (idx 10/11 replay stacks; commit-read expectations flipped to the ineffective signature).
+- **v10 (2026-07-09/10):** `hyperbus_ctrl` gains an EXPERIMENTAL, default-off write-boundary family —
+  `WR_CHOP_REPLAY`/`WR_REPLAY_WORDS`/`WR_REPLAY_PEND`/`WR_REPLAY_ALIGN`/`WR_REPLAY_MASK_LEAD`
+  (rollback replay: reopen a chopped write early, optionally row-aligned and mask-led, re-sending
+  the tail from a shadow; also fires at contiguous write→write command accepts) and
+  `WR_CHOP_PAUSE_CYCLES`/`WR_CHOP_PAUSE_CK` (post-write CS#-High dwell, optionally with CK
+  toggling). **Defaulted parameters only; no frozen port name, direction, or width changed on any
+  module.** Replay params threaded (defaulted) through `hyperram_avalon` and `hyperram_axi`. (This
+  entry also records the previously-unlogged 2026-07-09 ctrl parameters `COMMIT_READ_WORDS`/
+  `COMMIT_READ_MODE`/`WR_COALESCE`/`WR_COALESCE_WAIT`.)
+  SILICON VERDICT (W957D8NBRA4I, 2026-07-09 read-only-probe ladder — the reason all of the above is
+  default-OFF): the long-standing "write-commit quirk" story (burst tail held pending, discarded by
+  the next write, committed by covering reads) is FALSE. Measured truth: (1) write-burst tails
+  COMMIT to the array fine; (2) **any memory-space WRITE CS# opening at word address B wounds the
+  array at [B-4, B)** — zeroed (B 8-aligned) or garbled (else) — standalone writes included, and no
+  rollback (E-A), CS#-High pause (E-B), CK-toggling dwell (E-C), or RWDS-masked lead-in (E-D)
+  suppresses it: rollback merely relocates the wound below the new base; (3) READ CAs do not wound;
+  (4) ROW WRAP: linear bursts must NEVER cross the device's 1024-word row — writes WRAP back to the
+  row start (LEN=1536 single-burst: word 0 read back gen(1024) — 512+ words aliased; the early
+  "≥1024 hits tCSM" and interim "refresh starvation" readings were THIS, and the historic
+  "releases the bus when a read crosses 16 KB" was this same law at coarser granularity, 0x2000
+  being a row multiple); no tCSM effect was observed in range (5.9 µs bursts otherwise clean), and
+  `WR_CHOP_PAUSE_CYCLES`/`_CK` turned out to have no beneficial role on this device;
+  (5) END-AT-ROW GARBLE: a write burst ENDING exactly on a 1024-word row multiple garbles its own
+  last 4 words (persistent, foreign values).
+  OPTIMAL LEGAL CONFIGURATION (silicon-exact): row-aligned segments — `MAX_BURST_WORDS=1024` =
+  `BURST_BOUNDARY_WORDS='h400` + `WR_COALESCE=1`. In-row transfers are loss-free (768/768: 341.1 W
+  / 332.3 R MB/s @175 MHz, ERR=0, 25-run soak); every row TRANSITION costs exactly 4 words at
+  [row·1024-4, row·1024) — the closing burst's end-garble and the next open's wound coincide
+  (measured: 1024→4, 1536→4, 2048→8, 4096/256→16, stable across read-only re-probes).
+  Consequences: `WR_COMMIT_READ` is documented-ineffective for write→write streams; the ONLY
+  wound-free shape is chop avoidance (`WR_COALESCE` + `MAX_BURST_WORDS` ≤ the tCSM ceiling); streams
+  longer than one CS# budget pay a deterministic 4-word wound at every chop point [C-4, C). The SIM
+  model `hyperram_model` is rewritten (non-frozen, sim-only) from pending/discard to wound
+  semantics: `WR_WOUND_WORDS` (wound on write-CA open), `WR_WOUND_MASK_SUPPRESS` (counterfactual
+  knob, silicon says 0), `WR_BOUNDARY_END_GARBLE`. Regression: `sim/tb_commit.sv` rewritten against
+  the wound model (no-fix / coalesce / plain-replay-relocation / mask-led / command-edge /
+  boundary-end stacks). The replay/pause machinery is retained default-off: it documents the
+  falsification trail in-code and may genuinely help OTHER HyperBus devices with true
+  pending-discard semantics.

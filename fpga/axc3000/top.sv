@@ -294,27 +294,40 @@ module top (
     .LEN_WIDTH         (16),
     .LATENCY_CLOCKS    (6),
     .FIXED_LATENCY     (1'b1),
-    .MAX_BURST_WORDS   (512),         // tCSM chop budget for coalesced streams (~2.9us @175, huge margin vs ~15us)
+    .MAX_BURST_WORDS   (1024),        // = one device ROW (2026-07-09 v4). The ramp's ">=1536 chaos"
+                                      //   decoded as ROW WRAP (word0 held gen(1024): linear bursts
+                                      //   wrap at the 1024-word row, they never cross it), and the
+                                      //   "1024 garbles its tail" is the end-at-row law, not tCSM.
+                                      //   Row-aligned full-row segments are the optimum: exactly 4
+                                      //   words lost per row transition (wound == end-garble zone).
     .PROGRAM_CR        (1'b1),
     .POR_DELAY_CYCLES  (0),
     .INIT_CR0          (16'h8F1F),
     // Silicon findings, now first-class controller features (wave-1 ctrl-cluster):
-    .BURST_BOUNDARY_WORDS (16'h2000),  // W957D8NB releases the bus when a burst crosses 16 KB
+    .BURST_BOUNDARY_WORDS (16'h0400),  // = the 1024-word device ROW (v4). The old 16 KB (0x2000)
+                                       //   finding was this row law at coarser granularity: reads
+                                       //   release the bus at a row crossing, writes WRAP to the
+                                       //   row start (aliasing corruption). Never cross a row.
     .WR_COMMIT_READ       (1'b0),      // 2026-07-10 silicon: read-shaped interposes NEVER commit a
                                        //   write->write pending tail (FULL_BURST included) — replay
                                        //   below is the working fix, and dropping the interpose also
                                        //   drops its whole-segment re-read cost at every split
     .WR_COALESCE          (1'b1),      // issue #1 direction 4: merge contiguous writes into one CS#
     .WR_COALESCE_WAIT     (8),
-    .WR_CHOP_REPLAY       (1'b0),      // EXPERIMENT E-B (2026-07-09): replay OFF. E-A proved rollback
-                                       //   cannot converge — the device zeroes/garbles the 4 words
-                                       //   BELOW any reopened write CA base (rb=4: [504..507] garbage;
-                                       //   rb=8: [500..503] zeros — the kill zone tracks the base).
-    .WR_REPLAY_WORDS      (8),
-    .WR_CHOP_PAUSE_CYCLES (512),       // E-B RESULT: pause alone does NOT help (4 zeros per chop
-                                       //   unchanged at 2.9 us) — time-based self-commit is dead.
-    .WR_CHOP_PAUSE_CK     (1'b1),      // EXPERIMENT E-C: same dwell with CK TOGGLING (CS# High,
-                                       //   spec-legal) — is the pending-tail merge CK-clocked?
+    .WR_CHOP_REPLAY       (1'b0),      // E-D VERDICT (2026-07-09): mask-lead does NOT suppress the
+                                       //   below-base wound (errors moved to [B-4,B)=[500..503],
+                                       //   mask or no mask). ANY write CS# opening adjacent-above
+                                       //   committed data destroys the 4 words below its CA base —
+                                       //   unsuppressible (rollback/mask/pause/CK all falsified),
+                                       //   reads safe, tails commit fine. Replay machinery parked
+                                       //   default-off; the endgame is chop AVOIDANCE (coalesce +
+                                       //   the largest clean single-CS# budget) + documentation.
+    .WR_CHOP_PAUSE_CYCLES (0),         // OFF (v5). The interim "refresh slot" theory was a row-law
+                                       //   misattribution: the 804-error signature was ROW-WRAP
+                                       //   aliasing, and 512-budget builds passed W2 at pure wound
+                                       //   arithmetic with pause=0 too. The dwell only costs read
+                                       //   throughput (final-close delay lands in the read window).
+    .WR_CHOP_PAUSE_CK     (1'b0),
     .WR_LAT_TRIM          (3)          // silicon-measured: device write window opens 3 CK early
   ) u_ctrl (
     .clk            (clk),

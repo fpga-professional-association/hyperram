@@ -35,7 +35,12 @@ module hyperram_axi
   parameter bit          WR_CHOP_REPLAY    = 1'b0,                       // re-send the last words at
                                                                          //   intra-command write chops
                                                                          //   (issue #1 direction 5)
-  parameter int unsigned WR_REPLAY_WORDS   = 4,                          // replay depth (= device
+  parameter int unsigned WR_REPLAY_WORDS   = 4,
+  parameter int unsigned WR_REPLAY_PEND    = 4,                          // device pending depth (align floor)
+  parameter int unsigned WR_REPLAY_ALIGN   = 0,                          // row-aligned rollback (0 = legacy)
+  parameter int unsigned WR_REPLAY_MASK_LEAD = 0,                        // masked lead-in beats on reopen
+  parameter int unsigned WR_CHOP_PAUSE_CYCLES = 0,                       // post-write CS#-High dwell
+  parameter bit          WR_CHOP_PAUSE_CK  = 1'b0,                       // CK toggling through the dwell                          // replay depth (= device
                                                                          //   pending depth; W957D8NB: 4)
   parameter bit          PROGRAM_CR        = 1'b1,                       // program CR0 at init
   parameter int unsigned POR_DELAY_CYCLES  = 0,                         // POR init delay (sim: 0)
@@ -253,6 +258,11 @@ module hyperram_axi
     .WR_COMMIT_READ    (WR_COMMIT_READ),
     .WR_CHOP_REPLAY    (WR_CHOP_REPLAY),
     .WR_REPLAY_WORDS   (WR_REPLAY_WORDS),
+    .WR_REPLAY_PEND    (WR_REPLAY_PEND),
+    .WR_REPLAY_ALIGN   (WR_REPLAY_ALIGN),
+    .WR_REPLAY_MASK_LEAD (WR_REPLAY_MASK_LEAD),
+    .WR_CHOP_PAUSE_CYCLES (WR_CHOP_PAUSE_CYCLES),
+    .WR_CHOP_PAUSE_CK  (WR_CHOP_PAUSE_CK),
     .PROGRAM_CR        (PROGRAM_CR),
     .POR_DELAY_CYCLES  (POR_DELAY_CYCLES),
     .INIT_LATENCY_CODE (INIT_LATENCY_CODE),

@@ -52,11 +52,11 @@ in `qsys/make_bw_sys.tcl` (currently **175.0**).
 | Parameter | Value | Why |
 |-----------|-------|-----|
 | `LATENCY_CLOCKS` | 6 | CR0-programmed initial latency |
-| `MAX_BURST_WORDS` | 512 | tCSM chop budget (~2.9 µs @175 vs ~15 µs limit) |
-| `BURST_BOUNDARY_WORDS` | 0x2000 | device releases the bus when a burst crosses 16 KB |
-| `WR_COALESCE` / `WR_COALESCE_WAIT` | 1 / 8 | splice contiguous write commands into one CS# burst (issue #1) |
-| `WR_CHOP_REPLAY` / `WR_REPLAY_WORDS` | 1 / 4 | re-send the 4-word tail the device drops at every forced chop (issue #1) |
-| `WR_COMMIT_READ` | 0 | silicon-proven ineffective for write→write; replay supersedes |
+| `MAX_BURST_WORDS` | 1024 | = one device ROW. Segments never cross a row and are row-aligned after the first transition |
+| `BURST_BOUNDARY_WORDS` | 0x400 | the 1024-word row law: writes WRAP to the row start if a burst crosses (aliasing corruption), reads release the bus — the historic "16 KB boundary" was this law at coarser granularity |
+| `WR_COALESCE` / `WR_COALESCE_WAIT` | 1 / 8 | splice contiguous write commands into one CS# burst — chop avoidance is the only wound-free shape (issue #1) |
+| `WR_CHOP_REPLAY` (+ mask-lead/pause family) | 0 | parked: silicon falsified every wound heal/suppress strategy, and the interim "refresh slot" pause theory was a row-law misattribution (see below) |
+| `WR_COMMIT_READ` | 0 | silicon-proven ineffective for write→write |
 | `WR_LAT_TRIM` | 3 | measured: device write window opens 3 CK after the spec-anchored point |
 | `u_bw CAL_RESET` | 0x2 | REG_CAL POR seed (preamble_skip=1); readback-only on this build — the DDIO runtime cal paths are issue-#3-gated |
 
@@ -132,12 +132,13 @@ the first-error CSRs (`0x20` addr / `0x24` got / `0x28` expected — the offset 
 
 ## Measured on hardware (W957D8NBRA4I)
 
-**Clean, integrity-verified ceiling — 175 MHz CK, DDR x8** (LEN=768, single coalesced burst,
-`ERR_COUNT=0`):
+**Clean, integrity-verified ceiling — 175 MHz CK, DDR x8** (final row-aligned build,
+`ERR_COUNT=0`, 25-run soak clean; bitstream: `bitstreams/ddio_row_175_final.sof`):
 
-| hb_ck | WRITE MB/s | READ MB/s | notes |
-|-------|-----------:|----------:|-------|
-| **175 MHz** | **344.7** | **337.3** | FABRIC2X CK; ceiling set by the 2× clock's ~353 MHz min-pulse limit (~176 MHz CK max) |
+| hb_ck | shape | WRITE MB/s | READ MB/s | notes |
+|-------|-------|-----------:|----------:|-------|
+| **175 MHz** | LEN=768 (in-row) | **341.1** | **332.3** | ERR=0; FABRIC2X CK; ceiling set by the 2× clock's ~353 MHz min-pulse limit (~176 MHz CK max) |
+| 175 MHz | LEN=1024 (full row) | 343.3 | 337.8 | best pacing; costs the deterministic 4-word row-end garble |
 
 - **200 MHz**: everything the FPGA controls is proven — fit + static timing (Fmax 210 MHz), CA
   decode, reads pace 383.5 MB/s / writes 389.9 MB/s — but data integrity degrades with a
@@ -145,11 +146,30 @@ the first-error CSRs (`0x20` addr / `0x24` got / `0x28` expected — the offset 
   every 1× CK generator shows it, FABRIC2X doesn't, and the board wires CK **single-ended** on a
   1.2 V-class device (Infineon guidance specifies differential CK/CK# for this class). Formally
   roadmapped in issue #12 (250 MHz needs a dedicated differential PLL clock-output pair).
-- **Multi-burst writes**: the W957D8NB discards the last 4 words of a write burst when the next
-  command is also a write (issue #1). Fixed in the controller: `WR_COALESCE` splices contiguous
-  write commands into one CS# burst, and `WR_CHOP_REPLAY` re-sends the 4-word tail at every
-  forced chop (tCSM / 16 KB boundary). Residual, inherent to the device: a stream that ends
-  write-then-idle-forever leaves its final 4 words uncommitted unless any covering read follows.
+- **Multi-burst writes — the 2026-07-09 silicon verdict (issue #1)**: the old "pending tail
+  discarded by the next write" story is FALSE (read-only probes: burst tails commit fine). The
+  real defect: **any write CS# opening at word address B wounds the array at [B-4, B)** — 4 words
+  zeroed/garbled below the new CA base, standalone writes included. Reads never wound. No remedy
+  works: rollback replay just relocates the wound below the new base (E-A/E-D), CS#-High pauses
+  and CK-toggling dwells do nothing (E-B/E-C), RWDS-masked lead-ins do not suppress it (E-D). The
+  shipped configuration therefore AVOIDS mid-row chops entirely with ROW-ALIGNED segments
+  (`WR_COALESCE` + `MAX_BURST_WORDS=1024` = `BURST_BOUNDARY_WORDS=0x400` = the device row). TWO
+  companion laws complete the picture: (2) **row wrap** — a linear burst must never cross the
+  1024-word row (writes wrap back to the row start: LEN=1536 single-burst read back gen(1024) at
+  word 0, i.e. 512+ aliased words; reads release the bus — the historic "16 KB" finding, 0x2000
+  being a row multiple); (3) **end-at-row garble** — a burst ending exactly ON a row multiple
+  garbles its own last 4 words (this, not tCSM, is why "1024 fails"; there is no tCSM effect in
+  range — 5.9 µs bursts are otherwise clean, and an interim "refresh slot" pause theory was a
+  misattribution of the row-wrap signature). NET COST, exactly predictive on silicon: transfers
+  inside one row are loss-free; every row TRANSITION costs exactly 4 known words
+  ([row·1024−4, row·1024)) — the closing burst's end-garble and the next open's wound land on the
+  same 4. Measured: 768→0, 1024→4, 1536→4 (was 520 pre-row-alignment), 2048→8, 4096/256→16 (was
+  804), 16 KB-crosser→4, all first-error addresses at row edges, stable across read-only
+  re-probes. Hosts that cannot tolerate the 4-word row-transition loss must keep write
+  transactions within a single 1024-word row. The full experiment trail lives in
+  the `WR_CHOP_REPLAY`/`WR_CHOP_PAUSE_*` parameter notes in `rtl/hyperbus_ctrl.sv` and
+  `docs/INTERFACES.md` v10 — the machinery is retained default-off for devices with true
+  pending-discard semantics.
 - Diagnostic CSRs: burst size (`0x2C` write / `0x30` read), first-error triplet
   (`0x20/0x24/0x28`), live read-eye cal (`0x34`, issue #10).
 

@@ -1,89 +1,102 @@
-// tb_commit — regression for the W957D8NB SPLIT-WRITE commit quirk (issue #1), the 0x2000-word
-// boundary-release quirk, the independent read-burst-size CSR (issue #2), the WR_PENDING_WORDS=4
-// remedy iteration (2026-07-09: CS#-coalescing / FULL_BURST commit-read), and the 2026-07-10
-// WR_CHOP_REPLAY fix. It drives the EXACT board stack — bench engine (hyperram_bw_test) ->
-// hyperram_avalon (SDR PHY, RD_PREAMBLE_SKIP=1) -> golden model — the model reproduces the device
-// quirks (WR_COMMIT_QUIRK, BURST_BOUNDARY_WORDS) and the controller mitigates them.
+// tb_commit — regression for the W957D8NB WRITE-CA "wound" (2026-07-09 silicon ladder), the
+// end-of-burst 0x2000-word garble (finding 5), the independent 0x2000-word bus-release boundary
+// quirk (issue #2 legacy), and the independent read-burst-size CSR (issue #2). It drives the EXACT
+// board stack — bench engine (hyperram_bw_test) -> hyperbus_avalon (front-end) -> hyperbus_ctrl
+// (protocol engine) -> hyperbus_phy (SDR PHY, RD_PREAMBLE_SKIP=1) -> golden model — the model
+// reproduces the device quirks and the controller mitigates them.
 //
-// 2026-07-10 SILICON CORRECTION: the model's old covering-read-commits trigger is FALSIFIED — on
-// the real device NO read-shaped interpose preserves the pending words when another WRITE follows
-// (pend serves reads but is discarded by the next memory-write CS#; see hyperram_model's
-// WR_COMMIT_QUIRK note). Consequently every commit-read PASS expectation below flipped to the
-// no-fix signature (the mode is documented-ineffective for write->write; RTL kept), and the
-// working chop-boundary remedy is WR_CHOP_REPLAY (re-send the dropped words).
+// 2026-07-09 SILICON LADDER OVERTURNED THE OLD MODEL. Proven with read-only probes (write region A;
+// write elsewhere; read A back WITHOUT rewriting):
+//   1. The old WR_COMMIT_QUIRK story (a write burst's tail is held pending, discarded by the next
+//      write CS#, servable to reads from a buffer) is FALSE. Write-burst tails COMMIT to the array
+//      fine: [508..511] of a 512-word burst read back intact after 3 later writes elsewhere.
+//   2. The REAL defect: ANY memory-space WRITE CS# that opens at word address B WOUNDS the array at
+//      [B-4, B) — the 4 words immediately below its CA base are zeroed. Proven standalone: a plain
+//      16-word write at 0x100 zeroed [0xFC..0xFF]. B at the very start of never-written space is
+//      harmless (nothing there).
+//   3. READ CAs do NOT wound (a read CA at 0x100 mid-seeded-region left [0xFC..0xFF] intact).
+//   4. Wall-time pauses and CK-toggling dwells after write close change nothing (not exercised here;
+//      see hyperbus_ctrl's WR_CHOP_PAUSE_CYCLES/_CK).
+//   5. A separate, rarer defect: a write burst whose END lands exactly ON a 0x2000-word (16KB)
+//      boundary garbles its own last 4 words persistently (got=0x5050 style).
+//   6. The E-D hypothesis (does a fully-RWDS-masked lead beat SUPPRESS the wound?) is modeled as a
+//      knob (WR_WOUND_MASK_SUPPRESS) rather than hardwired either way, since silicon status varied
+//      during the investigation; this TB exercises the controller's mask-led replay
+//      (WR_CHOP_REPLAY/WR_REPLAY_WORDS/WR_REPLAY_MASK_LEAD, including the ST_IDLE contiguous-write
+//      replay-accept path for command-edge boundaries) against BOTH model settings.
 //
-// Twelve independent stacks (each = engine + controller + model, differing only in the DUT/model
-// parameters below) let one testbench prove every direction at once:
+// See hyperram_model's WR_WOUND_WORDS / WR_WOUND_MASK_SUPPRESS / WR_BOUNDARY_END_GARBLE parameter
+// comments for the model side, and hyperbus_ctrl's WR_CHOP_REPLAY / WR_COALESCE parameter comments
+// for the controller side. WR_COMMIT_QUIRK / WR_PENDING_WORDS / WR_COMMIT_READ are retired from this
+// TB (the story they modeled is falsified); the model keeps the first two as accepted-but-ignored
+// no-ops so any stale instantiation elsewhere still elaborates.
 //
-//   idx  DUT WR_COMMIT_READ  DUT boundary  DUT maxburst  DUT COALESCE  DUT REPLAY  model WR_QUIRK  model boundary  model OS  model PEND  proves
-//   ---  -----------------  ------------  ------------  ------------  ----------  -------------  --------------  --------  ----------  ----------------
-//    0        0 (off)            0             0             0            0           1 (on)          0             0          1        commit quirk: n-1
-//    1        1 (on)             0             0             0            0           1 (on)          0             0          1        commit-read ineffective: n-1
-//    2        0                  0             0             0            0           0               0x2000        0          1        boundary: FAIL
-//    3        0                  0x2000        0             0            0           0               0x2000        0          1        boundary: PASS
-//    4        1                  0x2000        0             0            0           1               0x2000        0          1        compose: commit-read ineffective: 1
-//    5        0                  0             0             0            0           0               0              9          1        read-split: PASS
-//    6        0                  0             0             1            0           1               0              0          4        depth4 COALESCE: PASS (0)
-//    7        1 (SPAN_END)       0             0             0            0           1               0              0          4        depth4 SPAN_END: 4*(n-1)
-//    8        0                  0             0             0            0           1               0              0          4        depth4 nofix: 4*(n-1)
-//    9*       1 (FULL_BURST)     0             0             0            0           1               0              0          4        depth4 FULL_BURST ineffective: 4*(n-1)
-//   10*       0                  0x2000        64            1            1           1               0              0          4        depth4 chop REPLAY: PASS (0)
-//   11*       0                  0x2000        64            1            0           1               0              0          4        depth4 chop no-replay: 4-per-chop
-//   * idx 9/10/11 are standalone instances below (not generate-for-driven: idx 9 needs a
-//     string-typed COMMIT_READ_MODE="FULL_BURST" literal; 10/11 keep the generate arrays intact).
+// Eleven independent stacks (each = bench engine + front-end + ctrl + PHY + model, differing only in
+// the DUT/model parameters below) let one testbench prove every direction at once:
 //
-//   - idx 0 reproduces the silicon signature ERR_COUNT == n_write_bursts-1 for a split multi-burst
-//     write (LEN=32/burst16 ->1, LEN=64/16 ->3, LEN=256/64 ->3); idx 1 is the SAME sweep with the
-//     commit-read interpose on -> the SAME n-1 signature (2026-07-10: a read between two writes
-//     commits nothing on silicon; the corrected model reproduces that).
-//   - idx 2/3: a single burst crossing a 0x2000-word boundary. With the DUT boundary chop OFF (2) the
-//     boundary-release model corrupts the read-back (ERR>0, proving the model models it); with the
-//     chop ON (3) the controller never crosses the boundary -> ERR_COUNT=0.
-//   - idx 4: boundary chop + commit-read at the chop: the chop itself is fixed but the interposed
-//     commit-read does NOT save the chopped segment's pending tail word -> ERR=1 (the old model
-//     wrongly showed 0 here).
-//   - idx 5: write a single (correct) burst, split the READ into many via REG_RBURSTW, against a clean
-//     model that over-streams like the silicon -> ERR_COUNT=0 (isolates the multi-burst READ path).
-//   - idx 6/7/8/9 (2026-07-09 silicon: the real W957D8NB holds FOUR pending words, not one) re-run the
-//     SAME split-write sweep at WR_PENDING_WORDS=4: idx 8 (no fix), idx 7 (SPAN_END) and — with the
-//     corrected model — also idx 9 (FULL_BURST, falsified on 2026-07-10 silicon) all reproduce
-//     ERR = 4*(n_bursts-1); only idx 6 (WR_COALESCE: no CS# boundary at all) restores ERR_COUNT=0
-//     among the pre-replay remedies.
-//   - idx 10/11 (WR_CHOP_REPLAY, 2026-07-10): forced intra-command chops (MAX_BURST_WORDS=64, plus a
-//     BURST_BOUNDARY-crossing case) with WR_COALESCE=1 against the depth-4 model. With replay ON
-//     every chop reopens 4 words early and re-sends the words the device drops -> ERR=0 for a
-//     chopped single command (LEN=768/wburst=768), a coalesced+chopped multi-command stream
-//     (LEN=4096/wburst=256), and a boundary-crossing write; replay OFF (idx 11) reproduces the
-//     4-per-chop signature (44 for the 11-chop LEN=768 case, 4 for the single boundary chop).
+//   idx  name              DUT MAXBURST  DUT COALESCE  DUT REPLAY  DUT MASK_LEAD  model WOUND  model SUPPRESS  proves
+//   ---  ----------------  ------------  ------------  ----------  -------------  -----------  ---------------  -------------------------------
+//    0   nofix                  64            0             0            0             4              0        no-fix chop: 4 err/chop at [C-4,C)
+//    1   coalesce                0            1             0            0             4              0        single CS#, no reopens: ERR=0
+//    2   replay_plain            64            0             1            0             4              0        plain rollback replay: errors MOVE to [C-8,C-4)
+//    3   masklead_pass           64            0             1            4             4              1        mask-led + model-suppress: ERR=0 (heals fully)
+//    4   masklead_cmdedge      512            1             1            4             4              1        SAME, but forces the coalesce-budget-at-
+//                                                                                                                command-edge boundary -> exercises the NEW
+//                                                                                                                ST_IDLE acc_elig replay-accept path: ERR=0
+//    5   masklead_nosuppress     64            0             1            4             4              0        mask-led, model does NOT suppress: 4 err/chop
+//                                                                                                                at [C-12,C-8) (the wound walks below the lead)
+//    6   cmdedge_noreplay      512            1             0            0             4              0        idx4's DUT shape with replay OFF: 4 err per
+//                                                                                                                command-edge boundary at [C-4,C) (proves the
+//                                                                                                                acc-leg is what fixes it)
+//    7   boundary_garble          0            0             0            0             0 (bnd=0)     -        WR_BOUNDARY_END_GARBLE=1, a burst ending
+//                                                                                                                exactly at 0x2000: its own last 4 garbled
+//    8   bndrel_off               -            -             -            -             0 (bnd=8192)  -        0x2000-word bus-release quirk, DUT chop OFF:
+//                                                                                                                ERR>0 (model boundary-release engages)
+//    9   bndrel_on                -            -             -            -             0 (bnd=8192)  -        SAME, DUT chop ON: ERR=0 (never crosses)
+//   10   readsplit                -            -             -            -             0             -        write one correct burst, split the READ via
+//                                                                                                                REG_RBURSTW: ERR=0 (isolates multi-burst READ)
+//
+// idx0/2/3/5 reuse a single-command LEN chosen so MAX_BURST_WORDS=64 chops land on a clean word count
+// under each mechanism (verified against an independent Python re-simulation of the controller's
+// seg_size/coalesce/replay arithmetic before being hard-coded here — see the per-test comments below
+// for the exact chop-count derivation). idx4/6 use LEN=4096/wburst=256 with MAX_BURST_WORDS=512 (an
+// exact multiple of wburst=256) so the coalescing budget exhausts EXACTLY at a command edge every
+// other command — the only way to exercise the ST_IDLE acc_elig path (as opposed to the ST_RECOVER
+// intra-command chop path idx0/2/3/5 exercise) without an intra-command MAX_BURST chop ever
+// triggering.
 //
 // Every poll loop is BOUNDED, so a hang shows up as a FAIL (bounded timeout) not an infinite loop.
 // Runs under: verilator --binary --timing (5.020).
 `timescale 1ns/1ps
 
 // ---------------------------------------------------------------------------------------------------
-// One complete board stack: bench engine (Avalon master + CSR slave) -> hyperram_avalon (SDR PHY) ->
-// golden device model, with the shared DQ/RWDS bus resolved and a round-trip flight delay, exactly as
-// sim/tb_multiburst.sv wires it. The CSR slave is hoisted to the top so the testbench can drive it.
+// One complete board stack: bench engine (Avalon master + CSR slave) -> hyperbus_avalon (front-end)
+// -> hyperbus_ctrl (protocol engine) -> hyperbus_phy (SDR PHY) -> golden device model, with the
+// shared DQ/RWDS bus resolved and a round-trip flight delay, exactly as sim/tb_multiburst.sv wires
+// hyperram_avalon. This TB direct-instantiates the three hyperram_avalon sub-blocks (rather than
+// going through hyperram_avalon itself, which is a pure structural wrapper around exactly these
+// three, per its own header) so it can reach hyperbus_ctrl's WR_REPLAY_MASK_LEAD parameter, which
+// hyperram_avalon does not yet forward. The CSR slave is hoisted to the top so the testbench can
+// drive it.
 // ---------------------------------------------------------------------------------------------------
 module commit_stack
   import hyperbus_pkg::*;
 #(
     parameter int unsigned CSR_ADDR_WIDTH = 4,
-    parameter bit          WR_COMMIT_READ = 1'b0,   // DUT: interpose commit-read after split writes
-    parameter int unsigned DUT_BOUNDARY   = 0,      // DUT: chop at this WORD boundary (0 = off)
-    parameter bit          MDL_WR_QUIRK   = 1'b0,   // model: split-write commit quirk
-    parameter int unsigned MDL_BOUNDARY   = 0,      // model: 0x2000-word boundary release quirk
-    parameter int unsigned MDL_OS         = 0,      // model: read over-stream words
-    // -- issue #1 remedy A/B iteration (2026-07-09 silicon: WR_PENDING_WORDS=4 on the real device) --
-    parameter bit          WR_COALESCE      = 1'b0, // DUT: CS#-coalescing (direction 4)
-    parameter int unsigned WR_COALESCE_WAIT = 8,     // DUT: cycles to await a splice command
-    parameter              COMMIT_READ_MODE = "SPAN_END",  // DUT: SPAN_END|FULL_BURST|NEXT_ROW
-    parameter int unsigned COMMIT_READ_WORDS= 4,     // DUT: fixed-shape commit-read length
-    parameter int unsigned MDL_PEND_WORDS   = 1,     // model: pending-write delay-line depth
-    // -- issue #1 direction 5 (2026-07-10 silicon: replay is the chop-boundary fix) --
-    parameter int unsigned DUT_MAXBURST     = 0,     // DUT: MAX_BURST_WORDS tCSM chop (0 = off)
-    parameter bit          WR_CHOP_REPLAY   = 1'b0,  // DUT: re-send the dropped words at write chops
-    parameter int unsigned WR_REPLAY_WORDS  = 4      // DUT: replay depth (= device pending depth)
+    // -- DUT (hyperbus_ctrl) chop / remedy knobs (all default OFF = a single unbounded CS#) --
+    parameter int unsigned DUT_BOUNDARY        = 0,      // BURST_BOUNDARY_WORDS (0x2000-word chop)
+    parameter int unsigned DUT_MAXBURST        = 0,      // MAX_BURST_WORDS (tCSM chop)
+    parameter bit          WR_COALESCE         = 1'b0,
+    parameter int unsigned WR_COALESCE_WAIT    = 8,
+    parameter bit          WR_CHOP_REPLAY      = 1'b0,
+    parameter int unsigned WR_REPLAY_WORDS     = 4,
+    parameter int unsigned WR_REPLAY_MASK_LEAD = 0,
+    // -- golden model (hyperram_model) W957D8NB quirk knobs (all default OFF = ideal device) --
+    parameter int unsigned MDL_WOUND_WORDS     = 0,
+    parameter bit          MDL_WOUND_SUPPRESS  = 1'b0,
+    parameter bit          MDL_BOUNDARY_GARBLE = 1'b0,
+    parameter int unsigned MDL_BOUNDARY        = 0,      // model BURST_BOUNDARY_WORDS (bus-release quirk)
+    parameter int unsigned MDL_OS              = 0       // model RD_OVERSTREAM_WORDS
 ) (
     input  logic                        clk,
     input  logic                        clk90,
@@ -108,17 +121,17 @@ module commit_stack
 
   // HyperBus device pins + split-driver resolution (single active driver at a time).
   logic                 hb_ck, hb_ck_n, hb_cs_n, hb_rst_n;
-  logic [DQ_WIDTH-1:0]  phy_dq_o;   logic phy_dq_oe;
-  logic                 phy_rwds_o; logic phy_rwds_oe;
-  logic [DQ_WIDTH-1:0]  mdl_dq_o;   logic mdl_dq_oe;
+  logic [DQ_WIDTH-1:0]  pin_dq_o;   logic pin_dq_oe;    // PHY's drive onto the shared device bus
+  logic                 pin_rwds_o; logic pin_rwds_oe;
+  logic [DQ_WIDTH-1:0]  mdl_dq_o;   logic mdl_dq_oe;    // model's drive onto the shared device bus
   logic                 mdl_rwds_o; logic mdl_rwds_oe;
-  wire [DQ_WIDTH-1:0] dq_line   = mdl_dq_oe   ? mdl_dq_o   : (phy_dq_oe   ? phy_dq_o   : '0);
-  wire                rwds_line = mdl_rwds_oe ? mdl_rwds_o : (phy_rwds_oe ? phy_rwds_o : 1'b0);
+  wire [DQ_WIDTH-1:0] dq_line   = mdl_dq_oe   ? mdl_dq_o   : (pin_dq_oe   ? pin_dq_o   : '0);
+  wire                rwds_line = mdl_rwds_oe ? mdl_rwds_o : (pin_rwds_oe ? pin_rwds_o : 1'b0);
   localparam realtime RTT = 3.0;    // ns device->master flight delay
   wire [DQ_WIDTH-1:0] dq_line_dly;   assign #RTT dq_line_dly   = dq_line;
   wire                rwds_line_dly; assign #RTT rwds_line_dly = rwds_line;
 
-  // Avalon-MM link: bench master <-> hyperram_avalon slave.
+  // Avalon-MM link: bench master <-> the front-end (hyperbus_avalon).
   logic [ADDR_WIDTH-1:0] av_address;
   logic [LEN_WIDTH-1:0]  av_burstcount;
   logic                  av_read, av_write;
@@ -139,61 +152,119 @@ module commit_stack
     .m_address (av_address), .m_burstcount (av_burstcount), .m_read (av_read), .m_write (av_write),
     .m_writedata (av_writedata), .m_readdata (av_readdata),
     .m_readdatavalid (av_readdatavalid), .m_waitrequest (av_waitrequest),
-    // REG_CAL outputs unused here — u_hyperram's cal is tied to constants below (empty = PINCONNECTEMPTY)
+    // REG_CAL outputs unused here — the PHY's cal is tied to constants below (empty = PINCONNECTEMPTY)
     .cal_capture_phase (), .cal_preamble_skip (), .cal_rx_tap (), .cal_pair_skew ()
   );
 
-  hyperram_avalon #(
-    .DQ_WIDTH         (DQ_WIDTH),
-    .DATA_WIDTH       (DATA_WIDTH),
-    .ADDR_WIDTH       (ADDR_WIDTH),
-    .LEN_WIDTH        (LEN_WIDTH),
-    .LATENCY_CLOCKS   (6),
-    .FIXED_LATENCY    (1'b1),
-    .MAX_BURST_WORDS  (DUT_MAXBURST),
-    .BURST_BOUNDARY_WORDS (DUT_BOUNDARY),
-    .WR_COMMIT_READ   (WR_COMMIT_READ),
-    .COMMIT_READ_WORDS(COMMIT_READ_WORDS),
-    .COMMIT_READ_MODE (COMMIT_READ_MODE),
-    .WR_COALESCE      (WR_COALESCE),
-    .WR_COALESCE_WAIT (WR_COALESCE_WAIT),
-    .WR_CHOP_REPLAY   (WR_CHOP_REPLAY),
-    .WR_REPLAY_WORDS  (WR_REPLAY_WORDS),
-    .PROGRAM_CR       (1'b1),
-    .POR_DELAY_CYCLES (0),
-    .INIT_CR0         (TB_INIT_CR0),
-    .PHY_VARIANT      ("SDR"),
-    .DIFF_CK          (1'b0),
-    .RD_PREAMBLE_SKIP (1)
-  ) u_hyperram (
-    .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
-    // cal tied to constants reproducing RD_PREAMBLE_SKIP=1 (board setting; preamble edge discarded)
-    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd1), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
+  // -------------------------------------------------------------------------
+  // Front-end: Avalon-MM slave -> native master.
+  // -------------------------------------------------------------------------
+  logic                    cmd_valid, cmd_ready, cmd_read, cmd_reg, cmd_wrap;
+  logic [ADDR_WIDTH-1:0]   cmd_addr;
+  logic [LEN_WIDTH-1:0]    cmd_len;
+  logic                    wr_valid, wr_ready;
+  logic [DATA_WIDTH-1:0]   wr_data;
+  logic [DATA_WIDTH/8-1:0] wr_strb;
+  logic                    wr_last;
+  logic                    rd_valid, rd_ready;
+  logic [DATA_WIDTH-1:0]   rd_data;
+  logic                    rd_last;
+
+  hyperbus_avalon #(
+    .DQ_WIDTH (DQ_WIDTH), .DATA_WIDTH (DATA_WIDTH), .ADDR_WIDTH (ADDR_WIDTH), .LEN_WIDTH (LEN_WIDTH)
+  ) u_avalon (
+    .clk (clk), .rst (rst),
     .avs_address (av_address), .avs_read (av_read), .avs_write (av_write),
     .avs_writedata (av_writedata), .avs_byteenable (2'b11), .avs_burstcount (av_burstcount),
     .avs_readdata (av_readdata), .avs_readdatavalid (av_readdatavalid), .avs_waitrequest (av_waitrequest),
+    .cmd_valid (cmd_valid), .cmd_ready (cmd_ready), .cmd_read (cmd_read), .cmd_reg (cmd_reg),
+    .cmd_wrap (cmd_wrap), .cmd_addr (cmd_addr), .cmd_len (cmd_len),
+    .wr_valid (wr_valid), .wr_ready (wr_ready), .wr_data (wr_data), .wr_strb (wr_strb), .wr_last (wr_last),
+    .rd_valid (rd_valid), .rd_ready (rd_ready), .rd_data (rd_data), .rd_last (rd_last),
+    .dbg_state ()
+  );
+
+  // -------------------------------------------------------------------------
+  // Protocol engine: native slave <-> PHY master. Direct-instantiated (see module header) so
+  // WR_REPLAY_MASK_LEAD is reachable; every other parameter mirrors the board / hyperram_avalon
+  // defaults used by the rest of the suite.
+  // -------------------------------------------------------------------------
+  logic                    phy_cs_n, phy_rst_n, phy_ck_en;
+  logic [DATA_WIDTH-1:0]   phy_dq_o;
+  logic                    phy_dq_oe;
+  logic [1:0]              phy_rwds_o;
+  logic                    phy_rwds_oe;
+  logic                    phy_rd_arm;
+  logic [DATA_WIDTH-1:0]   phy_dq_i;
+  logic                    phy_dq_i_valid;
+  logic                    phy_rwds_i;
+
+  hyperbus_ctrl #(
+    .DQ_WIDTH             (DQ_WIDTH),
+    .DATA_WIDTH           (DATA_WIDTH),
+    .ADDR_WIDTH           (ADDR_WIDTH),
+    .LEN_WIDTH            (LEN_WIDTH),
+    .LATENCY_CLOCKS       (6),
+    .FIXED_LATENCY        (1'b1),
+    .MAX_BURST_WORDS      (DUT_MAXBURST),
+    .BURST_BOUNDARY_WORDS (DUT_BOUNDARY),
+    .WR_COALESCE          (WR_COALESCE),
+    .WR_COALESCE_WAIT     (WR_COALESCE_WAIT),
+    .WR_CHOP_REPLAY       (WR_CHOP_REPLAY),
+    .WR_REPLAY_WORDS      (WR_REPLAY_WORDS),
+    .WR_REPLAY_MASK_LEAD  (WR_REPLAY_MASK_LEAD),
+    .PROGRAM_CR           (1'b1),
+    .POR_DELAY_CYCLES     (0),
+    .INIT_CR0             (TB_INIT_CR0)
+  ) u_ctrl (
+    .clk (clk), .rst (rst),
+    .cmd_valid (cmd_valid), .cmd_ready (cmd_ready), .cmd_read (cmd_read), .cmd_reg (cmd_reg),
+    .cmd_wrap (cmd_wrap), .cmd_addr (cmd_addr), .cmd_len (cmd_len),
+    .wr_valid (wr_valid), .wr_ready (wr_ready), .wr_data (wr_data), .wr_strb (wr_strb), .wr_last (wr_last),
+    .rd_valid (rd_valid), .rd_ready (rd_ready), .rd_data (rd_data), .rd_last (rd_last),
+    .busy (), .init_done (init_done), .err_underrun (), .err_timeout (),
+    .phy_cs_n (phy_cs_n), .phy_rst_n (phy_rst_n), .phy_ck_en (phy_ck_en),
+    .phy_dq_o (phy_dq_o), .phy_dq_oe (phy_dq_oe), .phy_rwds_o (phy_rwds_o), .phy_rwds_oe (phy_rwds_oe),
+    .phy_rd_arm (phy_rd_arm),
+    .phy_dq_i (phy_dq_i), .phy_dq_i_valid (phy_dq_i_valid), .phy_rwds_i (phy_rwds_i),
+    .dbg_state (), .dbg_rd_wptr (), .dbg_rd_rptr ()
+  );
+
+  // -------------------------------------------------------------------------
+  // PHY: DDR SERDES + I/O (SDR variant, matches the board / RD_PREAMBLE_SKIP=1 setting).
+  // -------------------------------------------------------------------------
+  hyperbus_phy #(
+    .DQ_WIDTH (DQ_WIDTH), .DATA_WIDTH (DATA_WIDTH), .ADDR_WIDTH (ADDR_WIDTH), .LEN_WIDTH (LEN_WIDTH),
+    .PHY_VARIANT ("SDR"), .DIFF_CK (1'b0), .RD_PREAMBLE_SKIP (1)
+  ) u_phy (
+    .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    .cal_capture_phase (1'b0), .cal_preamble_skip (3'd1), .cal_rx_tap (5'd0), .cal_pair_skew (1'b0),
+    .phy_cs_n (phy_cs_n), .phy_rst_n (phy_rst_n), .phy_ck_en (phy_ck_en),
+    .phy_dq_o (phy_dq_o), .phy_dq_oe (phy_dq_oe), .phy_rwds_o (phy_rwds_o), .phy_rwds_oe (phy_rwds_oe),
+    .phy_rd_arm (phy_rd_arm),
+    .phy_dq_i (phy_dq_i), .phy_dq_i_valid (phy_dq_i_valid), .phy_rwds_i (phy_rwds_i),
     .hb_ck (hb_ck), .hb_ck_n (hb_ck_n), .hb_cs_n (hb_cs_n), .hb_rst_n (hb_rst_n),
-    .hb_dq_o (phy_dq_o), .hb_dq_oe (phy_dq_oe), .hb_dq_i (dq_line_dly),
-    .hb_rwds_o (phy_rwds_o), .hb_rwds_oe (phy_rwds_oe), .hb_rwds_i (rwds_line_dly),
-    .init_done (init_done), .err_underrun (), .dbg_bus ()
+    .hb_dq_o (pin_dq_o), .hb_dq_oe (pin_dq_oe), .hb_dq_i (dq_line_dly),
+    .hb_rwds_o (pin_rwds_o), .hb_rwds_oe (pin_rwds_oe), .hb_rwds_i (rwds_line_dly)
   );
 
   hyperram_model #(
-    .DQ_WIDTH             (DQ_WIDTH),
-    .MEM_WORDS            (1 << 16),
-    .LATENCY_CLOCKS       (6),
-    .FIXED_LATENCY        (1'b1),
-    .ROW_WORDS            (0),
-    .REFRESH_EVERY        (0),
-    .RD_PREAMBLE_CLOCKS   (1),               // matches RD_PREAMBLE_SKIP=1 on the SDR PHY
-    .RD_OVERSTREAM_WORDS  (MDL_OS),
-    .WR_COMMIT_QUIRK      (MDL_WR_QUIRK),
-    .WR_PENDING_WORDS     (MDL_PEND_WORDS),
-    .BURST_BOUNDARY_WORDS (MDL_BOUNDARY)
+    .DQ_WIDTH               (DQ_WIDTH),
+    .MEM_WORDS              (1 << 16),
+    .LATENCY_CLOCKS         (6),
+    .FIXED_LATENCY          (1'b1),
+    .ROW_WORDS              (0),
+    .REFRESH_EVERY          (0),
+    .RD_PREAMBLE_CLOCKS     (1),               // matches RD_PREAMBLE_SKIP=1 on the SDR PHY
+    .RD_OVERSTREAM_WORDS    (MDL_OS),
+    .WR_WOUND_WORDS         (MDL_WOUND_WORDS),
+    .WR_WOUND_MASK_SUPPRESS (MDL_WOUND_SUPPRESS),
+    .WR_BOUNDARY_END_GARBLE (MDL_BOUNDARY_GARBLE),
+    .BURST_BOUNDARY_WORDS   (MDL_BOUNDARY)
   ) model (
     .hb_ck (hb_ck), .hb_ck_n (hb_ck_n), .hb_cs_n (hb_cs_n), .hb_rst_n (hb_rst_n),
-    .hb_dq_i (dq_line), .hb_dq_ie (phy_dq_oe), .hb_dq_o (mdl_dq_o), .hb_dq_oe (mdl_dq_oe),
-    .hb_rwds_i (rwds_line), .hb_rwds_ie (phy_rwds_oe), .hb_rwds_o (mdl_rwds_o), .hb_rwds_oe (mdl_rwds_oe)
+    .hb_dq_i (dq_line), .hb_dq_ie (pin_dq_oe), .hb_dq_o (mdl_dq_o), .hb_dq_oe (mdl_dq_oe),
+    .hb_rwds_i (rwds_line), .hb_rwds_ie (pin_rwds_oe), .hb_rwds_o (mdl_rwds_o), .hb_rwds_oe (mdl_rwds_oe)
   );
 endmodule
 
@@ -223,28 +294,9 @@ module tb_commit;
   initial begin clk_ref = 1'b0; forever #5.0  clk_ref = ~clk_ref; end
 
   // --------------------------------------------------------------------
-  // The stacks. Per-stack parameters (see the header table) selected by genvar index.
-  //
-  // idx 0-5: the original six (issue #1 commit-read + boundary + REG_RBURSTW); the commit-read PASS
-  //   expectations (1, 4) flipped to the no-fix signature under the 2026-07-10 corrected model.
-  // idx 6-8: 2026-07-09 silicon evidence — the W957D8NB actually holds WR_PENDING_WORDS=4 words
-  //   pending (not 1), so the split-write sweep is re-run at that depth:
-  //     6  WR_COALESCE=1 alone (issue #1 direction 4)      -> expect ERR=0   (single-CS# by construction)
-  //     7  WR_COMMIT_READ=1, COMMIT_READ_MODE=SPAN_END(default) -> expect ERR=4*(n-1)
-  //     8  defaults off (no fix)                            -> expect ERR=4*(n-1) (silicon signature)
-  // idx 9 (standalone, below): WR_COMMIT_READ=1, COMMIT_READ_MODE=FULL_BURST -> expect ERR=4*(n-1)
-  //   (2026-07-10: falsified on silicon; the corrected model no longer lets ANY read flush pend).
-  // idx 10/11 (standalone, below): WR_CHOP_REPLAY on/off against forced chops (issue #1 direction 5).
+  // The stacks (see the header table for the full idx -> parameter -> expectation map).
   // --------------------------------------------------------------------
-  localparam int GEN_N  = 9;                                    // idx 0-8: array/generate-for driven
-  localparam int NSTACK = 12;                                   // + idx 9 (FULL_BURST), 10/11 (REPLAY)
-  localparam bit STK_WCR   [GEN_N] = '{1'b0, 1'b1, 1'b0, 1'b0,  1'b1,  1'b0, 1'b0, 1'b1, 1'b0};  // DUT WR_COMMIT_READ
-  localparam int STK_DBND  [GEN_N] = '{0,    0,    0,    8192,  8192,  0,    0,    0,    0};      // DUT boundary chop
-  localparam bit STK_MWCQ  [GEN_N] = '{1'b1, 1'b1, 1'b0, 1'b0,  1'b1,  1'b0, 1'b1, 1'b1, 1'b1};  // model WR_COMMIT_QUIRK
-  localparam int STK_MBND  [GEN_N] = '{0,    0,    8192, 8192,  8192,  0,    0,    0,    0};      // model boundary release
-  localparam int STK_MOS   [GEN_N] = '{0,    0,    0,    0,     0,     9,    0,    0,    0};      // model read over-stream
-  localparam bit STK_WCOAL [GEN_N] = '{1'b0, 1'b0, 1'b0, 1'b0,  1'b0,  1'b0, 1'b1, 1'b0, 1'b0};  // DUT WR_COALESCE
-  localparam int STK_MPEND [GEN_N] = '{1,    1,    1,    1,     1,     1,    4,    4,    4};      // model WR_PENDING_WORDS
+  localparam int NSTACK = 11;
 
   logic [CSR_ADDR_WIDTH-1:0] s_addr  [NSTACK];
   logic                      s_read  [NSTACK];
@@ -254,85 +306,147 @@ module tb_commit;
   logic                      s_wait  [NSTACK];
   logic                      s_initd [NSTACK];
 
-  generate
-    for (genvar i = 0; i < GEN_N; i++) begin : g_stk
-      commit_stack #(
-        .CSR_ADDR_WIDTH (CSR_ADDR_WIDTH),
-        .WR_COMMIT_READ (STK_WCR[i]),
-        .DUT_BOUNDARY   (STK_DBND[i]),
-        .MDL_WR_QUIRK   (STK_MWCQ[i]),
-        .MDL_BOUNDARY   (STK_MBND[i]),
-        .MDL_OS         (STK_MOS[i]),
-        .WR_COALESCE    (STK_WCOAL[i]),
-        .MDL_PEND_WORDS (STK_MPEND[i])
-      ) u (
-        .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
-        .csr_address (s_addr[i]), .csr_read (s_read[i]), .csr_write (s_write[i]),
-        .csr_writedata (s_wdata[i]), .csr_readdata (s_rdata[i]),
-        .csr_waitrequest (s_wait[i]), .init_done (s_initd[i])
-      );
-    end
-  endgenerate
-
-  // idx 9 (standalone — not generate-for-driven, so the string-typed COMMIT_READ_MODE override can be
-  // a plain literal): WR_COMMIT_READ + COMMIT_READ_MODE="FULL_BURST" against WR_PENDING_WORDS=4.
-  commit_stack #(
-    .CSR_ADDR_WIDTH    (CSR_ADDR_WIDTH),
-    .WR_COMMIT_READ    (1'b1),
-    .DUT_BOUNDARY      (0),
-    .MDL_WR_QUIRK      (1'b1),
-    .MDL_BOUNDARY      (0),
-    .MDL_OS            (0),
-    .WR_COALESCE       (1'b0),
-    .COMMIT_READ_MODE  ("FULL_BURST"),
-    .MDL_PEND_WORDS    (4)
-  ) u_stk9 (
-    .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
-    .csr_address (s_addr[9]), .csr_read (s_read[9]), .csr_write (s_write[9]),
-    .csr_writedata (s_wdata[9]), .csr_readdata (s_rdata[9]),
-    .csr_waitrequest (s_wait[9]), .init_done (s_initd[9])
+  // idx0 — nofix: MAX_BURST_WORDS=64 chop, no coalesce, no replay, model wound=4. Every intra-command
+  // chop reopens at the natural boundary C with no rollback -> wounds [C-4,C).
+  commit_stack #(.CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .DUT_MAXBURST(64), .MDL_WOUND_WORDS(4)) u_nofix (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[0]), .csr_read(s_read[0]), .csr_write(s_write[0]),
+    .csr_writedata(s_wdata[0]), .csr_readdata(s_rdata[0]),
+    .csr_waitrequest(s_wait[0]), .init_done(s_initd[0])
   );
 
-  // idx 10/11 (WR_CHOP_REPLAY, issue #1 direction 5): WR_COALESCE=1 + MAX_BURST_WORDS=64 (forces
-  // intra-command chops) + the 0x2000-word boundary chop, against the WR_PENDING_WORDS=4 model with
-  // NO model boundary-release (MDL_BOUNDARY=0): these stacks isolate the corrected COMMIT quirk at
-  // the chop boundaries — including the boundary-chop case, where the replayed reopen deliberately
-  // starts 4 words BEFORE the boundary (see hyperbus_ctrl's WR_CHOP_REPLAY BURST_BOUNDARY note).
-  // idx 10 = replay ON (expect ERR=0 everywhere), idx 11 = replay OFF (expect 4-per-chop).
+  // idx1 — coalesce: WR_COALESCE=1, no hardware cap at all (DUT_MAXBURST=0) -> the whole transfer
+  // stays on ONE CS# regardless of how many native commands bw splits it into -> only the very first
+  // (and only) CA-decode wounds anything, and that wound zone sits BELOW base, outside the verified
+  // range -> ERR=0 for every LEN/wburst pair in the sweep.
+  commit_stack #(.CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .WR_COALESCE(1'b1), .MDL_WOUND_WORDS(4)) u_coalesce (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[1]), .csr_read(s_read[1]), .csr_write(s_write[1]),
+    .csr_writedata(s_wdata[1]), .csr_readdata(s_rdata[1]),
+    .csr_waitrequest(s_wait[1]), .init_done(s_initd[1])
+  );
+
+  // idx2 — replay_plain: WR_CHOP_REPLAY=1, WR_REPLAY_MASK_LEAD=0 (plain rollback, no masked lead
+  // beats). Every chop reopens rb=4 words EARLY (at C-4) and re-sends them (healing [C-4,C)), but the
+  // reopened CS#'s OWN CA base (C-4) now takes the wound one step further back: [C-8,C-4).
   commit_stack #(
-    .CSR_ADDR_WIDTH    (CSR_ADDR_WIDTH),
-    .WR_COMMIT_READ    (1'b0),
-    .DUT_BOUNDARY      (8192),
-    .DUT_MAXBURST      (64),
-    .MDL_WR_QUIRK      (1'b1),
-    .MDL_BOUNDARY      (0),
-    .MDL_OS            (0),
-    .WR_COALESCE       (1'b1),
-    .WR_CHOP_REPLAY    (1'b1),
-    .MDL_PEND_WORDS    (4)
-  ) u_stk10 (
-    .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
-    .csr_address (s_addr[10]), .csr_read (s_read[10]), .csr_write (s_write[10]),
-    .csr_writedata (s_wdata[10]), .csr_readdata (s_rdata[10]),
-    .csr_waitrequest (s_wait[10]), .init_done (s_initd[10])
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .DUT_MAXBURST(64),
+    .WR_CHOP_REPLAY(1'b1), .WR_REPLAY_WORDS(4), .WR_REPLAY_MASK_LEAD(0),
+    .MDL_WOUND_WORDS(4)
+  ) u_replay_plain (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[2]), .csr_read(s_read[2]), .csr_write(s_write[2]),
+    .csr_writedata(s_wdata[2]), .csr_readdata(s_rdata[2]),
+    .csr_waitrequest(s_wait[2]), .init_done(s_initd[2])
+  );
+
+  // idx3 — masklead_pass: WR_REPLAY_MASK_LEAD=4 (E-D mask-led replay: 4 masked dummy beats ahead of
+  // the 4 real replayed words) against a model with WR_WOUND_MASK_SUPPRESS=1 (the E-D hypothesis
+  // holds): every reopen's beat 0 is a masked dummy -> its wound is discarded -> ERR=0.
+  commit_stack #(
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .DUT_MAXBURST(64),
+    .WR_CHOP_REPLAY(1'b1), .WR_REPLAY_WORDS(4), .WR_REPLAY_MASK_LEAD(4),
+    .MDL_WOUND_WORDS(4), .MDL_WOUND_SUPPRESS(1'b1)
+  ) u_masklead_pass (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[3]), .csr_read(s_read[3]), .csr_write(s_write[3]),
+    .csr_writedata(s_wdata[3]), .csr_readdata(s_rdata[3]),
+    .csr_waitrequest(s_wait[3]), .init_done(s_initd[3])
+  );
+
+  // idx4 — masklead_cmdedge: SAME mask-led-replay + model-suppress composition as idx3, but shaped
+  // (WR_COALESCE=1, MAX_BURST_WORDS=512 = exactly 2x wburst=256) so the coalescing hw-cap budget
+  // exhausts EXACTLY at a command edge every other command -- no single command is ever long enough
+  // to trigger an INTRA-command MAX_BURST chop (each is only 256 words), so every wound here is
+  // healed exclusively through the NEW ST_IDLE acc_elig command-edge replay-accept path. ERR=0 proves
+  // that path (not just the already-covered ST_RECOVER intra-command path) heals correctly.
+  commit_stack #(
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .DUT_MAXBURST(512),
+    .WR_COALESCE(1'b1), .WR_COALESCE_WAIT(8),
+    .WR_CHOP_REPLAY(1'b1), .WR_REPLAY_WORDS(4), .WR_REPLAY_MASK_LEAD(4),
+    .MDL_WOUND_WORDS(4), .MDL_WOUND_SUPPRESS(1'b1)
+  ) u_masklead_cmdedge (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[4]), .csr_read(s_read[4]), .csr_write(s_write[4]),
+    .csr_writedata(s_wdata[4]), .csr_readdata(s_rdata[4]),
+    .csr_waitrequest(s_wait[4]), .init_done(s_initd[4])
+  );
+
+  // idx5 — masklead_nosuppress: same DUT shape as idx3 (mask-led replay) but the model does NOT
+  // honor mask-suppress (WR_WOUND_MASK_SUPPRESS=0, the "E-D hypothesis is false" case): every reopen
+  // still wounds [B-4,B) where B is now C-8 (rb=4 + lead=4 rolled back) -> wound zone [C-12,C-8),
+  // BELOW the masked-lead prefix entirely (untouched by either the lead beats or the replayed reals).
+  commit_stack #(
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .DUT_MAXBURST(64),
+    .WR_CHOP_REPLAY(1'b1), .WR_REPLAY_WORDS(4), .WR_REPLAY_MASK_LEAD(4),
+    .MDL_WOUND_WORDS(4), .MDL_WOUND_SUPPRESS(1'b0)
+  ) u_masklead_nosuppress (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[5]), .csr_read(s_read[5]), .csr_write(s_write[5]),
+    .csr_writedata(s_wdata[5]), .csr_readdata(s_rdata[5]),
+    .csr_waitrequest(s_wait[5]), .init_done(s_initd[5])
+  );
+
+  // idx6 — cmdedge_noreplay: EXACT same DUT shape as idx4 (WR_COALESCE=1, MAX_BURST_WORDS=512,
+  // wburst=256) but WR_CHOP_REPLAY=0 -> acc_elig can never trigger (it requires WR_CHOP_REPLAY=1) ->
+  // every command-edge boundary opens fresh with no rollback -> wounds [C-4,C) there too. Direct
+  // before/after pair with idx4: same setup, replay toggled off, proving the acc-leg (not something
+  // else about this DUT shape) is what fixes it.
+  commit_stack #(
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .DUT_MAXBURST(512),
+    .WR_COALESCE(1'b1), .WR_COALESCE_WAIT(8),
+    .MDL_WOUND_WORDS(4)
+  ) u_cmdedge_noreplay (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[6]), .csr_read(s_read[6]), .csr_write(s_write[6]),
+    .csr_writedata(s_wdata[6]), .csr_readdata(s_rdata[6]),
+    .csr_waitrequest(s_wait[6]), .init_done(s_initd[6])
+  );
+
+  // idx7 — boundary_garble: finding 5. A single 16-word write at 0x1FF0 ends EXACTLY at 0x2000 (no
+  // DUT chop needed to produce this — base+len already lands there); model WR_BOUNDARY_END_GARBLE=1
+  // garbles the burst's own last 4 words ([0x1FFC..0x1FFF]) to 0x5050 at CS# close. Model wound is
+  // OFF here (isolated single-quirk test, matching the isolation convention used throughout).
+  commit_stack #(
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .MDL_BOUNDARY_GARBLE(1'b1)
+  ) u_boundary_garble (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[7]), .csr_read(s_read[7]), .csr_write(s_write[7]),
+    .csr_writedata(s_wdata[7]), .csr_readdata(s_rdata[7]),
+    .csr_waitrequest(s_wait[7]), .init_done(s_initd[7])
+  );
+
+  // idx8/9 — bndrel_off/on: independent, orthogonal 0x2000-word bus-RELEASE boundary quirk (not the
+  // wound): a single burst crossing 0x2000 with the DUT's own BURST_BOUNDARY_WORDS chop OFF lets the
+  // model's bnd_rel engage (bus floats past the boundary) -> ERR>0; chop ON never crosses -> ERR=0.
+  commit_stack #(
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .DUT_BOUNDARY(0), .MDL_BOUNDARY(32'h2000)
+  ) u_bndrel_off (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[8]), .csr_read(s_read[8]), .csr_write(s_write[8]),
+    .csr_writedata(s_wdata[8]), .csr_readdata(s_rdata[8]),
+    .csr_waitrequest(s_wait[8]), .init_done(s_initd[8])
   );
 
   commit_stack #(
-    .CSR_ADDR_WIDTH    (CSR_ADDR_WIDTH),
-    .WR_COMMIT_READ    (1'b0),
-    .DUT_BOUNDARY      (8192),
-    .DUT_MAXBURST      (64),
-    .MDL_WR_QUIRK      (1'b1),
-    .MDL_BOUNDARY      (0),
-    .MDL_OS            (0),
-    .WR_COALESCE       (1'b1),
-    .WR_CHOP_REPLAY    (1'b0),
-    .MDL_PEND_WORDS    (4)
-  ) u_stk11 (
-    .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
-    .csr_address (s_addr[11]), .csr_read (s_read[11]), .csr_write (s_write[11]),
-    .csr_writedata (s_wdata[11]), .csr_readdata (s_rdata[11]),
-    .csr_waitrequest (s_wait[11]), .init_done (s_initd[11])
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .DUT_BOUNDARY(32'h2000), .MDL_BOUNDARY(32'h2000)
+  ) u_bndrel_on (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[9]), .csr_read(s_read[9]), .csr_write(s_write[9]),
+    .csr_writedata(s_wdata[9]), .csr_readdata(s_rdata[9]),
+    .csr_waitrequest(s_wait[9]), .init_done(s_initd[9])
+  );
+
+  // idx10 — readsplit: write ONE correct burst, split the READ into many via REG_RBURSTW, against a
+  // clean model that over-streams like silicon -> ERR=0 (isolates the multi-burst READ path from any
+  // write-side quirk; both DUT and model quirks are OFF here).
+  commit_stack #(
+    .CSR_ADDR_WIDTH(CSR_ADDR_WIDTH), .MDL_OS(9)
+  ) u_readsplit (
+    .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),
+    .csr_address(s_addr[10]), .csr_read(s_read[10]), .csr_write(s_write[10]),
+    .csr_writedata(s_wdata[10]), .csr_readdata(s_rdata[10]),
+    .csr_waitrequest(s_wait[10]), .init_done(s_initd[10])
   );
 
   // --------------------------------------------------------------------
@@ -390,7 +504,7 @@ module tb_commit;
     do begin
       csr_rd(idx, REG_CTRL, status);
       guard = guard + 1;
-    end while (!status[1] && guard < 200000);
+    end while (!status[1] && guard < 400000);
     done = status[1];
     csr_rd(idx, REG_ERRCNT, err);
     if (err != 0) begin
@@ -408,12 +522,6 @@ module tb_commit;
   logic [31:0] status, err;
   logic        done;
   int unsigned guard;
-
-  // commit-quirk sweep: expected nofix ERR = n_write_bursts - 1 (silicon signature).
-  localparam int NSW = 3;
-  int sw_len   [NSW] = '{32, 64, 256};
-  int sw_burst [NSW] = '{16, 16, 64};
-  int sw_nm1   [NSW] = '{1,  3,  3};
 
   initial begin
     for (int k = 0; k < NSTACK; k++) begin
@@ -437,143 +545,110 @@ module tb_commit;
     repeat (4) @(posedge clk);
 
     $display("==================================================================");
-    $display("tb_commit: split-write commit quirk + 0x2000 boundary + REG_RBURSTW");
+    $display("tb_commit: W957D8NB write-CA wound + 0x2000 boundary quirks");
     $display("==================================================================");
 
-    // ---- (A) Split-write commit quirk (issue #1) ----
-    // idx0 = no fix -> must reproduce ERR == n_write_bursts-1; idx1 = commit-read interpose -> the
-    // SAME n-1 signature (2026-07-10: NO read-shaped interpose commits when another write follows —
-    // the corrected model's pend is discarded by the next write CS# regardless of the read between).
-    $display("-- (A) split-write commit quirk (base=0x100) --");
-    for (int i = 0; i < NSW; i++) begin
-      run_one(0, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
-      $display("   [nofix] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect %0d)",
-               sw_len[i], sw_burst[i], done, err, sw_nm1[i]);
-      check(done, $sformatf("nofix LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
-      check(err == 32'(sw_nm1[i]),
-            $sformatf("nofix LEN=%0d ERR=%0d expected %0d (silicon signature n_bursts-1)",
-                      sw_len[i], err, sw_nm1[i]));
+    // ---- (A) idx0: no-fix chop, MAX_BURST_WORDS=64 ----
+    // LEN=724 = 64 + 11*60 chops into EXACTLY 11 segments (11 chop boundaries) under the no-replay
+    // arithmetic (64-word segments, ceil(724/64)-1=11) -> 11*4=44 wounded words at [C-4,C) per chop.
+    $display("-- (A) idx0 nofix: LEN=724 base=0x100 MAXBURST=64 (expect ERR=44, 11 chops x 4) --");
+    run_one(0, 32'd724, 32'h0000_0100, 32'd724, 32'd724, done, status, err);
+    $display("   [nofix] done=%0b ERR=%0d (expect 44)", done, err);
+    check(done, $sformatf("nofix did not complete (STATUS=0x%08x)", status));
+    check(err == 32'd44, $sformatf("nofix ERR=%0d expected 44 (silicon wound signature, 11 chops x 4)", err));
 
-      run_one(1, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
-      $display("   [cread] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect %0d — interpose ineffective)",
-               sw_len[i], sw_burst[i], done, err, sw_nm1[i]);
-      check(done, $sformatf("commit-read LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
-      check(err == 32'(sw_nm1[i]),
-            $sformatf("commit-read LEN=%0d ERR=%0d expected %0d (2026-07-10: a read interpose commits nothing when a write follows)",
-                      sw_len[i], err, sw_nm1[i]));
+    // ---- (B) idx1: WR_COALESCE alone, no hardware cap -> single CS#, no reopens ----
+    $display("-- (B) idx1 coalesce: no hw cap, WR_COALESCE=1 (expect ERR=0, no CS# reopens) --");
+    begin
+      localparam int NSW = 3;
+      int sw_len   [NSW] = '{32, 64, 256};
+      int sw_burst [NSW] = '{16, 16, 64};
+      for (int i = 0; i < NSW; i++) begin
+        run_one(1, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
+        $display("   [coalesce] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect 0)", sw_len[i], sw_burst[i], done, err);
+        check(done, $sformatf("coalesce LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
+        check(err == 32'd0, $sformatf("coalesce LEN=%0d ERR=%0d expected 0 (single-CS# by construction)", sw_len[i], err));
+      end
     end
 
-    // ---- (B) 0x2000-word boundary chop ----
-    // A single 16-word burst @0x1FF8 crosses the 0x2000-word boundary.
-    $display("-- (B) 0x2000-word boundary (base=0x1FF8, LEN=16, burst=16 -> crosses) --");
-    run_one(2, 32'd16, 32'h0000_1FF8, 32'd16, 32'd16, done, status, err);   // DUT chop OFF
-    $display("   [chop off] done=%0b ERR=%0d STATUS=0x%08x (expect ERR>0)", done, err, status);
-    check(done, "boundary chop-off did not complete (hang)");
-    check(err != 32'd0, "boundary chop-off ERR=0 — model boundary-release not modelled");
+    // ---- (C) idx2: plain rollback replay (WR_CHOP_REPLAY=1, MASK_LEAD=0) ----
+    // SAME LEN=724/MAXBURST=64 shape as idx0 (independently re-verified: the replay overhead (rb=4
+    // words/chop) shrinks per-chop forward progress from 64 to 60 real words, and 724 = 64 + 11*60
+    // divides EXACTLY under that arithmetic too -> still 11 chops) -> the errors MOVE from [C-4,C) to
+    // [C-8,C-4) but the total count (44) matches idx0 exactly.
+    $display("-- (C) idx2 replay_plain: LEN=724 MAXBURST=64, WR_CHOP_REPLAY=1 MASK_LEAD=0 (expect ERR=44 at [C-8,C-4)) --");
+    run_one(2, 32'd724, 32'h0000_0100, 32'd724, 32'd724, done, status, err);
+    $display("   [replay_plain] done=%0b ERR=%0d (expect 44)", done, err);
+    check(done, $sformatf("replay_plain did not complete (STATUS=0x%08x)", status));
+    check(err == 32'd44, $sformatf("replay_plain ERR=%0d expected 44 (wound moved to [C-8,C-4), same count)", err));
 
-    run_one(3, 32'd16, 32'h0000_1FF8, 32'd16, 32'd16, done, status, err);   // DUT chop ON
-    $display("   [chop on ] done=%0b ERR=%0d STATUS=0x%08x (expect ERR=0)", done, err, status);
-    check(done, "boundary chop-on did not complete");
-    check(err == 32'd0, $sformatf("boundary chop-on ERR=%0d expected 0", err));
+    // ---- (D) idx3: mask-led replay + model mask-suppress=1 ----
+    $display("-- (D) idx3 masklead_pass: MASK_LEAD=4, model WR_WOUND_MASK_SUPPRESS=1 (expect ERR=0) --");
+    run_one(3, 32'd768, 32'h0000_0100, 32'd768, 32'd768, done, status, err);
+    $display("   [masklead_pass] LEN=768/768 done=%0b ERR=%0d (expect 0)", done, err);
+    check(done, "masklead_pass LEN=768 did not complete");
+    check(err == 32'd0, $sformatf("masklead_pass LEN=768 ERR=%0d expected 0 (mask-led reopen heals its own wound)", err));
 
-    // ---- (C) Composition: boundary chop of a WRITE + commit-read at the chop ----
-    // The boundary chop itself works (no crossing), but the interposed commit-read does NOT save
-    // the first segment's pending tail word from the resumed write (2026-07-10) -> exactly 1 error
-    // (the pre-boundary segment's last word; PEND=1 here). The old model wrongly showed 0.
-    $display("-- (C) compose: boundary chop + commit-read (base=0x1FF8, LEN=16, burst=16) --");
-    run_one(4, 32'd16, 32'h0000_1FF8, 32'd16, 32'd16, done, status, err);
-    $display("   [compose] done=%0b ERR=%0d STATUS=0x%08x (expect ERR=1 — chop fixed, commit-read ineffective)",
-             done, err, status);
-    check(done, "compose did not complete");
-    check(err == 32'd1,
-          $sformatf("compose ERR=%0d expected 1 (chopped segment's tail word lost despite the commit-read)", err));
+    run_one(3, 32'd520, 32'h0000_0100, 32'd520, 32'd520, done, status, err);
+    $display("   [masklead_pass] LEN=520/520 done=%0b ERR=%0d (expect 0)", done, err);
+    check(done, "masklead_pass LEN=520 did not complete");
+    check(err == 32'd0, $sformatf("masklead_pass LEN=520 ERR=%0d expected 0", err));
 
-    // ---- (D) Independent read-burst-size CSR (issue #2) ----
-    // Write ONE burst (correct memory), split the READ into many; clean model over-streams like silicon.
-    $display("-- (D) REG_RBURSTW: write single burst, split read (base=0x100, LEN=64, wburst=64, rburst=16) --");
-    run_one(5, 32'd64, 32'h0000_0100, 32'd64, 32'd16, done, status, err);
-    $display("   [rsplit ] done=%0b ERR=%0d STATUS=0x%08x (expect ERR=0)", done, err, status);
-    check(done, "read-split did not complete (multi-burst read HANG)");
-    check(err == 32'd0, $sformatf("read-split ERR=%0d expected 0 (multi-burst READ path)", err));
+    // ---- (E) idx4: mask-led replay + model mask-suppress=1, forced to the ST_IDLE acc_elig
+    // command-edge path (WR_COALESCE=1, MAX_BURST_WORDS=512=2*wburst -> the budget always exhausts
+    // exactly at a command boundary, never mid-command) ----
+    $display("-- (E) idx4 masklead_cmdedge: LEN=4096/wburst=256 MAXBURST=512 COALESCE=1 (expect ERR=0, exercises ST_IDLE acc_elig) --");
+    run_one(4, 32'd4096, 32'h0000_0100, 32'd256, 32'd256, done, status, err);
+    $display("   [masklead_cmdedge] done=%0b ERR=%0d (expect 0)", done, err);
+    check(done, "masklead_cmdedge did not complete");
+    check(err == 32'd0, $sformatf("masklead_cmdedge ERR=%0d expected 0 (acc_elig heals every command-edge boundary)", err));
 
-    // ---- (E) 2026-07-09 silicon: WR_PENDING_WORDS=4 (the real W957D8NB holds FOUR words pending,
-    // not one) — re-run the SAME split-write sweep. no-fix, SPAN_END and (2026-07-10 corrected)
-    // FULL_BURST all reproduce the silicon fingerprint ERR = 4*(n_bursts-1); only WR_COALESCE
-    // (no CS# boundary at all) restores ERR=0 among the pre-replay remedies.
-    $display("-- (E) WR_PENDING_WORDS=4 split-write sweep (base=0x100) --");
-    for (int i = 0; i < NSW; i++) begin
-      run_one(8, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
-      $display("   [depth4 nofix    ] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect %0d)",
-               sw_len[i], sw_burst[i], done, err, 4 * sw_nm1[i]);
-      check(done, $sformatf("depth4 nofix LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
-      check(err == 32'(4 * sw_nm1[i]),
-            $sformatf("depth4 nofix LEN=%0d ERR=%0d expected %0d (silicon signature 4*(n_bursts-1))",
-                      sw_len[i], err, 4 * sw_nm1[i]));
+    // ---- (F) idx5: mask-led replay, model mask-suppress=0 (E-D hypothesis false) ----
+    // LEN=680 = 64 + 11*56 divides EXACTLY under the mask-led (rb=4,lead=4 -> pfx=8 -> 56 real/chop)
+    // arithmetic -> 11 chops x 4 = 44, now at [C-12,C-8) (below the masked-lead prefix entirely).
+    $display("-- (F) idx5 masklead_nosuppress: LEN=680 MAXBURST=64, model WR_WOUND_MASK_SUPPRESS=0 (expect ERR=44 at [C-12,C-8)) --");
+    run_one(5, 32'd680, 32'h0000_0100, 32'd680, 32'd680, done, status, err);
+    $display("   [masklead_nosuppress] done=%0b ERR=%0d (expect 44)", done, err);
+    check(done, $sformatf("masklead_nosuppress did not complete (STATUS=0x%08x)", status));
+    check(err == 32'd44, $sformatf("masklead_nosuppress ERR=%0d expected 44 (wound walks below the mask lead)", err));
 
-      run_one(7, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
-      $display("   [depth4 SPAN_END ] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect %0d — attempt #3 class)",
-               sw_len[i], sw_burst[i], done, err, 4 * sw_nm1[i]);
-      check(done, $sformatf("depth4 SPAN_END LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
-      check(err == 32'(4 * sw_nm1[i]),
-            $sformatf("depth4 SPAN_END LEN=%0d ERR=%0d expected %0d (a 4-word span-end read no longer spans PAST the 4-deep pending region, so it must NOT commit)",
-                      sw_len[i], err, 4 * sw_nm1[i]));
+    // ---- (G) idx6: command-edge case, replay OFF (proves the acc-leg is what fixes it) ----
+    // Identical DUT shape to idx4 (WR_COALESCE=1, MAX_BURST_WORDS=512, wburst=256) with WR_CHOP_REPLAY
+    // off -> acc_elig never triggers -> every one of the 7 command-edge boundaries (4096/512=8 CS#
+    // opens -> 7 boundaries) opens fresh with no rollback -> 7*4=28 wounded words at [C-4,C).
+    $display("-- (G) idx6 cmdedge_noreplay: SAME shape as idx4, WR_CHOP_REPLAY=0 (expect ERR=28, 7 boundaries x 4) --");
+    run_one(6, 32'd4096, 32'h0000_0100, 32'd256, 32'd256, done, status, err);
+    $display("   [cmdedge_noreplay] done=%0b ERR=%0d (expect 28)", done, err);
+    check(done, "cmdedge_noreplay did not complete");
+    check(err == 32'd28, $sformatf("cmdedge_noreplay ERR=%0d expected 28 (proves the acc-leg, not something else, fixes idx4)", err));
 
-      run_one(6, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
-      $display("   [depth4 COALESCE ] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect 0)",
-               sw_len[i], sw_burst[i], done, err);
-      check(done, $sformatf("depth4 COALESCE LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
-      check(err == 32'd0,
-            $sformatf("depth4 COALESCE LEN=%0d ERR=%0d expected 0 (single-CS# by construction)",
-                      sw_len[i], err));
+    // ---- (H) idx7: WR_BOUNDARY_END_GARBLE (silicon ladder finding 5) ----
+    // A single 16-word write at 0x1FF0 ends EXACTLY at 0x2000 -> the model garbles its own last 4
+    // words ([0x1FFC..0x1FFF]) to 0x5050 at CS# close.
+    $display("-- (H) idx7 boundary_garble: LEN=16 base=0x1FF0, model WR_BOUNDARY_END_GARBLE=1 (expect ERR=4) --");
+    run_one(7, 32'd16, 32'h0000_1FF0, 32'd16, 32'd16, done, status, err);
+    $display("   [boundary_garble] done=%0b ERR=%0d (expect 4)", done, err);
+    check(done, "boundary_garble did not complete");
+    check(err == 32'd4, $sformatf("boundary_garble ERR=%0d expected 4 (burst's own last 4 words garbled to 0x5050)", err));
 
-      run_one(9, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
-      $display("   [depth4 FULL_BURST] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect %0d — falsified on silicon)",
-               sw_len[i], sw_burst[i], done, err, 4 * sw_nm1[i]);
-      check(done, $sformatf("depth4 FULL_BURST LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
-      check(err == 32'(4 * sw_nm1[i]),
-            $sformatf("depth4 FULL_BURST LEN=%0d ERR=%0d expected %0d (2026-07-10 silicon: even a full re-read of the closed segment commits nothing when a write follows)",
-                      sw_len[i], err, 4 * sw_nm1[i]));
-    end
+    // ---- (I) idx8/9: 0x2000-word bus-release boundary quirk (orthogonal to the wound) ----
+    $display("-- (I) idx8/9 0x2000-word boundary (base=0x1FF8, LEN=16, burst=16 -> crosses) --");
+    run_one(8, 32'd16, 32'h0000_1FF8, 32'd16, 32'd16, done, status, err);   // DUT chop OFF
+    $display("   [bndrel_off] done=%0b ERR=%0d STATUS=0x%08x (expect ERR>0)", done, err, status);
+    check(done, "bndrel_off did not complete (hang)");
+    check(err != 32'd0, "bndrel_off ERR=0 — model boundary-release not modelled");
 
-    // ---- (F) WR_CHOP_REPLAY (issue #1 direction 5, 2026-07-10) ----
-    // Forced intra-command chops (MAX_BURST_WORDS=64) + WR_COALESCE against the depth-4 model.
-    // Replay ON (idx 10): every chop reopens 4 words early and re-sends the words the device is
-    // about to discard -> ERR=0. Replay OFF (idx 11): 4 words lost per chop.
-    $display("-- (F) WR_CHOP_REPLAY: depth-4 model, WR_COALESCE=1, MAX_BURST_WORDS=64 --");
-    // (F1) one native command chopped intra-command: LEN=768 = 12 segments = 11 chops.
-    run_one(10, 32'd768, 32'h0000_0100, 32'd768, 32'd768, done, status, err);
-    $display("   [replay  LEN=768/768 ] done=%0b ERR=%0d (expect 0)", done, err);
-    check(done, "replay LEN=768 did not complete");
-    check(err == 32'd0, $sformatf("replay LEN=768 ERR=%0d expected 0 (chops replayed)", err));
+    run_one(9, 32'd16, 32'h0000_1FF8, 32'd16, 32'd16, done, status, err);   // DUT chop ON
+    $display("   [bndrel_on ] done=%0b ERR=%0d STATUS=0x%08x (expect ERR=0)", done, err, status);
+    check(done, "bndrel_on did not complete");
+    check(err == 32'd0, $sformatf("bndrel_on ERR=%0d expected 0", err));
 
-    run_one(11, 32'd768, 32'h0000_0100, 32'd768, 32'd768, done, status, err);
-    $display("   [noreplay LEN=768/768] done=%0b ERR=%0d (expect 44 = 4 per chop x 11)", done, err);
-    check(done, "no-replay LEN=768 did not complete");
-    check(err == 32'd44,
-          $sformatf("no-replay LEN=768 ERR=%0d expected 44 (11 chops x 4 pending words)", err));
-
-    // (F2) multi-command stream: coalescing splices the command boundaries onto the same CS#, the
-    // hw-cap chops the chain every 64 words, replay covers every chop -> ERR=0 end to end.
-    run_one(10, 32'd4096, 32'h0000_0100, 32'd256, 32'd256, done, status, err);
-    $display("   [replay  LEN=4096/256] done=%0b ERR=%0d (expect 0)", done, err);
-    check(done, "replay LEN=4096 did not complete");
-    check(err == 32'd0,
-          $sformatf("replay LEN=4096 ERR=%0d expected 0 (coalesce + chop + replay compose)", err));
-
-    // (F3) BURST_BOUNDARY-crossing write: base=0x1FE0, LEN=64 crosses the 0x2000-word boundary at
-    // word 32 -> one boundary chop. The replayed reopen starts at 0x1FFC (4 words BEFORE the
-    // boundary — the only way the pre-boundary tail can be re-written; model boundary-release is
-    // OFF in these stacks, see the stack comment) and runs through 0x201F.
-    run_one(10, 32'd64, 32'h0000_1FE0, 32'd64, 32'd64, done, status, err);
-    $display("   [replay  bound cross ] done=%0b ERR=%0d (expect 0)", done, err);
-    check(done, "replay boundary-cross did not complete");
-    check(err == 32'd0, $sformatf("replay boundary-cross ERR=%0d expected 0", err));
-
-    run_one(11, 32'd64, 32'h0000_1FE0, 32'd64, 32'd64, done, status, err);
-    $display("   [noreplay bound cross] done=%0b ERR=%0d (expect 4 = one chop)", done, err);
-    check(done, "no-replay boundary-cross did not complete");
-    check(err == 32'd4,
-          $sformatf("no-replay boundary-cross ERR=%0d expected 4 (pre-boundary tail lost)", err));
+    // ---- (J) idx10: independent read-burst-size CSR (issue #2) ----
+    $display("-- (J) idx10 readsplit: write single burst, split read (base=0x100, LEN=64, wburst=64, rburst=16) --");
+    run_one(10, 32'd64, 32'h0000_0100, 32'd64, 32'd16, done, status, err);
+    $display("   [readsplit] done=%0b ERR=%0d STATUS=0x%08x (expect ERR=0)", done, err, status);
+    check(done, "readsplit did not complete (multi-burst read HANG)");
+    check(err == 32'd0, $sformatf("readsplit ERR=%0d expected 0 (multi-burst READ path)", err));
 
     $display("==================================================================");
     $display("[%0t] tb_commit done: %0d errors", $time, errors);
@@ -588,7 +663,7 @@ module tb_commit;
 
   // Global watchdog — a true infinite hang (should never happen; every poll is bounded).
   initial begin
-    #40_000_000;
+    #60_000_000;
     $display("[%0t] TB_RESULT: FAIL (global timeout)", $time);
     $fatal(1, "tb_commit: global timeout");
   end

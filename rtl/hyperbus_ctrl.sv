@@ -159,6 +159,12 @@ module hyperbus_ctrl
     // CA base. 0 = off. Sizing: ~1-3 us of clk cycles; costs once per chop, negligible for
     // >=512-word segments.
     parameter int unsigned WR_CHOP_PAUSE_CYCLES = 0,
+    // Mask-led replay reopen (2026-07-09 silicon, the wound-suppression probe): open the replay
+    // reopen this many words EARLIER still, sending that many fully-RWDS-MASKED dummy beats before
+    // the replayed real words. Tests whether the device's below-base 4-word wound (see the ladder
+    // findings: ANY write CA zeroes [base-4, base) — reads do not) is suppressed when the burst
+    // leads with masked beats. 0 = off.
+    parameter int unsigned WR_REPLAY_MASK_LEAD  = 0,
     // Keep CK toggling (CS# High, spec-legal) through the post-write recovery/pause dwell — tests
     // whether the device's pending-tail merge needs CK edges rather than wall time.
     parameter bit          WR_CHOP_PAUSE_CK     = 1'b0,
@@ -399,6 +405,7 @@ module hyperbus_ctrl
   logic [STRB_WIDTH-1:0]   rp_strb [WR_REPLAY_WORDS];
   logic [LEN_WIDTH-1:0]    rp_cnt;
   logic [LEN_WIDTH-1:0]    replay_left;
+  logic [LEN_WIDTH-1:0]    replay_real;   // real (shadow-sourced) beats within replay_left (mask lead)
   logic [RP_AW-1:0]        replay_idx;
 
   // read holding FIFO ({last, data})
@@ -552,8 +559,12 @@ module hyperbus_ctrl
   // This ST_WRITE beat is a REPLAYED one: sourced from the replay shadow, not the front-end
   // (wr_ready held Low, underrun detection suppressed — the data is by construction available).
   wire                  replay_beat = WR_CHOP_REPLAY & (replay_left != '0);
+  // Mask-led beats: the first WR_REPLAY_MASK_LEAD beats of a replay reopen are fully-masked
+  // dummies (address-consuming, array-neutral); replay_real tracks how many REAL shadow beats
+  // remain so lead_beat = "still inside the masked prefix".
+  wire                  lead_beat   = replay_beat & (replay_left > replay_real);
   wire [DATA_WIDTH-1:0] rp_data_sel = rp_word[replay_idx];
-  wire [STRB_WIDTH-1:0] rp_strb_sel = rp_strb[replay_idx];
+  wire [STRB_WIDTH-1:0] rp_strb_sel = lead_beat ? '0 : rp_strb[replay_idx];
 
   // Replay-reopen geometry (consumed at the ST_RECOVER chop branch, where cur_addr has already been
   // advanced to the un-rolled next-segment base and rem_left/rp_cnt are stable):
@@ -585,14 +596,16 @@ module hyperbus_ctrl
     end
     return want;
   endfunction
+  wire [LEN_WIDTH-1:0]  rp_lead     = LEN_WIDTH'(WR_REPLAY_MASK_LEAD);
   wire [LEN_WIDTH-1:0]  rp_rb       = rp_rollback(cur_addr);
+  wire [LEN_WIDTH-1:0]  rp_pfx      = rp_rb + rp_lead;            // total reopen prefix (lead + real)
   wire [LEN_WIDTH-1:0]  rp_real_raw = seg_size(rem_left, 1'b0, cur_addr);
   wire [LEN_WIDTH-1:0]  rp_real     = ((MAX_BURST_WORDS != 0) &&
-                                       (LEN_WIDTH'(MAX_BURST_WORDS) > rp_rb) &&
-                                       (rp_real_raw > LEN_WIDTH'(MAX_BURST_WORDS) - rp_rb))
-                                      ? (LEN_WIDTH'(MAX_BURST_WORDS) - rp_rb) : rp_real_raw;
-  wire [ADDR_WIDTH-1:0] rp_base     = cur_addr - ADDR_WIDTH'(rp_rb);
-  wire [LEN_WIDTH-1:0]  rp_seg      = rp_rb + rp_real;
+                                       (LEN_WIDTH'(MAX_BURST_WORDS) > rp_pfx) &&
+                                       (rp_real_raw > LEN_WIDTH'(MAX_BURST_WORDS) - rp_pfx))
+                                      ? (LEN_WIDTH'(MAX_BURST_WORDS) - rp_pfx) : rp_real_raw;
+  wire [ADDR_WIDTH-1:0] rp_base     = cur_addr - ADDR_WIDTH'(rp_pfx);
+  wire [LEN_WIDTH-1:0]  rp_seg      = rp_pfx + rp_real;
 
   // COMMAND-level contiguous write->write replay (the coalesce-leg gap, 2026-07-09 silicon: when
   // the coalesce hw-cap budget exhausts exactly AT a command edge — e.g. MAX_BURST_WORDS=512 with
@@ -607,13 +620,14 @@ module hyperbus_ctrl
                                       & ~cmd_read & ~cmd_reg & ~cmd_wrap & ~doing_init
                                       & (cmd_addr == last_wr_addr + ADDR_WIDTH'(1));
   wire [LEN_WIDTH-1:0]  acc_rb      = rp_rollback(cmd_addr);
+  wire [LEN_WIDTH-1:0]  acc_pfx     = acc_rb + rp_lead;
   wire [LEN_WIDTH-1:0]  acc_real_raw= seg_size(cmd_len, 1'b0, cmd_addr);
   wire [LEN_WIDTH-1:0]  acc_real    = ((MAX_BURST_WORDS != 0) &&
-                                       (LEN_WIDTH'(MAX_BURST_WORDS) > acc_rb) &&
-                                       (acc_real_raw > LEN_WIDTH'(MAX_BURST_WORDS) - acc_rb))
-                                      ? (LEN_WIDTH'(MAX_BURST_WORDS) - acc_rb) : acc_real_raw;
-  wire [ADDR_WIDTH-1:0] acc_base    = cmd_addr - ADDR_WIDTH'(acc_rb);
-  wire [LEN_WIDTH-1:0]  acc_seg     = acc_rb + acc_real;
+                                       (LEN_WIDTH'(MAX_BURST_WORDS) > acc_pfx) &&
+                                       (acc_real_raw > LEN_WIDTH'(MAX_BURST_WORDS) - acc_pfx))
+                                      ? (LEN_WIDTH'(MAX_BURST_WORDS) - acc_pfx) : acc_real_raw;
+  wire [ADDR_WIDTH-1:0] acc_base    = cmd_addr - ADDR_WIDTH'(acc_pfx);
+  wire [LEN_WIDTH-1:0]  acc_seg     = acc_pfx + acc_real;
 
   // ------------------------------------------------------------------------
   // Read data-out (FIFO front)
@@ -800,6 +814,7 @@ module hyperbus_ctrl
       coalesce_wait_cnt <= '0;
       rp_cnt       <= '0;
       replay_left  <= '0;
+      replay_real  <= '0;
       replay_idx   <= '0;
       cur_read     <= 1'b0;
       cur_reg      <= 1'b0;
@@ -883,16 +898,36 @@ module hyperbus_ctrl
               cur_read  <= cmd_read;
               cur_reg   <= cmd_reg;
               cur_wrap  <= cmd_wrap;
-              cur_addr  <= cmd_addr;
-              rem_left  <= cmd_len;
-              seg_count <= seg_size(cmd_len, cmd_wrap, cmd_addr);
-              seg_left  <= seg_size(cmd_len, cmd_wrap, cmd_addr);
-              seg_cap_left <= hw_cap(cmd_addr);    // fresh CS# open: full hw-cap budget (WR_COALESCE)
-              ca_reg    <= hb_pack_ca(cmd_read, cmd_reg, ~cmd_wrap, cmd_addr);
+              // WR_CHOP_REPLAY at a COMMAND-level contiguous write->write boundary (coalesce budget
+              // exhausted at a command edge, coalesce timeout, or plain back-to-back contiguous
+              // writes): the new CS# would wound [cmd_addr-4, cmd_addr) — the previous burst's tail
+              // (2026-07-09 ladder: ANY write CA wounds the 4 words below its base). Open rolled
+              // back with the mask-lead + shadow prefix, exactly like the ST_RECOVER chop reopen.
+              if (acc_elig) begin
+                cur_addr    <= acc_base;
+                rem_left    <= cmd_len + acc_pfx;
+                seg_count   <= acc_seg;
+                seg_left    <= acc_seg;
+                seg_cap_left<= acc_pfx + hw_cap(cmd_addr);
+                ca_reg      <= hb_pack_ca(1'b0, 1'b0, 1'b1, acc_base);   // write, memory, linear
+                replay_left <= acc_pfx;
+                replay_real <= acc_rb;
+                replay_idx  <= RP_AW'(acc_rb - LEN_WIDTH'(1));
+              end else begin
+                cur_addr    <= cmd_addr;
+                rem_left    <= cmd_len;
+                seg_count   <= seg_size(cmd_len, cmd_wrap, cmd_addr);
+                seg_left    <= seg_size(cmd_len, cmd_wrap, cmd_addr);
+                seg_cap_left<= hw_cap(cmd_addr);   // fresh CS# open: full hw-cap budget (WR_COALESCE)
+                ca_reg      <= hb_pack_ca(cmd_read, cmd_reg, ~cmd_wrap, cmd_addr);
+                replay_left <= '0;                 // a non-replay command never starts with a replay
+              end
               rwds_hi   <= 1'b0;
               ca_idx    <= 2'd0;
-              rp_cnt      <= '0;                   // fresh CS# (WR_CHOP_REPLAY word count)
-              replay_left <= '0;                   //   (a user command never starts with a replay)
+              // rp_cnt tracks the LAST WRITE burst's tail; preserve it across READ accepts (reads
+              // do not disturb the array or the shadow validity — silicon ladder L5/X2), reset it
+              // for anything that writes (a new write rebuilds it; reg/wrap writes invalidate it).
+              if (~cmd_read) rp_cnt <= '0;
               wr_pending_commit <= 1'b0;           // a normally-accepted command clears the pending
                                                    //   flag (a covering read commits the prior write)
               // A1: if the device is in Deep-Power-Down, wake it (CS# pulse + tDPDOUT) BEFORE running
@@ -1050,7 +1085,9 @@ module hyperbus_ctrl
           // replayed beats included — into the replay shift shadow (see its declaration for why the
           // fixed emit index stays correct under this shift), and count it toward rp_cnt (saturating
           // at WR_REPLAY_WORDS). An underrun filler is captured with an all-zero strobe.
-          if (WR_CHOP_REPLAY && !zlw) begin
+          // Mask-led beats are NOT captured: they are array-neutral dummies, and shifting them in
+          // would evict the real shadow words before their own replay emission.
+          if (WR_CHOP_REPLAY && !zlw && !lead_beat) begin
             for (int p = int'(WR_REPLAY_WORDS) - 1; p > 0; p--) begin
               rp_word[p] <= rp_word[p-1];
               rp_strb[p] <= rp_strb[p-1];
@@ -1058,8 +1095,8 @@ module hyperbus_ctrl
             rp_word[0] <= replay_beat ? rp_data_sel : wsrc_data;
             rp_strb[0] <= replay_beat ? rp_strb_sel : (wsrc_valid ? wsrc_strb : '0);
             if (rp_cnt != LEN_WIDTH'(WR_REPLAY_WORDS)) rp_cnt <= rp_cnt + 1'b1;
-            if (replay_beat) replay_left <= replay_left - 1'b1;
           end
+          if (WR_CHOP_REPLAY && !zlw && replay_beat) replay_left <= replay_left - 1'b1;
           if (seg_left == LEN_WIDTH'(1)) begin
             // Last word of this write segment: record its (pre-advance) WORD address, and the
             // segment's own base/length, so a subsequent commit-read (WR_COMMIT_READ) can be shaped
@@ -1150,12 +1187,13 @@ module hyperbus_ctrl
                 // the same prefix allowance as rp_seg so coalescing's continuous budget tracking
                 // stays consistent with the segment actually opened.
                 cur_addr     <= rp_base;
-                rem_left     <= rem_left + rp_rb;
+                rem_left     <= rem_left + rp_pfx;
                 seg_count    <= rp_seg;
                 seg_left     <= rp_seg;
-                seg_cap_left <= rp_rb + hw_cap(cur_addr);
+                seg_cap_left <= rp_pfx + hw_cap(cur_addr);
                 ca_reg       <= hb_pack_ca(1'b0, 1'b0, 1'b1, rp_base);   // write, memory, linear
-                replay_left  <= rp_rb;
+                replay_left  <= rp_pfx;
+                replay_real  <= rp_rb;
                 replay_idx   <= RP_AW'(rp_rb - LEN_WIDTH'(1));
                 rp_cnt       <= '0;                   // fresh CS#: nothing sent in it yet
                 rwds_hi      <= 1'b0;

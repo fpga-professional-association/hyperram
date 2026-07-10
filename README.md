@@ -15,26 +15,38 @@ simulates end-to-end under `verilator --binary` (tested with Verilator 5.020).
 ## ⚡ Performance & test status (at a glance)
 
 **Tested on real silicon:** Arrow **AXC3000** dev board — Intel **Agilex 3 `A3CY100BM16AE7S`** FPGA
-+ Winbond **W957D8NB** HyperRAM (128 Mb, ×8, 1.2 V), Quartus Prime Pro 26.1, **SDR PHY**.
++ Winbond **W957D8NBRA4I** HyperRAM (128 Mb, ×8, 1.2 V, HyperRAM 2.1 250 MHz grade), Quartus Prime
+Pro 26.1 — **DDR (DDIO/GPIO-cell) board build** on the `ddio-200` line; the 50–160 MHz rows below
+are the earlier portable-SDR-PHY bring-up ramp.
 
-**Measured HyperRAM bandwidth** (single burst, data-integrity-verified on every row, `ERR_COUNT=0`):
+**Measured HyperRAM bandwidth** (LEN=768 linear burst, every word integrity-checked, `ERR_COUNT=0`,
+25-run soak clean at the peak):
 
-| HyperBus CK | Byte clock | Write | Read |
-|------------:|-----------:|------:|-----:|
-| 50 MHz  | 100 MHz | 96.8  | 94.8  MB/s |
-| 100 MHz | 200 MHz | 193.6 | 189.3 |
-| 150 MHz | 300 MHz | 290.4 | 283.9 |
-| **175 MHz** | **350 MHz** | **342.4** | **337.3 MB/s** |
+| HyperBus CK | Build | Write | Read |
+|------------:|------:|------:|-----:|
+| 50 MHz  | SDR | 96.8  | 94.8  MB/s |
+| 100 MHz | SDR | 193.6 | 189.3 |
+| 150 MHz | SDR | 290.4 | 283.9 |
+| **175 MHz** | **DDR x8** | **341.1** | **332.3 MB/s** |
 
-- **Peak ~342 / ~337 MB/s at 175 MHz CK — 3.5× the bring-up baseline.** Change the clock with the
-  single `CK_MHZ` knob in [`fpga/axc3000/qsys/make_bw_sys.tcl`](fpga/axc3000/qsys/make_bw_sys.tcl).
-- **175 MHz is the SDR-PHY ceiling** (its 2×-byte clock hits a min-pulse-width limit). The device's
-  **200 MHz / 400 MB/s** maximum needs the DDIO PHY — tracked in
-  [issue #3](https://github.com/fpga-professional-association/hyperram/issues/3).
-- **Single bursts commit clean up to ~768 words** (≥1024 hits the device refresh window, tCSM ≈15 µs).
-  *Split* multi-burst **writes** (LEN > burst size) drop the last word of each non-final burst — a
-  W957D8NB write-commit quirk ([issue #1](https://github.com/fpga-professional-association/hyperram/issues/1));
-  workaround: drive writes as single bursts ≤512 words.
+- **Peak ~341 / ~332 MB/s at 175 MHz CK** (full-row 1024-word bursts pace 343.3/337.8 with the
+  known 4-word row-end cost). Clock knob: `CK_MHZ` in
+  [`fpga/axc3000/qsys/make_bw_sys.tcl`](fpga/axc3000/qsys/make_bw_sys.tcl). ~176 MHz is this
+  board's clean ceiling (the FABRIC2X CK generator's 2× clock hits the Agilex-3 min-pulse limit);
+  at 200 MHz everything FPGA-side is proven but a board-level single-ended-CK artifact remains —
+  the path to the chip's rated **250 MHz / 500 MB/s** is roadmapped in
+  [issue #12](https://github.com/fpga-professional-association/hyperram/issues/12) (see below).
+- **Device addressing laws (2026-07-09 silicon characterization, read-only-probe verified):** this
+  W957D8NB (1) **wounds the 4 words below any write CS#'s CA base** — unsuppressible (rollback,
+  pauses, CK dwells, masked lead-ins all falsified; reads never wound); (2) **linear bursts must
+  not cross its 1024-word row** (writes wrap back to the row start, reads release the bus — the
+  historic "16 KB boundary" was this law at coarser granularity); (3) a burst **ending exactly on
+  a row multiple garbles its own last 4 words**. The shipped configuration (row-aligned segments:
+  `MAX_BURST_WORDS=1024`, `BURST_BOUNDARY_WORDS=0x400`, write coalescing) is exactly-predictive:
+  transfers that stay inside one row are loss-free; streams that touch row transitions lose
+  exactly 4 known words per transition (e.g. 4096 words → 16). Full experiment trail:
+  [issue #1](https://github.com/fpga-professional-association/hyperram/issues/1),
+  [`fpga/axc3000/README.md`](fpga/axc3000/README.md), and `docs/INTERFACES.md` v10.
 - **Vendor-neutral core:** the controller + AXI4/Avalon front-ends contain no vendor primitives and
   simulate end-to-end under Verilator; only the PHY is device-specific. See
   **[Porting to your device](#porting-to-your-device)**.
@@ -368,11 +380,15 @@ amortizes. The read eye holds all the way to the 350 MHz byte clock with `CAPTUR
 - **Fit** (A3CY100, Quartus Pro 26.1, timing closed at 175 MHz CK): outclk0 (fabric) Fmax 189 MHz,
   outclk1 (byte) restricted Fmax **352.98 MHz** — the min-pulse-width limit that caps this 2×-byte SDR
   architecture at **~176 MHz CK**. ~1 k ALM / ~1.4 k reg / few M20K / 0 DSP / 1 PLL.
-- **Update (DDIO bring-up, branch `ddio-200`):** the DDIO PHY now works on silicon — Fitter
-  24403/24404 is solved, and the DDIO architecture matches the SDR ceiling (**344.7/337.3 MB/s at
-  175 MHz, ERR_COUNT=0**) with full split-burst write support. At 200 MHz everything logical works
-  (writes pace 390 MB/s, reads 384) but data integrity degrades — root-caused to **clock generation
-  and board wiring**, not the IP. See the subsection below and issue #12.
+- **Final DDR board build (branch `ddio-200`, 2026-07-09):** the DDIO/GPIO-cell build is the
+  shipping configuration — Fitter 24403/24404 solved, timing closed, **341.1 W / 332.3 R MB/s at
+  175 MHz, `ERR_COUNT=0`, 25-run soak clean**, with write coalescing and row-aligned segmenting
+  (`MAX_BURST_WORDS=1024` = `BURST_BOUNDARY_WORDS` = the device's 1024-word row). Multi-burst
+  write streams within one row are loss-free; row transitions cost exactly 4 known words each on
+  this silicon (the below-base wound — see the device-laws bullet at the top and issue #1). At
+  200 MHz everything logical works (writes pace 390 MB/s, reads 384) but data integrity degrades —
+  root-caused to **clock generation and board wiring**, not the IP. See the subsection below and
+  issue #12.
 
 ### Reaching the chip's rated maximum: 250 MHz / 500 MB/s needs differential, dedicated-pin CK
 
