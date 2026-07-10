@@ -61,7 +61,6 @@ set_global_assignment -name LAST_QUARTUS_VERSION "26.1.0 Pro Edition"
 # names below — the compile logs identify which one this Quartus/family accepts (unknown names are
 # reported/ignored); remove the rejected ones once identified.
 # KILL-TEST: delay chain suspected of killing the CK output entirely (capture shows no RWDS data strobe ever)
-set_instance_assignment -name OUTPUT_DELAY_CHAIN 255 -to hb_ck
 set_instance_assignment -name D5_DELAY 15 -to hb_ck -entity top
 
 # ---- hb_rwds input-delay eye-centring (issue #9, RX HARD_CHAIN) --------------------------------
@@ -72,3 +71,8 @@ set_instance_assignment -name D5_DELAY 15 -to hb_ck -entity top
 # so the delayed strobe lands mid-eye). Same hard-delay mechanism as hb_ck's OUTPUT_DELAY_CHAIN.
 # GPIO build: dq_cell's DDIO_WITH_DELAY provides the data-vs-strobe margin in-cell
 # set_instance_assignment -name INPUT_DELAY_CHAIN 8 -to hb_rwds
+
+# DQ0 write-eye nudge (200 MHz): the only marginal bit on silicon — byte-B slot, reads-as-1,
+# count varies run-to-run, read path proven stable (ID0 12/12). Shift DQ0's launch a fraction
+# of the eye so the device's CK falling-edge latch clears the transition.
+set_instance_assignment -name OUTPUT_DELAY_CHAIN 31 -to hb_dq[0]
