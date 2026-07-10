@@ -62,7 +62,7 @@ set_instance_parameter_value iopll gui_number_of_clocks          {2}
 set_instance_parameter_value iopll gui_output_clock_frequency0   $CK_MHZ
 set_instance_parameter_value iopll gui_phase_shift_deg0          {0.0}
 set_instance_parameter_value iopll gui_output_clock_frequency1   $BYTE_MHZ
-set_instance_parameter_value iopll gui_phase_shift_deg1          {90.0}
+set_instance_parameter_value iopll gui_phase_shift_deg1          {112.5}
 
 # Clock bridges: an IOPLL output clock that is BOTH exported AND fanned to internal sinks loses its
 # internal connections on save (the export wins). So the internal fabric (rst_ctrl, jtag_master)
