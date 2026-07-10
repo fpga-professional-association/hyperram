@@ -28,6 +28,10 @@ module hyperram_avalon
                                                                          //   WORD boundary (W957D8NB)
   parameter bit          WR_COMMIT_READ    = 1'b0,                       // interpose commit-read after
                                                                          //   each split memory write
+  parameter int unsigned COMMIT_READ_WORDS = 4,                          // commit-read length (words)
+  parameter              COMMIT_READ_MODE  = "SPAN_END",                 // SPAN_END|FULL_BURST|NEXT_ROW
+  parameter bit          WR_COALESCE       = 1'b0,                       // CS#-coalescing (issue #1 #4)
+  parameter int unsigned WR_COALESCE_WAIT  = 8,                          // cycles to await a splice cmd
   parameter bit          PROGRAM_CR        = 1'b1,                       // program CR0 at init
   parameter int unsigned POR_DELAY_CYCLES  = 0,                         // POR init delay (sim: 0)
   parameter logic [3:0]  INIT_LATENCY_CODE = hb_clocks_to_latency_code(LATENCY_CLOCKS),
@@ -185,6 +189,10 @@ module hyperram_avalon
     .MAX_BURST_WORDS   (MAX_BURST_WORDS),
     .BURST_BOUNDARY_WORDS (BURST_BOUNDARY_WORDS),
     .WR_COMMIT_READ    (WR_COMMIT_READ),
+    .COMMIT_READ_WORDS (COMMIT_READ_WORDS),
+    .COMMIT_READ_MODE  (COMMIT_READ_MODE),
+    .WR_COALESCE       (WR_COALESCE),
+    .WR_COALESCE_WAIT  (WR_COALESCE_WAIT),
     .PROGRAM_CR        (PROGRAM_CR),
     .POR_DELAY_CYCLES  (POR_DELAY_CYCLES),
     .INIT_LATENCY_CODE (INIT_LATENCY_CODE),

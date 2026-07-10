@@ -75,12 +75,23 @@ module hyperram_model
                                                                       //   this; the SELF-TIMED tail below reproduces it.
                                                                       //   0 = ideal device (keeps all existing TBs aligned).
     parameter bit          WR_COMMIT_QUIRK = 1'b0,                     // W957D8NB SPLIT-WRITE commit quirk (issue #1):
-                                                                      //   when 1, the FINAL word of every memory WRITE
-                                                                      //   burst is held pending (NOT committed to mem[])
-                                                                      //   and is committed only when a subsequent READ
-                                                                      //   transaction covers that address and delivers
-                                                                      //   >=2 words; a subsequent WRITE drops it. 0 =
-                                                                      //   ideal device (immediate commit; keeps TBs aligned).
+                                                                      //   when 1, the FINAL WR_PENDING_WORDS word(s) of
+                                                                      //   every memory WRITE burst are held pending (NOT
+                                                                      //   committed to mem[]) and are committed only when
+                                                                      //   a subsequent READ transaction starts AT OR
+                                                                      //   BEFORE the oldest pending word and reaches the
+                                                                      //   newest one (i.e. covers the WHOLE pending
+                                                                      //   range, not merely touches it); a subsequent
+                                                                      //   WRITE drops them. 0 = ideal device (immediate
+                                                                      //   commit; keeps TBs aligned).
+    parameter int unsigned WR_PENDING_WORDS = 1,                      // depth of the pending-write delay line (words
+                                                                      //   held back at the tail of every write burst).
+                                                                      //   1 = original issue #1 model (default, keeps
+                                                                      //   all existing TBs aligned); 2026-07-09 silicon
+                                                                      //   (175 MHz GPIO-I/O image) measured 4 on the
+                                                                      //   real W957D8NB — ERR_COUNT = 4*(n_bursts-1),
+                                                                      //   always the LAST FOUR words of each non-final
+                                                                      //   write burst.
     parameter int unsigned BURST_BOUNDARY_WORDS = 0,                  // W957D8NB 0x2000-WORD boundary quirk: when a
                                                                       //   single burst crosses this WORD-aligned boundary
                                                                       //   the device RELEASES the bus (stops driving on
@@ -147,19 +158,24 @@ module hyperram_model
   logic [DQ_WIDTH-1:0]     wr_hi;           // captured byte A during a register write
   logic                    stall_done;      // read-stall (STALL_CLOCKS) already injected this txn
 
-  // ---- split-write commit quirk (WR_COMMIT_QUIRK) ----
-  // `hold` = the most recent memory-write word within the CURRENT burst (delayed one word so the
-  // burst's LAST word is never committed here); at CS# deassert it moves to `pend`. `pend` = the last
-  // burst's held word, awaiting a covering read (commit) or the next write (drop).
-  logic                    hold_valid;
-  logic [AW-1:0]           hold_addr;
-  logic [DATA_WIDTH-1:0]   hold_word;
-  logic [1:0]              hold_we;         // per-byte write-enable {A,B} (unmasked bytes)
+  // ---- split-write commit quirk (WR_COMMIT_QUIRK / WR_PENDING_WORDS) ----
+  // `hold[]` is a WR_PENDING_WORDS-deep shift register of the most recent memory-write words within
+  // the CURRENT burst — index 0 = newest word, index WR_PENDING_WORDS-1 = oldest still-buffered word.
+  // Every new word evicts (commits to mem[]) whatever currently sits at the oldest slot and shifts the
+  // rest down, so a word commits only once WR_PENDING_WORDS newer words have arrived after it within
+  // the SAME burst: the burst's LAST WR_PENDING_WORDS words are therefore never committed here (they
+  // are still sitting in hold[] when CS# deasserts). At CS# deassert whatever remains valid in hold[]
+  // moves to `pend[]` — the just-closed burst's uncommitted tail, awaiting a covering read (commit, see
+  // the read-side trigger below) or the next write (drop, both modelled per-entry).
+  logic                    hold_valid [WR_PENDING_WORDS];
+  logic [AW-1:0]           hold_addr  [WR_PENDING_WORDS];
+  logic [DATA_WIDTH-1:0]   hold_word  [WR_PENDING_WORDS];
+  logic [1:0]              hold_we    [WR_PENDING_WORDS]; // per-byte write-enable {A,B} (unmasked bytes)
   logic                    whi_we;          // byte-A write-enable, captured on the rising edge
-  logic                    pend_valid;
-  logic [AW-1:0]           pend_addr;
-  logic [DATA_WIDTH-1:0]   pend_word;
-  logic [1:0]              pend_we;
+  logic                    pend_valid [WR_PENDING_WORDS];
+  logic [AW-1:0]           pend_addr  [WR_PENDING_WORDS];
+  logic [DATA_WIDTH-1:0]   pend_word  [WR_PENDING_WORDS];
+  logic [1:0]              pend_we    [WR_PENDING_WORDS];
 
   // ---- 0x2000-word boundary release quirk (BURST_BOUNDARY_WORDS) ----
   logic                    bnd_rel;         // this transaction crossed a boundary -> bus released
@@ -242,8 +258,10 @@ module hyperram_model
       pen_pending <= '0;
       wcnt        <= '0;
       stall_done  <= 1'b0;
-      hold_valid  <= 1'b0;
-      pend_valid  <= 1'b0;
+      for (int p = 0; p < WR_PENDING_WORDS; p++) begin
+        hold_valid[p] <= 1'b0;
+        pend_valid[p] <= 1'b0;
+      end
       bnd_rel     <= 1'b0;
       cs_q        <= 1'b1;
       ck_q        <= hb_ck;
@@ -263,14 +281,19 @@ module hyperram_model
       cs_q  <= 1'b1;
       ck_q  <= hb_ck;
       bnd_rel <= 1'b0;                         // boundary-release latch is per-transaction
-      // Split-write quirk: the word still held at CS# deassert is this burst's UNCOMMITTED last word.
-      // Move it to `pend` to await a covering read (commit) or the next write (drop). Idempotent.
-      if (WR_COMMIT_QUIRK && hold_valid) begin
-        pend_valid <= 1'b1;
-        pend_addr  <= hold_addr;
-        pend_word  <= hold_word;
-        pend_we    <= hold_we;
-        hold_valid <= 1'b0;
+      // Split-write quirk: whatever remains valid in `hold[]` at CS# deassert is this burst's
+      // UNCOMMITTED tail (up to WR_PENDING_WORDS words). Move it to `pend[]` to await a covering read
+      // (commit) or the next write (drop). Idempotent.
+      if (WR_COMMIT_QUIRK) begin
+        for (int p = 0; p < WR_PENDING_WORDS; p++) begin
+          if (hold_valid[p]) begin
+            pend_valid[p] <= 1'b1;
+            pend_addr[p]  <= hold_addr[p];
+            pend_word[p]  <= hold_word[p];
+            pend_we[p]    <= hold_we[p];
+          end
+          hold_valid[p] <= 1'b0;
+        end
       end
     end else if (cs_q) begin
       // CS# just fell: start of transaction. Decide the refresh-collision for this transaction
@@ -315,15 +338,17 @@ module hyperram_model
           //   edge index = 6 + 2*eff + 1 = 7 + 2*eff.
           first_data_beat <= 16'd7 + (eff << 1);
 
-          // Split-write quirk: a NEW memory WRITE drops any pending (uncommitted) word from the
-          // previous write burst (models "a following WRITE leaves the pending word uncommitted").
-          // The array location then reads back 0x0000 on the W957D8NB (issue #1: the lost word
-          // "reads back as 0x0000"), so zero it here — this reproduces the exact silicon fingerprint
+          // Split-write quirk: a NEW memory WRITE drops any pending (uncommitted) words from the
+          // previous write burst (models "a following WRITE leaves the pending word(s) uncommitted").
+          // Each array location then reads back 0x0000 on the W957D8NB (issue #1: the lost word(s)
+          // "read back as 0x0000"), so zero them here — this reproduces the exact silicon fingerprint
           // AND is robust to any prior committed value at that address. A read (incl. the master's
-          // commit-read) does NOT drop it — it commits it below.
+          // commit-read) does NOT unconditionally drop them — it may commit them below.
           if (WR_COMMIT_QUIRK && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca)) begin
-            if (pend_valid) mem[pend_addr] <= '0;
-            pend_valid <= 1'b0;
+            for (int p = 0; p < WR_PENDING_WORDS; p++) begin
+              if (pend_valid[p]) mem[pend_addr[p]] <= '0;
+              pend_valid[p] <= 1'b0;
+            end
           end
 
           // Data-phase address / burst setup.
@@ -358,14 +383,43 @@ module hyperram_model
             if ((BURST_BOUNDARY_WORDS != 0) && (wcnt != 32'd0) &&
                 ((32'(addr) % BURST_BOUNDARY_WORDS) == 32'd0))
               bnd_rel <= 1'b1;
-            // Split-write quirk: reading the pending address returns the held (uncommitted) value;
-            // if the read delivers >=2 words (this is at least the 2nd, wcnt>=1) it COMMITS it.
-            if (WR_COMMIT_QUIRK && pend_valid && !cur_as && (addr == pend_addr)) begin
-              out_word <= pend_word;
-              if (wcnt >= 32'd1) begin
-                if (pend_we[1]) mem[pend_addr][DATA_WIDTH-1:DQ_WIDTH] <= pend_word[DATA_WIDTH-1:DQ_WIDTH];
-                if (pend_we[0]) mem[pend_addr][DQ_WIDTH-1:0]          <= pend_word[DQ_WIDTH-1:0];
-                pend_valid <= 1'b0;
+            // Split-write quirk: reading ANY currently-pending address returns its held (uncommitted)
+            // value — readback correctness, the device's internal buffer still has the right data even
+            // though the array doesn't yet. Separately, the COMMIT trigger: reaching the NEWEST pending
+            // word (pend_addr[0], the burst's true last word — hold[]/pend[] are newest-first) on a
+            // read that started AT OR BEFORE the OLDEST pending word — i.e. this read has now delivered
+            // >= WR_PENDING_WORDS words, so it swept through the WHOLE pending range end-to-end, not
+            // merely touched it — commits every still-pending word. wcnt>=WR_PENDING_WORDS generalizes
+            // the original 1-word model's "wcnt>=1" trigger exactly (algebraically identical at
+            // WR_PENDING_WORDS=1, so every existing WR_COMMIT_QUIRK TB is untouched by this
+            // generalization); a short dummy read (issue #1 attempt #3) or a read spanning only the
+            // pending words themselves (e.g. a 4-word SPAN_END commit-read at WR_PENDING_WORDS=4 —
+            // 2026-07-09 silicon evidence) never satisfies it, matching both observed failures.
+            if (WR_COMMIT_QUIRK) begin
+              logic                  addr_pending;
+              logic [DATA_WIDTH-1:0] pend_out;
+              addr_pending = 1'b0;
+              pend_out     = '0;
+              for (int p = 0; p < WR_PENDING_WORDS; p++) begin
+                if (pend_valid[p] && (pend_addr[p] == addr)) begin
+                  addr_pending = 1'b1;
+                  pend_out     = pend_word[p];
+                end
+              end
+              if (addr_pending) out_word <= pend_out;
+              else              out_word <= cur_as ? reg_val : mem[addr];
+
+              if (pend_valid[0] && !cur_as && (addr == pend_addr[0]) &&
+                  (wcnt >= 32'(WR_PENDING_WORDS))) begin
+                for (int q = 0; q < WR_PENDING_WORDS; q++) begin
+                  if (pend_valid[q]) begin
+                    if (pend_we[q][1])
+                      mem[pend_addr[q]][DATA_WIDTH-1:DQ_WIDTH] <= pend_word[q][DATA_WIDTH-1:DQ_WIDTH];
+                    if (pend_we[q][0])
+                      mem[pend_addr[q]][DQ_WIDTH-1:0]          <= pend_word[q][DQ_WIDTH-1:0];
+                    pend_valid[q] <= 1'b0;
+                  end
+                end
               end
             end else begin
               out_word <= cur_as ? reg_val : mem[addr];
@@ -402,16 +456,29 @@ module hyperram_model
               end
               // ID0/ID1 are read-only: writes ignored.
             end else if (WR_COMMIT_QUIRK) begin
-              // Commit the PREVIOUS held word (never the current), so this burst's LAST word stays in
-              // `hold` at CS# deassert (-> pend). Honor per-byte masks; skip stores once bus-released.
-              if (hold_valid && !bnd_rel) begin
-                if (hold_we[1]) mem[hold_addr][DATA_WIDTH-1:DQ_WIDTH] <= hold_word[DATA_WIDTH-1:DQ_WIDTH];
-                if (hold_we[0]) mem[hold_addr][DQ_WIDTH-1:0]          <= hold_word[DQ_WIDTH-1:0];
+              // Commit the OLDEST held word (index WR_PENDING_WORDS-1 — never the current one), then
+              // shift every entry down one slot and push this word in at index 0. A burst's LAST
+              // WR_PENDING_WORDS words are therefore never committed here (still sitting in hold[] at
+              // CS# deassert). Honor per-byte masks; skip stores once bus-released. At WR_PENDING_WORDS=1
+              // this degenerates to exactly the original single-hold behavior (the shift loop is empty).
+              if (hold_valid[WR_PENDING_WORDS-1] && !bnd_rel) begin
+                if (hold_we[WR_PENDING_WORDS-1][1])
+                  mem[hold_addr[WR_PENDING_WORDS-1]][DATA_WIDTH-1:DQ_WIDTH]
+                      <= hold_word[WR_PENDING_WORDS-1][DATA_WIDTH-1:DQ_WIDTH];
+                if (hold_we[WR_PENDING_WORDS-1][0])
+                  mem[hold_addr[WR_PENDING_WORDS-1]][DQ_WIDTH-1:0]
+                      <= hold_word[WR_PENDING_WORDS-1][DQ_WIDTH-1:0];
               end
-              hold_addr  <= addr;
-              hold_word  <= {wr_hi, hb_dq_i};
-              hold_we    <= {whi_we, ~hb_rwds_i};
-              hold_valid <= 1'b1;
+              for (int p = WR_PENDING_WORDS - 1; p > 0; p--) begin
+                hold_valid[p] <= hold_valid[p-1];
+                hold_addr[p]  <= hold_addr[p-1];
+                hold_word[p]  <= hold_word[p-1];
+                hold_we[p]    <= hold_we[p-1];
+              end
+              hold_valid[0] <= 1'b1;
+              hold_addr[0]  <= addr;
+              hold_word[0]  <= {wr_hi, hb_dq_i};
+              hold_we[0]    <= {whi_we, ~hb_rwds_i};
             end else if (!hb_rwds_i && !bnd_rel) begin
               mem[addr][DQ_WIDTH-1:0] <= hb_dq_i;
             end

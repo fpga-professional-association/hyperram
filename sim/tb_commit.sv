@@ -1,20 +1,28 @@
 // tb_commit — regression for the W957D8NB SPLIT-WRITE commit quirk (issue #1), the 0x2000-word
-// boundary-release quirk, and the independent read-burst-size CSR (issue #2). It drives the EXACT
-// board stack — bench engine (hyperram_bw_test) -> hyperram_avalon (SDR PHY, RD_PREAMBLE_SKIP=1) ->
-// golden model — but the model now reproduces the two device quirks (WR_COMMIT_QUIRK,
-// BURST_BOUNDARY_WORDS) and the controller fixes them (WR_COMMIT_READ, BURST_BOUNDARY_WORDS).
+// boundary-release quirk, the independent read-burst-size CSR (issue #2), and (2026-07-09 silicon
+// evidence) the WR_PENDING_WORDS=4 remedy iteration: CS#-coalescing (WR_COALESCE, direction 4) and the
+// FULL_BURST commit-read shape (COMMIT_READ_MODE, direction 1 re-shaped). It drives the EXACT board
+// stack — bench engine (hyperram_bw_test) -> hyperram_avalon (SDR PHY, RD_PREAMBLE_SKIP=1) -> golden
+// model — but the model now reproduces the two device quirks (WR_COMMIT_QUIRK, BURST_BOUNDARY_WORDS)
+// and the controller fixes them (WR_COMMIT_READ, BURST_BOUNDARY_WORDS, WR_COALESCE).
 //
-// Six independent stacks (each = engine + controller + model, differing only in the DUT/model
+// Ten independent stacks (each = engine + controller + model, differing only in the DUT/model
 // parameters below) let one testbench prove every direction at once:
 //
-//   idx  DUT WR_COMMIT_READ  DUT boundary  model WR_QUIRK  model boundary  model over-stream  proves
-//   ---  -----------------  ------------  -------------  --------------  ----------------  ----------------
-//    0        0 (off)            0            1 (on)          0                0            commit: FAIL (n-1)
-//    1        1 (on)             0            1 (on)          0                0            commit: PASS (0)
-//    2        0                  0            0               0x2000           0            boundary: FAIL
-//    3        0                  0x2000       0               0x2000           0            boundary: PASS
-//    4        1                  0x2000       1               0x2000           0            compose: PASS
-//    5        0                  0            0               0                9            read-split: PASS
+//   idx  DUT WR_COMMIT_READ  DUT boundary  DUT COALESCE  model WR_QUIRK  model boundary  model OS  model PEND  proves
+//   ---  -----------------  ------------  ------------  -------------  --------------  --------  ----------  ----------------
+//    0        0 (off)            0             0             1 (on)          0             0          1        commit: FAIL (n-1)
+//    1        1 (on)             0             0             1 (on)          0             0          1        commit: PASS (0)
+//    2        0                  0             0             0               0x2000        0          1        boundary: FAIL
+//    3        0                  0x2000        0             0               0x2000        0          1        boundary: PASS
+//    4        1                  0x2000        0             1               0x2000        0          1        compose: PASS
+//    5        0                  0             0             0               0              9          1        read-split: PASS
+//    6        0                  0             1             1               0              0          4        depth4 COALESCE: PASS (0)
+//    7        1 (SPAN_END)       0             0             1               0              0          4        depth4 SPAN_END: FAIL (4*(n-1))
+//    8        0                  0             0             1               0              0          4        depth4 nofix: FAIL (4*(n-1))
+//    9*       1 (FULL_BURST)     0             0             1               0              0          4        depth4 FULL_BURST: PASS (0)
+//   * idx 9 is a standalone instance below (not generate-for-driven), so its string-typed
+//     COMMIT_READ_MODE="FULL_BURST" override is a plain per-instance literal.
 //
 //   - idx 0 reproduces the silicon signature ERR_COUNT == n_write_bursts-1 for a split multi-burst
 //     write (LEN=32/burst16 ->1, LEN=64/16 ->3, LEN=256/64 ->3); idx 1 is the SAME sweep with the
@@ -26,6 +34,12 @@
 //     split segment gets a commit-read (the intended composition) -> ERR_COUNT=0.
 //   - idx 5: write a single (correct) burst, split the READ into many via REG_RBURSTW, against a clean
 //     model that over-streams like the silicon -> ERR_COUNT=0 (isolates the multi-burst READ path).
+//   - idx 6/7/8/9 (2026-07-09 silicon: the real W957D8NB holds FOUR pending words, not one) re-run the
+//     SAME split-write sweep at WR_PENDING_WORDS=4: idx 8 (no fix) and idx 7 (the OLD SPAN_END
+//     commit-read shape) both now reproduce ERR = 4*(n_bursts-1) — the 4-word span-end read exactly
+//     covers the 4 pending words but no longer STARTS before them, so it never satisfies the "covers
+//     the whole pending range" commit trigger (same failure class as issue #1 attempt #3); idx 6
+//     (WR_COALESCE alone) and idx 9 (COMMIT_READ_MODE=FULL_BURST alone) both restore ERR_COUNT=0.
 //
 // Every poll loop is BOUNDED, so a hang shows up as a FAIL (bounded timeout) not an infinite loop.
 // Runs under: verilator --binary --timing (5.020).
@@ -44,7 +58,13 @@ module commit_stack
     parameter int unsigned DUT_BOUNDARY   = 0,      // DUT: chop at this WORD boundary (0 = off)
     parameter bit          MDL_WR_QUIRK   = 1'b0,   // model: split-write commit quirk
     parameter int unsigned MDL_BOUNDARY   = 0,      // model: 0x2000-word boundary release quirk
-    parameter int unsigned MDL_OS         = 0       // model: read over-stream words
+    parameter int unsigned MDL_OS         = 0,      // model: read over-stream words
+    // -- issue #1 remedy A/B iteration (2026-07-09 silicon: WR_PENDING_WORDS=4 on the real device) --
+    parameter bit          WR_COALESCE      = 1'b0, // DUT: CS#-coalescing (direction 4)
+    parameter int unsigned WR_COALESCE_WAIT = 8,     // DUT: cycles to await a splice command
+    parameter              COMMIT_READ_MODE = "SPAN_END",  // DUT: SPAN_END|FULL_BURST|NEXT_ROW
+    parameter int unsigned COMMIT_READ_WORDS= 4,     // DUT: fixed-shape commit-read length
+    parameter int unsigned MDL_PEND_WORDS   = 1      // model: pending-write delay-line depth
 ) (
     input  logic                        clk,
     input  logic                        clk90,
@@ -112,6 +132,10 @@ module commit_stack
     .MAX_BURST_WORDS  (0),
     .BURST_BOUNDARY_WORDS (DUT_BOUNDARY),
     .WR_COMMIT_READ   (WR_COMMIT_READ),
+    .COMMIT_READ_WORDS(COMMIT_READ_WORDS),
+    .COMMIT_READ_MODE (COMMIT_READ_MODE),
+    .WR_COALESCE      (WR_COALESCE),
+    .WR_COALESCE_WAIT (WR_COALESCE_WAIT),
     .PROGRAM_CR       (1'b1),
     .POR_DELAY_CYCLES (0),
     .INIT_CR0         (TB_INIT_CR0),
@@ -139,6 +163,7 @@ module commit_stack
     .RD_PREAMBLE_CLOCKS   (1),               // matches RD_PREAMBLE_SKIP=1 on the SDR PHY
     .RD_OVERSTREAM_WORDS  (MDL_OS),
     .WR_COMMIT_QUIRK      (MDL_WR_QUIRK),
+    .WR_PENDING_WORDS     (MDL_PEND_WORDS),
     .BURST_BOUNDARY_WORDS (MDL_BOUNDARY)
   ) model (
     .hb_ck (hb_ck), .hb_ck_n (hb_ck_n), .hb_cs_n (hb_cs_n), .hb_rst_n (hb_rst_n),
@@ -173,14 +198,28 @@ module tb_commit;
   initial begin clk_ref = 1'b0; forever #5.0  clk_ref = ~clk_ref; end
 
   // --------------------------------------------------------------------
-  // The six stacks. Per-stack parameters (see the header table) selected by genvar index.
+  // The stacks. Per-stack parameters (see the header table) selected by genvar index.
+  //
+  // idx 0-5: the original six (issue #1 commit-read + boundary + REG_RBURSTW), unchanged.
+  // idx 6-8: 2026-07-09 silicon evidence — the W957D8NB actually holds WR_PENDING_WORDS=4 words
+  //   pending (not 1), so the split-write sweep is re-run at that depth:
+  //     6  WR_COALESCE=1 alone (issue #1 direction 4)      -> expect ERR=0   (single-CS# by construction)
+  //     7  WR_COMMIT_READ=1, COMMIT_READ_MODE=SPAN_END(default) -> expect ERR=4*(n-1) (same class as
+  //        issue #1 attempt #3 — a 4-word span read no longer triggers a 4-deep pending commit; this
+  //        is the exact regression the 2026-07-09 silicon run found)
+  //     8  defaults off (no fix)                            -> expect ERR=4*(n-1) (silicon signature)
+  // idx 9 (standalone, below): WR_COMMIT_READ=1, COMMIT_READ_MODE=FULL_BURST -> expect ERR=0 (direction 1
+  //   re-shaped: re-read the ENTIRE just-closed write segment from its base, not just its span-end).
   // --------------------------------------------------------------------
-  localparam int NSTACK = 6;
-  localparam bit STK_WCR  [NSTACK] = '{1'b0, 1'b1, 1'b0, 1'b0,  1'b1,  1'b0};   // DUT WR_COMMIT_READ
-  localparam int STK_DBND [NSTACK] = '{0,    0,    0,    8192,  8192,  0};       // DUT boundary chop
-  localparam bit STK_MWCQ [NSTACK] = '{1'b1, 1'b1, 1'b0, 1'b0,  1'b1,  1'b0};   // model WR_COMMIT_QUIRK
-  localparam int STK_MBND [NSTACK] = '{0,    0,    8192, 8192,  8192,  0};       // model boundary release
-  localparam int STK_MOS  [NSTACK] = '{0,    0,    0,    0,     0,     9};       // model read over-stream
+  localparam int GEN_N  = 9;                                    // idx 0-8: array/generate-for driven
+  localparam int NSTACK = 10;                                   // + idx 9: standalone (FULL_BURST)
+  localparam bit STK_WCR   [GEN_N] = '{1'b0, 1'b1, 1'b0, 1'b0,  1'b1,  1'b0, 1'b0, 1'b1, 1'b0};  // DUT WR_COMMIT_READ
+  localparam int STK_DBND  [GEN_N] = '{0,    0,    0,    8192,  8192,  0,    0,    0,    0};      // DUT boundary chop
+  localparam bit STK_MWCQ  [GEN_N] = '{1'b1, 1'b1, 1'b0, 1'b0,  1'b1,  1'b0, 1'b1, 1'b1, 1'b1};  // model WR_COMMIT_QUIRK
+  localparam int STK_MBND  [GEN_N] = '{0,    0,    8192, 8192,  8192,  0,    0,    0,    0};      // model boundary release
+  localparam int STK_MOS   [GEN_N] = '{0,    0,    0,    0,     0,     9,    0,    0,    0};      // model read over-stream
+  localparam bit STK_WCOAL [GEN_N] = '{1'b0, 1'b0, 1'b0, 1'b0,  1'b0,  1'b0, 1'b1, 1'b0, 1'b0};  // DUT WR_COALESCE
+  localparam int STK_MPEND [GEN_N] = '{1,    1,    1,    1,     1,     1,    4,    4,    4};      // model WR_PENDING_WORDS
 
   logic [CSR_ADDR_WIDTH-1:0] s_addr  [NSTACK];
   logic                      s_read  [NSTACK];
@@ -191,14 +230,16 @@ module tb_commit;
   logic                      s_initd [NSTACK];
 
   generate
-    for (genvar i = 0; i < NSTACK; i++) begin : g_stk
+    for (genvar i = 0; i < GEN_N; i++) begin : g_stk
       commit_stack #(
         .CSR_ADDR_WIDTH (CSR_ADDR_WIDTH),
         .WR_COMMIT_READ (STK_WCR[i]),
         .DUT_BOUNDARY   (STK_DBND[i]),
         .MDL_WR_QUIRK   (STK_MWCQ[i]),
         .MDL_BOUNDARY   (STK_MBND[i]),
-        .MDL_OS         (STK_MOS[i])
+        .MDL_OS         (STK_MOS[i]),
+        .WR_COALESCE    (STK_WCOAL[i]),
+        .MDL_PEND_WORDS (STK_MPEND[i])
       ) u (
         .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
         .csr_address (s_addr[i]), .csr_read (s_read[i]), .csr_write (s_write[i]),
@@ -207,6 +248,25 @@ module tb_commit;
       );
     end
   endgenerate
+
+  // idx 9 (standalone — not generate-for-driven, so the string-typed COMMIT_READ_MODE override can be
+  // a plain literal): WR_COMMIT_READ + COMMIT_READ_MODE="FULL_BURST" against WR_PENDING_WORDS=4.
+  commit_stack #(
+    .CSR_ADDR_WIDTH    (CSR_ADDR_WIDTH),
+    .WR_COMMIT_READ    (1'b1),
+    .DUT_BOUNDARY      (0),
+    .MDL_WR_QUIRK      (1'b1),
+    .MDL_BOUNDARY      (0),
+    .MDL_OS            (0),
+    .WR_COALESCE       (1'b0),
+    .COMMIT_READ_MODE  ("FULL_BURST"),
+    .MDL_PEND_WORDS    (4)
+  ) u_stk9 (
+    .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    .csr_address (s_addr[9]), .csr_read (s_read[9]), .csr_write (s_write[9]),
+    .csr_writedata (s_wdata[9]), .csr_readdata (s_rdata[9]),
+    .csr_waitrequest (s_wait[9]), .init_done (s_initd[9])
+  );
 
   // --------------------------------------------------------------------
   // Scoreboard
@@ -359,6 +419,45 @@ module tb_commit;
     $display("   [rsplit ] done=%0b ERR=%0d STATUS=0x%08x (expect ERR=0)", done, err, status);
     check(done, "read-split did not complete (multi-burst read HANG)");
     check(err == 32'd0, $sformatf("read-split ERR=%0d expected 0 (multi-burst READ path)", err));
+
+    // ---- (E) 2026-07-09 silicon: WR_PENDING_WORDS=4 (the real W957D8NB holds FOUR words pending,
+    // not one) — re-run the SAME split-write sweep against both remedies (A: WR_COALESCE, B: commit-read
+    // reshaped to FULL_BURST), plus proof that the OLD SPAN_END shape and no-fix both now reproduce the
+    // silicon fingerprint ERR = 4*(n_bursts-1) (4 words lost per non-final boundary, not 1).
+    $display("-- (E) WR_PENDING_WORDS=4 split-write sweep (base=0x100) --");
+    for (int i = 0; i < NSW; i++) begin
+      run_one(8, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
+      $display("   [depth4 nofix    ] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect %0d)",
+               sw_len[i], sw_burst[i], done, err, 4 * sw_nm1[i]);
+      check(done, $sformatf("depth4 nofix LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
+      check(err == 32'(4 * sw_nm1[i]),
+            $sformatf("depth4 nofix LEN=%0d ERR=%0d expected %0d (silicon signature 4*(n_bursts-1))",
+                      sw_len[i], err, 4 * sw_nm1[i]));
+
+      run_one(7, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
+      $display("   [depth4 SPAN_END ] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect %0d — attempt #3 class)",
+               sw_len[i], sw_burst[i], done, err, 4 * sw_nm1[i]);
+      check(done, $sformatf("depth4 SPAN_END LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
+      check(err == 32'(4 * sw_nm1[i]),
+            $sformatf("depth4 SPAN_END LEN=%0d ERR=%0d expected %0d (a 4-word span-end read no longer spans PAST the 4-deep pending region, so it must NOT commit)",
+                      sw_len[i], err, 4 * sw_nm1[i]));
+
+      run_one(6, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
+      $display("   [depth4 COALESCE ] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect 0)",
+               sw_len[i], sw_burst[i], done, err);
+      check(done, $sformatf("depth4 COALESCE LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
+      check(err == 32'd0,
+            $sformatf("depth4 COALESCE LEN=%0d ERR=%0d expected 0 (single-CS# by construction)",
+                      sw_len[i], err));
+
+      run_one(9, sw_len[i][31:0], 32'h0000_0100, sw_burst[i][31:0], sw_burst[i][31:0], done, status, err);
+      $display("   [depth4 FULL_BURST] LEN=%0d wburst=%0d done=%0b ERR=%0d (expect 0)",
+               sw_len[i], sw_burst[i], done, err);
+      check(done, $sformatf("depth4 FULL_BURST LEN=%0d did not complete (STATUS=0x%08x)", sw_len[i], status));
+      check(err == 32'd0,
+            $sformatf("depth4 FULL_BURST LEN=%0d ERR=%0d expected 0 (re-reads the whole just-closed segment)",
+                      sw_len[i], err));
+    end
 
     $display("==================================================================");
     $display("[%0t] tb_commit done: %0d errors", $time, errors);

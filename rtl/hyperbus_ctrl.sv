@@ -61,7 +61,44 @@ module hyperbus_ctrl
     // AXC3000 GPIO-I/O bring-up the device's write window opens exactly 3 CK after the
     // spec-anchored wait ends (silicon-measured: mem[k]=pat(k+3) at trim 0, pat(k+6) at trim -3 —
     // the offset tracks the knob 1:1). Default 0 = spec behavior.
-    parameter int unsigned WR_LAT_TRIM          = 0
+    parameter int unsigned WR_LAT_TRIM          = 0,
+    // Internal commit-read length (WR_COMMIT_READ), in words. Must be >= 2 (a 1-word dummy read does
+    // NOT trigger the device write-commit; issue #1 attempt #3) and, for COMMIT_READ_MODE=SPAN_END,
+    // small enough to never itself cross a BURST_BOUNDARY_WORDS boundary. 4 matched the on-silicon
+    // "working read phase" trigger against a 1-word pending write buffer — see COMMIT_READ_MODE.
+    parameter int unsigned COMMIT_READ_WORDS    = 4,
+    // Shape of the internal commit-read (issue #1 direction iteration, 2026-07-09 silicon evidence).
+    // SPAN_END (default; the original fix): a COMMIT_READ_WORDS-word linear read ENDING on the
+    // just-written last word. Silicon-proven against a 1-word pending write buffer, but new evidence
+    // (175 MHz GPIO-I/O image) shows the W957D8NB actually holds the LAST FOUR words of every
+    // non-final write burst pending (ERR_COUNT = 4*(n_bursts-1), always words [len-4..len-1]) — a
+    // 4-word SPAN_END read exactly spans those four words yet no longer triggers the commit (same
+    // failure class as issue #1 attempt #3's short dummy read). FULL_BURST: re-read the ENTIRE
+    // just-closed write segment from its true base (wr_seg_base/wr_seg_len) — the shape silicon
+    // PROVES commits (bw's own full-range read-back phase always commits everything), and is robust
+    // to a pending depth the controller cannot otherwise know. NEXT_ROW (issue #1 direction 3,
+    // untried on silicon): read COMMIT_READ_WORDS words at last_wr_addr with bit 12 flipped (a
+    // different 4K row), on the row-close/precharge hypothesis.
+    parameter              COMMIT_READ_MODE     = "SPAN_END",  // SPAN_END | FULL_BURST | NEXT_ROW
+    // CS#-COALESCING (issue #1 direction 4 — the deterministic fix for transfers under tCSM). When a
+    // memory-write command finishes and a NEW, contiguous (cmd_addr == just-written-end), linear,
+    // memory-space write command is already valid — or arrives within WR_COALESCE_WAIT cycles — do
+    // NOT close CS#: hold the SAME HyperBus burst open (CS# stays Low) and wait for the new command's
+    // first data word, then continue streaming without a new CA/latency phase. This makes split writes
+    // single-CS# by construction, sidestepping the write-commit quirk entirely for transfers that fit
+    // under the MAX_BURST_WORDS / BURST_BOUNDARY_WORDS caps (still respected across the coalesced
+    // stream — the combined burst chops exactly like one long native command would; the chop boundary
+    // itself may still need WR_COMMIT_READ). The wait holds CK STOPPED rather than streaming a masked
+    // filler word: the master's own burst address auto-increments on every CK edge regardless of RWDS
+    // masking (SPEC_DIGEST §4 — RWDS only masks which BYTES of a word are written, not whether the
+    // word's address slot is consumed), so a *toggling* masked filler would silently shift every word
+    // of the spliced-in command's data by one address — verified against the golden model, which
+    // reproduces this address-continuity rule. Holding CK idle (mirroring the ST_RD_DRAIN precedent)
+    // keeps the burst address exactly at last_wr_addr+1 for as long as the wait lasts, so the spliced
+    // command's first real word lands exactly where it should. Default 0 = off (bit-identical to prior
+    // instantiations).
+    parameter bit          WR_COALESCE          = 1'b0,
+    parameter int unsigned WR_COALESCE_WAIT     = 8            // cycles to wait for a coalescing cmd
 ) (
     input  logic                    clk,
     input  logic                    rst,            // synchronous, active high
@@ -147,11 +184,6 @@ module hyperbus_ctrl
                                                                     // words (bursts >=6 hung). 32 covers the
                                                                     // board's 16-word bursts with slack.
   localparam int unsigned RD_AW            = $clog2(RD_FIFO_DEPTH);
-  // Internal commit-read length (WR_COMMIT_READ). Must be >= 2 words (a 1-word dummy read does NOT
-  // trigger the device write-commit; issue #1 approach #3) and small enough to never itself cross a
-  // BURST_BOUNDARY_WORDS boundary (it reads backwards from the just-written last word, which lies in
-  // an un-crossed segment). 4 matches the on-silicon "working read phase" trigger.
-  localparam int unsigned COMMIT_READ_WORDS = 4;
 
   typedef enum logic [3:0] {
     ST_RESET,   // device reset asserted
@@ -165,6 +197,8 @@ module hyperbus_ctrl
     ST_RD_ABORT,// read aborted (RWDS timeout): drain remaining beats as flagged filler
     ST_RD_DRAIN,// post-read: CK stopped, receiver kept armed to absorb+discard over-stream stragglers
     ST_WRITE,   // write-data phase
+    ST_WR_COALESCE, // WR_COALESCE: burst held open past command end, CS# Low / CK STOPPED, waiting
+                    // (up to WR_COALESCE_WAIT cycles) for a contiguous write command to splice in
     ST_TAIL,    // CS# held Low after last word (tCSH note)
     ST_RECOVER  // CS# High, tCSHI/tRWR recovery
   } state_e;
@@ -201,8 +235,25 @@ module hyperbus_ctrl
   logic                    wr_pending_commit;
   logic                    commit_resume;
   logic [ADDR_WIDTH-1:0]   last_wr_addr; // last WORD address written in the most recent write segment
+  logic [ADDR_WIDTH-1:0]   wr_seg_base;  // base WORD address of the most recently CLOSED write segment
+  logic [LEN_WIDTH-1:0]    wr_seg_len;   // word length of the most recently CLOSED write segment
+                                        //   (COMMIT_READ_MODE=FULL_BURST re-reads [wr_seg_base +:
+                                        //   wr_seg_len]; both mirror last_wr_addr's capture point)
   logic [ADDR_WIDTH-1:0]   sv_addr;      // shadow: write-segment start to resume after a chop commit-read
   logic [LEN_WIDTH-1:0]    sv_rem;       // shadow: words remaining to resume after a chop commit-read
+
+  // -- CS#-coalescing (WR_COALESCE). `seg_cap_left` is the hardware-cap (MAX_BURST_WORDS /
+  //    BURST_BOUNDARY_WORDS) word budget LEFT in the CURRENTLY OPEN CS# burst: (re-)initialized to
+  //    hw_cap(base) at every genuine new CS# open (ST_IDLE accept, ST_RECOVER reopen) and decremented
+  //    by exactly ONE for every REAL word actually sent in ST_WRITE thereafter, for as long as this
+  //    SAME CS# stays open, even across multiple spliced-in native commands (ST_WR_COALESCE's wait
+  //    holds CK stopped — see its state comment — so it never itself consumes budget). This continuous,
+  //    single-counter tracking (rather than re-deriving a fresh per-address budget at each splice) is
+  //    what keeps a multi-command coalescing chain correctly bounded by the ORIGINAL burst's
+  //    tCSM/boundary budget. `coalesce_wait_cnt` bounds how long the bus is held open with no
+  //    qualifying command (WR_COALESCE_WAIT cycles). --
+  logic [LEN_WIDTH-1:0]    seg_cap_left;
+  logic [15:0]             coalesce_wait_cnt;
 
   // read holding FIFO ({last, data})
   logic [DATA_WIDTH:0]     rd_fifo [RD_FIFO_DEPTH];
@@ -276,15 +327,72 @@ module hyperbus_ctrl
     return lim;
   endfunction
 
+  // Hardware-cap (MAX_BURST_WORDS / BURST_BOUNDARY_WORDS) word budget for a CS# burst based at word
+  // address `addr` — seg_size() with an "unbounded" request length, so only the two caps apply. Used
+  // to (re-)initialize seg_cap_left at every genuine new CS# open (WR_COALESCE then tracks it
+  // CONTINUOUSLY from there, one word at a time — see seg_cap_left's declaration — so a multi-command
+  // coalescing chain is bounded by the budget of the burst that ACTUALLY stayed open, not a fresh
+  // budget re-derived from whichever command's address happens to be current at each splice).
+  function automatic logic [LEN_WIDTH-1:0] hw_cap(input logic [ADDR_WIDTH-1:0] addr);
+    return seg_size({LEN_WIDTH{1'b1}}, 1'b0, addr);
+  endfunction
+
   // Base WORD address for the internal commit-read so that a COMMIT_READ_WORDS-word linear read
   // [base .. base+COMMIT_READ_WORDS-1] SPANS (ends on) the just-written word `la` (issue #1: the read
-  // must cover the pending address). Clamped at 0 for very low addresses.
+  // must cover the pending address). Clamped at 0 for very low addresses. Used by SPAN_END; also the
+  // NEXT_ROW clamp guard (both index off the last written word, not the segment base).
   function automatic logic [ADDR_WIDTH-1:0] commit_base(input logic [ADDR_WIDTH-1:0] la);
     if (la >= ADDR_WIDTH'(COMMIT_READ_WORDS - 1))
       return la - ADDR_WIDTH'(COMMIT_READ_WORDS - 1);
     else
       return '0;
   endfunction
+
+  // Commit-read base/length per COMMIT_READ_MODE (see the parameter comment for the rationale of
+  // each shape). `la` = last_wr_addr (the just-written segment's last word); `base`/`len` = the
+  // just-closed segment's own [wr_seg_base, wr_seg_len] (FULL_BURST only).
+  function automatic logic [ADDR_WIDTH-1:0] commit_read_base(input logic [ADDR_WIDTH-1:0] la,
+                                                              input logic [ADDR_WIDTH-1:0] base);
+    if (COMMIT_READ_MODE == "FULL_BURST")
+      return base;
+    else if (COMMIT_READ_MODE == "NEXT_ROW")
+      return la ^ ADDR_WIDTH'(32'h0000_1000);
+    else // "SPAN_END" (default)
+      return commit_base(la);
+  endfunction
+
+  function automatic logic [LEN_WIDTH-1:0] commit_read_len(input logic [LEN_WIDTH-1:0] len);
+    if (COMMIT_READ_MODE == "FULL_BURST")
+      return len;
+    else // SPAN_END / NEXT_ROW: fixed-length read
+      return LEN_WIDTH'(COMMIT_READ_WORDS);
+  endfunction
+
+  // -- CS#-coalescing (WR_COALESCE) combinational helpers -------------------------------------------
+  // Coalescing eligibility, sampled at the ST_WRITE seg_left==1 & rem_left==1 transition (a plain
+  // linear memory write is completing): only worth trying if seg_cap_left — the LIVE, continuously
+  // tracked hw-cap budget for the CURRENTLY OPEN CS# burst (see its declaration) — shows room for at
+  // least one more word after the one this cycle is sending. seg_cap_left is read here BEFORE this
+  // cycle's own decrement takes effect, so ">1" (not "!=0") is the correct "room after this word" test.
+  wire coalesce_try = WR_COALESCE & ~cur_read & ~cur_reg & ~cur_wrap & ~doing_init & ~doing_commit &
+                      (seg_cap_left > LEN_WIDTH'(1));
+
+  // A new, contiguous (picks up exactly where the closed segment left off), linear, memory-space
+  // WRITE command, with hw-cap room left to accept at least one of its words. NOTE: unlike the write-
+  // data underrun filler (ST_WRITE, wsrc_valid low -> RWDS=11 for ONE word with CK still toggling),
+  // ST_WR_COALESCE's wait holds CK STOPPED (see its combinational drive) rather than toggling a masked
+  // filler word, so seg_cap_left is not consumed while waiting — it still holds exactly the value left
+  // after the last REAL word (ST_WRITE's own per-word countdown).
+  wire coalesce_match = cmd_valid & ~cmd_read & ~cmd_reg & ~cmd_wrap &
+                        (cmd_addr == last_wr_addr + ADDR_WIDTH'(1)) & (seg_cap_left != '0);
+
+  // Accepted length for a coalescing splice: the new command's own boundary/MAX_BURST_WORDS cap (from
+  // its own address), further clipped to the room actually left in the still-open CS# burst. If this
+  // is less than cmd_len the remainder becomes a further chop, handled by the existing seg_left/
+  // rem_left machinery once this spliced-in segment itself closes (no special-casing needed).
+  wire [LEN_WIDTH-1:0] coalesce_new_seg    = seg_size(cmd_len, 1'b0, cmd_addr);
+  wire [LEN_WIDTH-1:0] coalesce_accept_len = (coalesce_new_seg < seg_cap_left) ? coalesce_new_seg
+                                                                                : seg_cap_left;
 
   // ------------------------------------------------------------------------
   // Read data-out (FIFO front)
@@ -361,6 +469,27 @@ module hyperbus_ctrl
         busy = ~doing_init;
       end
 
+      ST_WR_COALESCE: begin
+        // WR_COALESCE: hold the burst open — CS# stays Low — while waiting for the splice command.
+        // phy_ck_en is deliberately left at its default (0, CK STOPPED): the burst address advances on
+        // every CK edge regardless of RWDS masking (SPEC_DIGEST §4), so toggling CK with a masked
+        // filler word here would silently shift the spliced-in command's address by one per wait cycle
+        // (caught in simulation against the golden model). Holding CK idle — the same technique
+        // ST_RD_DRAIN already uses to stop the device without deselecting it — keeps the burst address
+        // pinned at last_wr_addr+1 for the whole wait. DQ/RWDS are still driven to known (masked)
+        // values rather than left floating, though with CK idle nothing latches them. cmd_ready is
+        // asserted ONLY when a qualifying contiguous write command is present this cycle, so a
+        // non-matching command is simply left waiting (standard ready/valid semantics) rather than
+        // being incorrectly consumed.
+        phy_cs_n    = 1'b0;
+        phy_dq_oe   = 1'b1;
+        phy_dq_o    = '0;
+        phy_rwds_oe = 1'b1;
+        phy_rwds_o  = 2'b11;
+        cmd_ready   = coalesce_match;
+        busy        = ~doing_init;
+      end
+
       ST_TAIL:     busy = ~doing_init;
       ST_RECOVER:  busy = ~doing_init;
       ST_RD_ABORT: busy = ~doing_init;   // CS# High (idle bus); draining flagged filler to the FIFO
@@ -382,18 +511,19 @@ module hyperbus_ctrl
     if (state == ST_TAIL) phy_cs_n = 1'b0;   // hold CS# Low through the tail
   end
 
-  // Launch an internal COMMIT-READ (WR_COMMIT_READ): a linear memory read of COMMIT_READ_WORDS words
-  // based at `base`, marked doing_commit so its recovered data is discarded (never enters rd_fifo).
-  // Drives the transaction context exactly like a user read accepted in ST_IDLE, then enters ST_CS.
-  task automatic launch_commit_read(input logic [ADDR_WIDTH-1:0] base);
+  // Launch an internal COMMIT-READ (WR_COMMIT_READ): a linear memory read of `len` words based at
+  // `base` (shaped by COMMIT_READ_MODE — see commit_read_base/commit_read_len), marked doing_commit
+  // so its recovered data is discarded (never enters rd_fifo). Drives the transaction context exactly
+  // like a user read accepted in ST_IDLE, then enters ST_CS.
+  task automatic launch_commit_read(input logic [ADDR_WIDTH-1:0] base, input logic [LEN_WIDTH-1:0] len);
     doing_commit <= 1'b1;
     cur_read     <= 1'b1;
     cur_reg      <= 1'b0;
     cur_wrap     <= 1'b0;
     cur_addr     <= base;
-    rem_left     <= LEN_WIDTH'(COMMIT_READ_WORDS);
-    seg_count    <= LEN_WIDTH'(COMMIT_READ_WORDS);
-    seg_left     <= LEN_WIDTH'(COMMIT_READ_WORDS);
+    rem_left     <= len;
+    seg_count    <= len;
+    seg_left     <= len;
     ca_reg       <= hb_pack_ca(1'b1, 1'b0, 1'b1, base);   // read, memory, linear
     rwds_hi      <= 1'b0;
     ca_idx       <= 2'd0;
@@ -420,8 +550,12 @@ module hyperbus_ctrl
       wr_pending_commit <= 1'b0;
       commit_resume     <= 1'b0;
       last_wr_addr <= '0;
+      wr_seg_base  <= '0;
+      wr_seg_len   <= '0;
       sv_addr      <= '0;
       sv_rem       <= '0;
+      seg_cap_left      <= '0;
+      coalesce_wait_cnt <= '0;
       cur_read     <= 1'b0;
       cur_reg      <= 1'b0;
       cur_wrap     <= 1'b0;
@@ -489,10 +623,11 @@ module hyperbus_ctrl
           if (init_done & rd_fifo_empty) begin
             if (commit_gate) begin
               // DEFERRED write->write interpose: a new memory write is pending but the previous
-              // write still needs committing. Self-issue the commit-read (spanning last_wr_addr);
+              // write still needs committing. Self-issue the commit-read (shaped by COMMIT_READ_MODE);
               // the pending write command is NOT accepted (cmd_ready gated) and is taken after the
               // commit-read completes and returns to ST_IDLE.
-              launch_commit_read(commit_base(last_wr_addr));
+              launch_commit_read(commit_read_base(last_wr_addr, wr_seg_base),
+                                  commit_read_len(wr_seg_len));
               commit_resume <= 1'b0;               // deferred: return to ST_IDLE afterwards
             end else if (cmd_valid) begin
               cur_read  <= cmd_read;
@@ -502,6 +637,7 @@ module hyperbus_ctrl
               rem_left  <= cmd_len;
               seg_count <= seg_size(cmd_len, cmd_wrap, cmd_addr);
               seg_left  <= seg_size(cmd_len, cmd_wrap, cmd_addr);
+              seg_cap_left <= hw_cap(cmd_addr);    // fresh CS# open: full hw-cap budget (WR_COALESCE)
               ca_reg    <= hb_pack_ca(cmd_read, cmd_reg, ~cmd_wrap, cmd_addr);
               rwds_hi   <= 1'b0;
               ca_idx    <= 2'd0;
@@ -635,16 +771,67 @@ module hyperbus_ctrl
         // ---------------- write data ----------------
         ST_WRITE: begin
           if (!wsrc_valid) err_underrun <= 1'b1;   // host underrun: word gets masked, burst continues
-          seg_left <= seg_left - 1'b1;
-          rem_left <= rem_left - 1'b1;
+          seg_left     <= seg_left - 1'b1;
+          rem_left     <= rem_left - 1'b1;
+          // WR_COALESCE hw-cap tracking: one word of this still-open CS# burst's budget is spent every
+          // ST_WRITE cycle, regardless of which native command it belongs to (see seg_cap_left above).
+          seg_cap_left <= seg_cap_left - 1'b1;
           if (seg_left == LEN_WIDTH'(1)) begin
-            // Last word of this write segment: record its (pre-advance) WORD address so a subsequent
-            // commit-read (WR_COMMIT_READ) can span it.
+            // Last word of this write segment: record its (pre-advance) WORD address, and the
+            // segment's own base/length, so a subsequent commit-read (WR_COMMIT_READ) can be shaped
+            // by COMMIT_READ_MODE (SPAN_END spans last_wr_addr; FULL_BURST re-reads
+            // [wr_seg_base, wr_seg_base+wr_seg_len-1] — this whole just-closed segment).
             last_wr_addr <= cur_addr + ADDR_WIDTH'(seg_count) - ADDR_WIDTH'(1);
-            if (rem_left != LEN_WIDTH'(1))          // chopped: advance to next linear segment
+            wr_seg_base  <= cur_addr;
+            wr_seg_len   <= seg_count;
+            if (rem_left != LEN_WIDTH'(1)) begin
+              // more of THIS native command remains beyond this segment's tCSM/boundary cap: normal
+              // internal chop, unaffected by WR_COALESCE (which only applies at command completion).
               cur_addr <= cur_addr + ADDR_WIDTH'(seg_count);
+              cnt      <= 32'(TAIL_CYCLES - 1);
+              state    <= ST_TAIL;
+            end else if (coalesce_try) begin
+              // WR_COALESCE: this command's data is exhausted but the CS# burst still has hw-cap room
+              // left (seg_cap_left, decremented above, > 0) — hold the bus open (CS# Low, CK stopped)
+              // instead of closing CS#, and wait up to WR_COALESCE_WAIT cycles for a contiguous write
+              // command to splice onto the SAME burst (issue #1 direction 4).
+              coalesce_wait_cnt <= '0;
+              state             <= ST_WR_COALESCE;
+            end else begin
+              cnt   <= 32'(TAIL_CYCLES - 1);
+              state <= ST_TAIL;
+            end
+          end
+        end
+
+        // ---------------- CS#-coalescing wait/splice (WR_COALESCE) ----------------
+        ST_WR_COALESCE: begin
+          // CK is stopped throughout this state (see the combinational drive), so no word is ever
+          // actually transferred while waiting — seg_cap_left is therefore left untouched here; it
+          // still holds exactly the budget remaining after the last REAL word (ST_WRITE's own
+          // per-word countdown resumes seamlessly once state <= ST_WRITE below).
+          if (coalesce_match) begin
+            // Splice the new command onto the still-open CS# burst — no CS# close/reopen, no new
+            // CA/latency phase. If its own cap-limited length (coalesce_accept_len) is shorter than
+            // cmd_len, the remainder becomes a further chop once this spliced segment itself closes
+            // (no special-casing needed — ST_WRITE's countdown just continues from seg_cap_left).
+            cur_addr  <= cmd_addr;
+            cur_read  <= 1'b0;
+            cur_reg   <= 1'b0;
+            cur_wrap  <= 1'b0;
+            rem_left  <= cmd_len;
+            seg_count <= coalesce_accept_len;
+            seg_left  <= coalesce_accept_len;
+            state     <= ST_WRITE;
+          end else if (coalesce_wait_cnt + 16'd1 >= 16'(WR_COALESCE_WAIT)) begin
+            // Waited long enough without a qualifying command: close normally (exactly the
+            // pre-coalescing behavior — the pending command, if any, is taken via ST_IDLE once CS#
+            // recovers).
             cnt   <= 32'(TAIL_CYCLES - 1);
             state <= ST_TAIL;
+          end else begin
+            // Keep waiting for a qualifying command (coalesce_wait_cnt bounds the total wait).
+            coalesce_wait_cnt <= coalesce_wait_cnt + 16'd1;
           end
         end
 
@@ -669,11 +856,13 @@ module hyperbus_ctrl
                 sv_rem            <= rem_left;
                 commit_resume     <= 1'b1;
                 wr_pending_commit <= 1'b1;            // segment closed -> needs committing
-                launch_commit_read(commit_base(last_wr_addr));
+                launch_commit_read(commit_read_base(last_wr_addr, wr_seg_base),
+                                    commit_read_len(wr_seg_len));
               end else begin
                 // normal reopen (read / reg / commit-read, or WR_COMMIT_READ disabled)
                 seg_count <= seg_size(rem_left, cur_wrap, cur_addr);
                 seg_left  <= seg_size(rem_left, cur_wrap, cur_addr);
+                seg_cap_left <= hw_cap(cur_addr);  // fresh CS# open: full hw-cap budget (WR_COALESCE)
                 ca_reg    <= hb_pack_ca(cur_read, cur_reg, ~cur_wrap, cur_addr);
                 rwds_hi   <= 1'b0;
                 ca_idx    <= 2'd0;
@@ -693,6 +882,7 @@ module hyperbus_ctrl
                 rem_left  <= sv_rem;
                 seg_count <= seg_size(sv_rem, 1'b0, sv_addr);
                 seg_left  <= seg_size(sv_rem, 1'b0, sv_addr);
+                seg_cap_left <= hw_cap(sv_addr);   // fresh CS# open: full hw-cap budget (WR_COALESCE)
                 ca_reg    <= hb_pack_ca(1'b0, 1'b0, 1'b1, sv_addr);   // write, memory, linear
                 rwds_hi   <= 1'b0;
                 ca_idx    <= 2'd0;
