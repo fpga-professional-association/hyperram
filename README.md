@@ -368,9 +368,51 @@ amortizes. The read eye holds all the way to the 350 MHz byte clock with `CAPTUR
 - **Fit** (A3CY100, Quartus Pro 26.1, timing closed at 175 MHz CK): outclk0 (fabric) Fmax 189 MHz,
   outclk1 (byte) restricted Fmax **352.98 MHz** — the min-pulse-width limit that caps this 2×-byte SDR
   architecture at **~176 MHz CK**. ~1 k ALM / ~1.4 k reg / few M20K / 0 DSP / 1 PLL.
-- **Reaching the 200 MHz / 400 MB/s device max** requires the DDIO PHY (I/O at 1×CK), still blocked on
-  the Fitter's 24403/24404 two-clock-phase routing —
-  [issue #3](https://github.com/fpga-professional-association/hyperram/issues/3).
+- **Update (DDIO bring-up, branch `ddio-200`):** the DDIO PHY now works on silicon — Fitter
+  24403/24404 is solved, and the DDIO architecture matches the SDR ceiling (**344.7/337.3 MB/s at
+  175 MHz, ERR_COUNT=0**) with full split-burst write support. At 200 MHz everything logical works
+  (writes pace 390 MB/s, reads 384) but data integrity degrades — root-caused to **clock generation
+  and board wiring**, not the IP. See the subsection below and issue #12.
+
+### Reaching the chip's rated maximum: 250 MHz / 500 MB/s needs differential, dedicated-pin CK
+
+The AXC3000's device is a **W957D8NBRA4I — HyperRAM 2.1, 4 ns tCK = 250 MHz** (suffix decode:
+`RA4I` = 250 MHz grade, `RA5` = 200 MHz). The IP's protocol engine and datapath are not the
+bottleneck; the **HyperBus clock is**, in two measured ways:
+
+1. **Clean CK is speed-capped by how it's generated.** The only CK source measured clean on this
+   board is a fabric-register generator driven by an internal 2× clock — capped at **~176 MHz** by
+   the FPGA's minimum-pulse-width limit on that 2× clock. Every 1×-rate alternative (vendor GPIO
+   DDR-out cell in both gating styles, raw DDIO primitive) emits a waveform marginal enough that the
+   RAM's most timing-sensitive internal moments — its 32-byte page turnarounds — fail first
+   (~1 flipped bit per page at ≥190 MHz, immune to every launch/sample/drive calibration knob,
+   because the artifact tracks the device's clocking, not the FPGA's).
+2. **Single-ended CK wiring halves the margin.** This is a 1.2 V-class HyperBus device; Infineon's
+   HyperBus guidance specifies **differential CK/CK#** for the low-voltage classes (single-ended is
+   the 3.0 V-class configuration). The AXC3000 routes CK single-ended — there is no CK# trace — so a
+   slightly imperfect clock edge that a differential receiver would reject shows up as data errors.
+
+**How a board + design reaches 250 MHz with this IP:**
+
+- **Generate CK from a PLL dedicated clock-output pin pair, not from I/O-cell data registers.**
+  Route an IOPLL output clock directly to dedicated `CLKOUT`-capable pins as a true clock-network
+  drive (Agilex: PLL outclk → dedicated clock output; equivalent structures exist on other
+  families). This is the one clock path with launch jitter/duty characteristics of a real clock
+  tree. A free-running CK is HyperBus-spec-legal — the device acts only on CS#-scoped edges — and
+  CS# launched from the same PLL clock keeps command alignment deterministic. Controller-side
+  support (`CK_FREERUN`) is tracked in issue #12.
+- **Use a differential I/O standard on that pin pair and route CK/CK# as a matched differential
+  pair to the RAM** (a standard compatible with the device's 1.2 V CK inputs — check the datasheet's
+  input-level table). The IP already drives both legs: set `DIFF_CK=1` and `hb_ck_n` is generated.
+- **Then configure for the 250 MHz grade:** latency code per the RA4I AC table (`LATENCY_CLOCKS`/
+  `INIT_CR0`), re-run the write-latency calibration (`WR_LAT_TRIM` — the readback offset tracks the
+  knob 1:1), set `MAX_BURST_WORDS` = tCSM×250 MHz, and close fabric timing at 250 (Fmax is 210
+  today; the remaining gap is ordinary STA-guided pipelining, or the half-rate controller option).
+  The complete step list, with acceptance criteria, is **issue #12**.
+
+On boards without a CK# trace (like the AXC3000), the practical clean ceiling remains ~176 MHz
+(344/337 MB/s) unless the dedicated-pin free-running CK proves better margins single-ended — that
+experiment is issue #12's first work item.
 
 **Scope / open items.** Single bursts commit clean up to ~768 words (≥1024 hits tCSM refresh, ≈15 µs).
 Multi-burst *reads* complete correctly (over-stream drain). Multi-burst (split) *writes* drop the last
