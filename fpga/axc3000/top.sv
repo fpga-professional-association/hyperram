@@ -306,8 +306,15 @@ module top (
                                        //   drops its whole-segment re-read cost at every split
     .WR_COALESCE          (1'b1),      // issue #1 direction 4: merge contiguous writes into one CS#
     .WR_COALESCE_WAIT     (8),
-    .WR_CHOP_REPLAY       (1'b1),      // issue #1 direction 5: re-send the 4-word tail the device
-    .WR_REPLAY_WORDS      (4),         //   drops at every forced chop (tCSM / 16 KB boundary)
+    .WR_CHOP_REPLAY       (1'b0),      // EXPERIMENT E-B (2026-07-09): replay OFF. E-A proved rollback
+                                       //   cannot converge — the device zeroes/garbles the 4 words
+                                       //   BELOW any reopened write CA base (rb=4: [504..507] garbage;
+                                       //   rb=8: [500..503] zeros — the kill zone tracks the base).
+    .WR_REPLAY_WORDS      (8),
+    .WR_CHOP_PAUSE_CYCLES (512),       // E-B RESULT: pause alone does NOT help (4 zeros per chop
+                                       //   unchanged at 2.9 us) — time-based self-commit is dead.
+    .WR_CHOP_PAUSE_CK     (1'b1),      // EXPERIMENT E-C: same dwell with CK TOGGLING (CS# High,
+                                       //   spec-legal) — is the pending-tail merge CK-clocked?
     .WR_LAT_TRIM          (3)          // silicon-measured: device write window opens 3 CK early
   ) u_ctrl (
     .clk            (clk),

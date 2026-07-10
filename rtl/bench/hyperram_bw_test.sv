@@ -30,6 +30,8 @@
 //   byte off | word | name                 | access | bits / meaning
 //   ---------+------+----------------------+--------+------------------------------------------------
 //    0x00    |  0   | CTRL  (on write)     |  W     | bit0 = start (self-clearing strobe; ignored while busy)
+//            |      |                      |        | bit1 = READ-ONLY run (skip the write phase; score the
+//            |      |                      |        |         readback against gen_pattern — pending-buffer probe)
 //            |      | STATUS(on read)      |  R     | bit0 = busy, bit1 = done, bit2 = error
 //    0x04    |  1   | LEN                  |  R/W   | number of words to test (per phase)
 //    0x08    |  2   | BASE_ADDR            |  R/W   | starting WORD address (keep MSB=0 => memory space)
@@ -304,7 +306,11 @@ module hyperram_bw_test
                         beat        <= '0;
                         wr_started  <= 1'b0;
                         rd_started  <= 1'b0;
-                        state       <= S_WSTART;
+                        // CTRL bit1 = READ-ONLY run: skip the write phase and score the readback
+                        // against the pattern of a PREVIOUS normal run over the same LEN/BASE.
+                        // The device-pending-buffer probe: read a region back later, WITHOUT the
+                        // usual rewrite, to see what actually reached the memory array.
+                        state       <= csr_writedata[1] ? S_RSTART : S_WSTART;
                     end
                 end
 

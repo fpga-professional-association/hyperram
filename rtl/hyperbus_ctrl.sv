@@ -145,6 +145,23 @@ module hyperbus_ctrl
     // to rb words). Default 0 = off (bit-identical to prior instantiations).
     parameter bit          WR_CHOP_REPLAY       = 1'b0,
     parameter int unsigned WR_REPLAY_WORDS      = 4,
+    // Device pending-tail depth (W957D8NB: 4) — the rollback floor when WR_REPLAY_ALIGN is used.
+    parameter int unsigned WR_REPLAY_PEND       = 4,
+    // 0 = legacy rollback (= words captured, saturating at WR_REPLAY_WORDS). N = roll back past the
+    // pending tail to the previous N-word-aligned address (2026-07-09 silicon: reopening INSIDE the
+    // device's internal buffer row garbles the row's lower half; see rp_rollback below). The shadow
+    // must be deep enough: WR_REPLAY_WORDS >= WR_REPLAY_PEND + N - 1.
+    parameter int unsigned WR_REPLAY_ALIGN      = 0,
+    // Extra CS#-High dwell (clk cycles) after every memory-WRITE burst closes, BEFORE the next
+    // CS# opens (chop reopen, coalesce-declined next command, anything). 2026-07-09 silicon
+    // experiment: the device appears to need internal-merge time after a write burst; a next write
+    // CS# arriving too soon discards the pending tail AND zeroes/garbles the 4 words below the new
+    // CA base. 0 = off. Sizing: ~1-3 us of clk cycles; costs once per chop, negligible for
+    // >=512-word segments.
+    parameter int unsigned WR_CHOP_PAUSE_CYCLES = 0,
+    // Keep CK toggling (CS# High, spec-legal) through the post-write recovery/pause dwell — tests
+    // whether the device's pending-tail merge needs CK edges rather than wall time.
+    parameter bit          WR_CHOP_PAUSE_CK     = 1'b0,
     // ---- A3: optional CR1 programming at init (SPEC_DIGEST §5/§8.2). Default OFF = today's behavior
     //          (CR0 only). When set, a SECOND zero-latency register write of CR1 follows the CR0 write
     //          during init, before init_done. The device's distributed-refresh/PASR/hybrid-sleep fields
@@ -540,8 +557,15 @@ module hyperbus_ctrl
 
   // Replay-reopen geometry (consumed at the ST_RECOVER chop branch, where cur_addr has already been
   // advanced to the un-rolled next-segment base and rem_left/rp_cnt are stable):
-  //   rp_rb   — rollback = min(WR_REPLAY_WORDS, words sent in the just-closed CS#) (rp_cnt saturates
-  //             at WR_REPLAY_WORDS in ST_WRITE, so it IS that min);
+  //   rp_rb   — rollback. WR_REPLAY_ALIGN=0 (legacy): min(WR_REPLAY_WORDS, words sent in the
+  //             just-closed CS#) (rp_cnt saturates at WR_REPLAY_WORDS in ST_WRITE, so it IS that
+  //             min). WR_REPLAY_ALIGN=N (2026-07-09 silicon): the W957D8NB garbles the LOWER half
+  //             of its internal write-buffer row when a new write CA opens INSIDE the row holding
+  //             its pending tail (reopen@508 for pending [508..511] read back [504..507] as foreign
+  //             data while the replayed words were fine) — so roll back PAST the pending tail
+  //             (WR_REPLAY_PEND words) to the previous N-word-aligned address, rewriting the whole
+  //             row from its base. Clamped to rp_cnt (the shadow can only replay what it captured;
+  //             a segment shorter than the row is rewritten from its own start).
   //   rp_real — the segment's REAL (front-end-sourced) word budget. Boundary-capped from the
   //             PRE-rollback base (cur_addr): the replayed prefix sits BEFORE that base, so capping
   //             from rp_base instead would re-chop the reopen at the very boundary it just chopped
@@ -549,7 +573,19 @@ module hyperbus_ctrl
   //             counts toward the tCSM budget, so rp_real is clipped to MAX_BURST_WORDS - rp_rb
   //             (skipped if the cap is too small to honor — see the WR_CHOP_REPLAY sizing note);
   //   rp_base — rolled-back segment base;  rp_seg — total reopened segment length.
-  wire [LEN_WIDTH-1:0]  rp_rb       = rp_cnt;
+  function automatic logic [LEN_WIDTH-1:0] rp_rollback(input logic [ADDR_WIDTH-1:0] chop_base);
+    logic [LEN_WIDTH-1:0] want;
+    if (WR_REPLAY_ALIGN == 0) begin
+      want = rp_cnt;
+    end else begin
+      want = LEN_WIDTH'(WR_REPLAY_PEND)
+             + LEN_WIDTH'((chop_base - ADDR_WIDTH'(WR_REPLAY_PEND))
+                          & ADDR_WIDTH'(WR_REPLAY_ALIGN - 1));
+      if (want > rp_cnt) want = rp_cnt;
+    end
+    return want;
+  endfunction
+  wire [LEN_WIDTH-1:0]  rp_rb       = rp_rollback(cur_addr);
   wire [LEN_WIDTH-1:0]  rp_real_raw = seg_size(rem_left, 1'b0, cur_addr);
   wire [LEN_WIDTH-1:0]  rp_real     = ((MAX_BURST_WORDS != 0) &&
                                        (LEN_WIDTH'(MAX_BURST_WORDS) > rp_rb) &&
@@ -557,6 +593,27 @@ module hyperbus_ctrl
                                       ? (LEN_WIDTH'(MAX_BURST_WORDS) - rp_rb) : rp_real_raw;
   wire [ADDR_WIDTH-1:0] rp_base     = cur_addr - ADDR_WIDTH'(rp_rb);
   wire [LEN_WIDTH-1:0]  rp_seg      = rp_rb + rp_real;
+
+  // COMMAND-level contiguous write->write replay (the coalesce-leg gap, 2026-07-09 silicon: when
+  // the coalesce hw-cap budget exhausts exactly AT a command edge — e.g. MAX_BURST_WORDS=512 with
+  // 64-word commands — the stream closes as a command completion, the next contiguous write is
+  // accepted from ST_IDLE as a fresh CS#, and the device discards the closed burst's pending tail:
+  // 4 zeroed words per chop, the pre-replay fingerprint). Same remedy through the ST_IDLE accept:
+  // if the arriving command is a linear memory WRITE that starts exactly where the previous write
+  // burst ended and the replay shadow still covers that tail, open it rolled back with the shadow
+  // prefix. rp_cnt is preserved across READ accepts (reads do not disturb the device's pending
+  // buffer — silicon-corrected model), so write->read->write-contiguous is covered too.
+  wire                  acc_elig    = WR_CHOP_REPLAY & (rp_cnt != '0) & cmd_valid
+                                      & ~cmd_read & ~cmd_reg & ~cmd_wrap & ~doing_init
+                                      & (cmd_addr == last_wr_addr + ADDR_WIDTH'(1));
+  wire [LEN_WIDTH-1:0]  acc_rb      = rp_rollback(cmd_addr);
+  wire [LEN_WIDTH-1:0]  acc_real_raw= seg_size(cmd_len, 1'b0, cmd_addr);
+  wire [LEN_WIDTH-1:0]  acc_real    = ((MAX_BURST_WORDS != 0) &&
+                                       (LEN_WIDTH'(MAX_BURST_WORDS) > acc_rb) &&
+                                       (acc_real_raw > LEN_WIDTH'(MAX_BURST_WORDS) - acc_rb))
+                                      ? (LEN_WIDTH'(MAX_BURST_WORDS) - acc_rb) : acc_real_raw;
+  wire [ADDR_WIDTH-1:0] acc_base    = cmd_addr - ADDR_WIDTH'(acc_rb);
+  wire [LEN_WIDTH-1:0]  acc_seg     = acc_rb + acc_real;
 
   // ------------------------------------------------------------------------
   // Read data-out (FIFO front)
@@ -659,7 +716,13 @@ module hyperbus_ctrl
       end
 
       ST_TAIL:     busy = ~doing_init;
-      ST_RECOVER:  busy = ~doing_init;
+      ST_RECOVER: begin
+        busy = ~doing_init;
+        // WR_CHOP_PAUSE_CK (2026-07-09 silicon experiment): keep CK toggling through the post-WRITE
+        // recovery/pause dwell (CS# High — spec-legal free-running CK). Tests whether the device's
+        // internal pending-tail merge is CK-clocked rather than time-based.
+        if (WR_CHOP_PAUSE_CK & ~cur_read & ~cur_reg & ~doing_init) phy_ck_en = 1'b1;
+      end
       ST_RD_ABORT: busy = ~doing_init;   // CS# High (idle bus); draining flagged filler to the FIFO
 
       ST_RD_DRAIN: begin
@@ -1059,7 +1122,14 @@ module hyperbus_ctrl
         // ---------------- tail / recovery ----------------
         ST_TAIL: begin
           if (cnt == 32'd0) begin
-            cnt   <= 32'(RECOVERY_CYCLES - 1);
+            // WR_CHOP_PAUSE_CYCLES (2026-07-09 silicon experiment): after a memory-WRITE burst
+            // closes, dwell extra CS#-High cycles before anything else. Hypothesis under test: the
+            // device self-commits its pending write tail given time (internal buffer/ECC-block
+            // merge); the observed tail loss + the 4-word kill zone below a reopened write CA are
+            // both "next CS# arrived before the merge finished" artifacts. 0 = today's behavior.
+            cnt   <= (~cur_read & ~cur_reg & ~doing_init & (WR_CHOP_PAUSE_CYCLES != 0))
+                     ? 32'(RECOVERY_CYCLES - 1 + WR_CHOP_PAUSE_CYCLES)
+                     : 32'(RECOVERY_CYCLES - 1);
             state <= ST_RECOVER;
           end else begin
             cnt <= cnt - 1'b1;

@@ -25,6 +25,8 @@ if {$argc >= 3} { set BURSTW    [lindex $argv 2] }
 if {$argc >= 4} { set F_CLK [expr {double([lindex $argv 3]) * 1.0e6}] }   ;# arg 4 = clk (word) freq in MHz
 set CALV -1                ;# arg 5 = REG_CAL image (live read-eye cal, issue #10: [0]=capture_phase
 if {$argc >= 5} { set CALV [lindex $argv 4] }   ;# [3:1]=preamble_skip [8:4]=rx_tap [9]=pair_skew); -1 => POR seed
+set RDONLY 0               ;# arg 6 = 1: READ-ONLY run (CTRL bit1 — skip write phase; score readback
+if {$argc >= 6} { set RDONLY [lindex $argv 5] } ;#   against the pattern; device pending-buffer probe)
 
 # CSR byte offsets
 set CTRL   0x00
@@ -85,7 +87,8 @@ set burstw_now [rd32 $m $BURSTWR]
 puts [format "BURST_WORDS   = %d (HyperBus burst length)" $burstw_now]
 
 # ---- pulse CTRL.start (self-clearing strobe) -----------------------------
-master_write_32 $m $CTRL 0x1
+master_write_32 $m $CTRL [expr {$RDONLY ? 0x3 : 0x1}]
+if {$RDONLY} { puts "MODE          = READ-ONLY (write phase skipped)" }
 
 # ---- poll STATUS.done (bit1), with a timeout -----------------------------
 set done 0
