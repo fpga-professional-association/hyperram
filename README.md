@@ -1,121 +1,112 @@
-# HyperBus / HyperRAM Controller IP
+# HyperRAM / HyperBus Controller IP
 
-A clean-room, technology-agnostic **HyperBus master controller** for HyperRAM /
-HyperFlash-class devices, with both **AXI4** and **Avalon-MM** front-ends and a
-swappable DDR PHY. The protocol engine contains **no vendor primitives** and
-simulates end-to-end under `verilator --binary` (tested with Verilator 5.020).
+A clean-room, vendor-neutral **HyperBus master** for HyperRAM devices: one protocol engine
+(`hyperbus_ctrl`) behind your choice of **AXI4** or **Avalon-MM** slave front-end and a swappable
+PHY (generic-inferrable, portable-SDR, AMD/Xilinx, Intel/Altera). Verified end-to-end against a
+behavioral device model under Verilator (23 self-checking testbenches) and on real silicon.
 
-> **Normative source:** Infineon / Cypress **HyperBus Specification, doc
-> 001-99253 Rev. \*H** (Feb 6 2019). An implementation-oriented digest lives in
-> [`docs/SPEC_DIGEST.md`](docs/SPEC_DIGEST.md); every controller decision cites a
-> section there.
+**Measured on hardware** (Arrow AXC3000: Agilex 3 `A3CY100BM16AE7S` + Winbond **W957D8NBRA4I**,
+128 Mb ×8, 1.2 V, HyperRAM 2.1):
 
----
+| Clock | Interface | Write | Read | Integrity |
+|------:|-----------|------:|-----:|-----------|
+| **175 MHz CK** | DDR x8 | **341.1 MB/s** | **332.3 MB/s** | `ERR_COUNT=0`, 25-run soak clean |
 
-## ⚡ Performance & test status (at a glance)
-
-**Tested on real silicon:** Arrow **AXC3000** dev board — Intel **Agilex 3 `A3CY100BM16AE7S`** FPGA
-+ Winbond **W957D8NBRA4I** HyperRAM (128 Mb, ×8, 1.2 V, HyperRAM 2.1 250 MHz grade), Quartus Prime
-Pro 26.1 — **DDR (DDIO/GPIO-cell) board build** on the `ddio-200` line; the 50–160 MHz rows below
-are the earlier portable-SDR-PHY bring-up ramp.
-
-**Measured HyperRAM bandwidth** (LEN=768 linear burst, every word integrity-checked, `ERR_COUNT=0`,
-25-run soak clean at the peak):
-
-| HyperBus CK | Build | Write | Read |
-|------------:|------:|------:|-----:|
-| 50 MHz  | SDR | 96.8  | 94.8  MB/s |
-| 100 MHz | SDR | 193.6 | 189.3 |
-| 150 MHz | SDR | 290.4 | 283.9 |
-| **175 MHz** | **DDR x8** | **341.1** | **332.3 MB/s** |
-
-- **Peak ~341 / ~332 MB/s at 175 MHz CK** (full-row 1024-word bursts pace 343.3/337.8 with the
-  known 4-word row-end cost). Clock knob: `CK_MHZ` in
-  [`fpga/axc3000/qsys/make_bw_sys.tcl`](fpga/axc3000/qsys/make_bw_sys.tcl). ~176 MHz is this
-  board's clean ceiling (the FABRIC2X CK generator's 2× clock hits the Agilex-3 min-pulse limit);
-  at 200 MHz everything FPGA-side is proven but a board-level single-ended-CK artifact remains —
-  the path to the chip's rated **250 MHz / 500 MB/s** is roadmapped in
-  [issue #12](https://github.com/fpga-professional-association/hyperram/issues/12) (see below).
-- **Device addressing laws (2026-07-09 silicon characterization, read-only-probe verified):** this
-  W957D8NB (1) **wounds the 4 words below any write CS#'s CA base** — unsuppressible (rollback,
-  pauses, CK dwells, masked lead-ins all falsified; reads never wound); (2) **linear bursts must
-  not cross its 1024-word row** (writes wrap back to the row start, reads release the bus — the
-  historic "16 KB boundary" was this law at coarser granularity); (3) a burst **ending exactly on
-  a row multiple garbles its own last 4 words**. The shipped configuration (row-aligned segments:
-  `MAX_BURST_WORDS=1024`, `BURST_BOUNDARY_WORDS=0x400`, write coalescing) is exactly-predictive:
-  transfers that stay inside one row are loss-free; streams that touch row transitions lose
-  exactly 4 known words per transition (e.g. 4096 words → 16). Full experiment trail:
-  [issue #1](https://github.com/fpga-professional-association/hyperram/issues/1),
-  [`fpga/axc3000/README.md`](fpga/axc3000/README.md), and `docs/INTERFACES.md` v10.
-- **Vendor-neutral core:** the controller + AXI4/Avalon front-ends contain no vendor primitives and
-  simulate end-to-end under Verilator; only the PHY is device-specific. See
-  **[Porting to your device](#porting-to-your-device)**.
-
----
-
-## Burst-length limits & the write-commit workaround
-
-HyperBus transfers a **linear burst** under one CS# assertion, auto-incrementing the address. Two limits
-shape how you should drive writes on this device:
-
-- **tCSM — CS# maximum-Low time (spec §6 / §9).** A self-refreshing HyperRAM can only refresh while CS# is
-  High, so the spec **requires** that a single CS# assertion not exceed **tCSM**; longer transfers must be
-  split into multiple bursts. This IP does that automatically via `MAX_BURST_WORDS` (= tCSM / tCK) so the
-  chop is transparent to the caller. Empirically the W957D8NB holds a clean single burst up to ~768 words
-  (≈15 µs) at these clocks; a ≥1024-word single burst overruns tCSM and corrupts.
-
-- **Split-write commit quirk (device — [issue #1](https://github.com/fpga-professional-association/hyperram/issues/1)).**
-  When a *write* transfer is split across CS# boundaries — whether the caller issues several bursts or the
-  tCSM chopper does — the W957D8NB fails to commit the **last word of every non-final write burst** (it
-  reads back `0x0000`). It is deterministic, is *not* reproduced in an ideal-clock model, and the device
-  commits that word only if the **next command is a read**. Multi-burst *reads* are unaffected.
-
-**Is the single-burst workaround spec-compliant? Yes.** Issuing a write as a **single linear burst within
-one CS# assertion (≤ tCSM, ≤512 words with margin)** is not a workaround *around* the spec — it is exactly
-a normal HyperBus write transaction as the spec defines it. The CA, initial latency, DDR data phase, and
-RWDS byte-masking are all unchanged; you simply keep the transfer inside one CS# assertion, which the spec
-already permits up to tCSM. What you cannot yet *rely* on is back-to-back write bursts to a contiguous
-region committing every boundary word — and that is a **device** behavior to design around, not a spec
-feature this IP omits. Transfers that must exceed tCSM (and therefore *must* cross a CS# boundary, per
-spec) are where the quirk bites; [issue #1](https://github.com/fpga-professional-association/hyperram/issues/1)
-tracks the real fix (the device commits a pending write on a subsequent read).
+Full-row 1024-word bursts pace 343.3 / 337.8 MB/s. The board's clean ceiling is ~176 MHz (FPGA
+clock-generation limit); the path to the device's rated 250 MHz / 500 MB/s is
+[issue #12](https://github.com/fpga-professional-association/hyperram/issues/12).
 
 ---
 
 ## Features
 
-- **Two host interfaces, one engine.** `hyperram_axi` (AXI4 slave) and
-  `hyperram_avalon` (Avalon-MM slave) are *thin* front-ends over a single native
-  command/write/read valid-ready interface (`hyperbus_ctrl`). No protocol logic
-  is duplicated between them.
-- **Full 48-bit Command-Address** encode/decode (R/W#, address-space,
-  burst-type, word address) per spec §3, built in `hyperbus_pkg::hb_pack_ca()`.
-- **Fixed and variable initial latency.** The controller always decodes the
-  slave-driven RWDS level during CA and doubles the latency count when the device
-  requests 2× — even in fixed-latency mode (spec §3.2 / §5.2.4). Verified by
-  `tb_fixed2x` (constant 2×) and `tb_varlat` (device alternating 1×/2× per transaction).
-- **RWDS-gated read completion.** Read words are counted on the source-synchronous
-  RWDS strobe, not a free-running clock, so mid-burst row/page latency gaps are
-  absorbed transparently (spec §3.2 / §7).
-- **Read-stall timeout + abort.** RWDS held Low ≥ 32 clocks raises `err_timeout`,
-  terminates the native read cleanly (`rd_last`), and maps to AXI **SLVERR** — no
-  deadlock. Verified by `tb_timeout`.
-- **Byte-masked writes** (RWDS = inverted per-byte strobe) and **zero-latency
-  register/config writes** (no RWDS mask, full-word only) per spec §5 / §6.
-- **Linear and wrapped bursts.** `CA[45] = ~wrap`; linear bursts are chopped to
-  `MAX_BURST_WORDS` (= tCSM / tCK) so CS# never exceeds the device's maximum
-  Low-time, transparently to the caller (spec §6 / §7).
-- **POR init + CR programming.** Reset pulse, configurable power-up delay, then an
-  optional CR0 write built from parameters; `init_done` gates user traffic.
-- **Register / ID access is first-class**, routed through the same native
-  interface (CR0/CR1/ID0/ID1), not a side channel.
-- **Swappable PHY** behind one frozen port list: a **generic inferrable-DDR**
-  variant (simulation + any FPGA), an **AMD/Xilinx** 7-series DDR variant that
-  simulates via a Verilator-only primitive shim (still not hardware-proven), and an
-  **Intel/Altera** DDIO variant for board bring-up (see *Status & scope*).
-- **Hyperflex-friendly RTL:** single clock domain in the controller/front-ends,
-  synchronous active-high reset for architectural state, no async reset and no
-  datapath clock gating. The one true CDC (RWDS → `clk`) is isolated inside the PHY.
+**Protocol (HyperBus spec 001-99253 Rev \*H):**
+- Full 48-bit Command-Address encode (R/W#, address space, burst type, word address).
+- Fixed **and** variable initial latency: the controller decodes the device's RWDS level during CA
+  and inserts the 2× latency count whenever the device requests it, for reads and writes.
+- RWDS-gated read completion — mid-burst row/page latency gaps are absorbed transparently.
+- Byte-masked writes (RWDS = inverted strobe), zero-latency register/config writes.
+- Linear and wrapped/hybrid bursts (all four CR0 wrap sizes).
+- POR/reset sequencing with ns-derived AC timing (`CLK_FREQ_MHZ` + `T_RP_NS/T_RPH_NS/T_RH_NS/
+  T_VCS_US`), CR0 **and optional CR1** programming at init, `init_done` gating.
+- **Deep Power-Down**: entry via a host CR0 write is detected, and the next command transparently
+  performs the guarded wake (CS# pulse + `tDPDOUT`).
+- **Active clock-stop** during read back-pressure (`ACTIVE_CLK_STOP`).
+- Read-stall watchdog: RWDS silent ≥ 32 clocks → clean abort, `rd_last` preserved, AXI `SLVERR` —
+  no deadlock.
+
+**Throughput & device management:**
+- **Write coalescing** (`WR_COALESCE`): contiguous write commands arriving back-to-back are
+  spliced into one CS# burst — a stream of small writes runs at full bus rate with no
+  per-command CA/latency cost and no CS# boundaries inside a row.
+- **Row-aligned segmenting** (`MAX_BURST_WORDS`, `BURST_BOUNDARY_WORDS`): long transfers are
+  chopped so no burst ever crosses the device row — the invariant the W957D8NB requires (see
+  *Device limitations* below). Chopping is transparent to the caller.
+- Deterministic, spec-legal CS#-low time per segment (tCSM compliance by construction).
+
+**Runtime calibration & diagnostics:**
+- **Live read-eye calibration ports** (`cal_capture_phase`, `cal_preamble_skip`, `cal_rx_tap`,
+  `cal_pair_skew`): retune the read capture at runtime with a CSR write — no recompile. The
+  bench exposes them at `REG_CAL` (word 13).
+- The synthesizable bandwidth/integrity engine (`rtl/bench/hyperram_bw_test.sv`): cycle-exact
+  write/read MB/s counters, per-word integrity check, first-error address/got/expected CSRs,
+  runtime burst-size registers, and a **read-only run mode** (score a region without rewriting
+  it — the instrument that characterized the device below).
+
+**Portability & verification:**
+- Controller + front-ends contain **no vendor primitives**; single clock domain, synchronous
+  reset, Hyperflex-friendly. The one true CDC (RWDS → `clk`) is isolated inside the PHY.
+- Four PHY variants behind one frozen port list (see *Porting*).
+- 23 Verilator testbenches against a golden device model that reproduces the real silicon's
+  behaviors (read preamble, variable latency, row quirks — see below); `bash sim/run.sh` runs
+  everything and fails non-zero on any mismatch.
+
+---
+
+## Device limitations and how they are handled
+
+Silicon characterization of the W957D8NBRA4I (read-only-probe verified, 2026-07;
+full trail: [`fpga/axc3000/README.md`](fpga/axc3000/README.md), `docs/INTERFACES.md` v10,
+[issue #1](https://github.com/fpga-professional-association/hyperram/issues/1)) found three
+hard device behaviors. **The core automatically reduces their cost to the physical floor; the
+residual is deterministic and is the application's to manage.**
+
+| # | Device behavior | What the core does | Residual for the user |
+|---|---|---|---|
+| 1 | **Write wound**: any memory-write CS# opening at word address B destroys the 4 words below it, `[B-4, B)`. Reads never wound. Unsuppressible (rollback, dummy-masked lead-ins, pauses and CK dwells were all tested and falsified). | Coalescing removes CS# openings *inside* a contiguous stream, so a stream wounds only at forced row transitions — where the wound lands on the 4 words the device garbles anyway (one shared 4-word cost, not two). | Any **separate, later** write whose base abuts live data kills the 4 words below its base. See the rules below. |
+| 2 | **Row wrap**: a linear burst must never cross the device's **1024-word (2 KB) row**. Writes that cross wrap back onto the row start (large-scale aliasing corruption); reads release the bus. | Segments are row-bounded and row-aligned (`MAX_BURST_WORDS=1024` = `BURST_BOUNDARY_WORDS='h400` in the reference build): **no burst ever crosses a row**. Fully transparent for reads. | None (handled entirely by the core). |
+| 3 | **End-at-row garble**: a write burst ending exactly on a row multiple garbles its own last 4 words. | Row-aligned segmenting makes this coincide with the law-1 wound at the same 4 addresses — one cost, not two. | Merged into the row-transition cost below. |
+
+**The net cost model (measured, exactly predictive):** a write transfer that stays inside one
+1024-word row is **loss-free**. A write stream that spans rows loses **exactly 4 words per row
+transition**, always at `[N·1024−4, N·1024)` — e.g. a 4096-word stream loses 16 words at 4 known
+addresses. Reads are always safe.
+
+**What an application must do:**
+
+1. **Zero-loss rule:** keep each independently-written data object inside one 2 KB row —
+   2 KB-aligned buffers of ≤1024 words (≤2 KB) never lose anything. This is the same discipline
+   as DMA-descriptor or sector alignment.
+2. **Bulk streams** (buffers > 2 KB): either
+   - reserve the last **8 bytes of every 2 KB row** as padding in your data layout (the loss
+     addresses are fixed and known), or
+   - tolerate/scrub: reads are safe, so read back the 4-word groups at row edges and account for
+     them at a higher layer (ECC framing, length fields that skip row tails, etc.).
+   There is no write-only repair: *any* write wounds below its own base, so rewriting a lost
+   group just relocates the loss 4 words lower. (This was proven exhaustively — see the issue #1
+   trail.)
+3. **Abutting regions written as separate transactions:** a later write starting exactly where
+   earlier data ends wounds that data's last 4 words. Leave an 8-byte guard gap below any
+   independently-written base, write abutting regions in **descending** address order, or make
+   region boundaries coincide with row boundaries (rule 1 covers this automatically).
+4. **Read throughput:** reads never coalesce (each read command pays CA + initial latency), so
+   issue reads as large burstcounts rather than many small ones. Read integrity needs no care.
+5. **Different silicon:** these are W957D8NB sample findings. The management knobs are
+   parameters (`MAX_BURST_WORDS`, `BURST_BOUNDARY_WORDS`, `WR_COALESCE`), so retune them from
+   your device's datasheet — and the repo ships the read-only-probe method
+   (`fpga/axc3000/sysconsole/bw_read.tcl` arg 6) to verify *your* part's behavior directly.
+   A default-off experiment family (`WR_CHOP_REPLAY`/`WR_REPLAY_*`, `WR_CHOP_PAUSE_*`) remains in
+   the RTL for devices with genuinely different boundary semantics.
 
 ---
 
@@ -130,339 +121,206 @@ tracks the real fix (the device commits a pending write on a subsequent read).
   slave          │  │hyperbus_avalon│ ◄─────────────────────── │  (protocol   │ ◄───────────────────── │ _phy   │  │◄─► hb_dq[7:0]
                  │  └───────────────┘       read data          │   engine)    │   recovered read data  │ (SERDES│  │◄─► hb_rwds
                  │   front-end / bus adapter                   └──────────────┘   + RWDS→clk CDC        │  + IO) │  │
-                 │       (thin, no protocol)                     no vendor prims  ──────────────────►   └────────┘  │
-                 │                                                                    init_done                     │  GENERIC | INTEL | XILINX
+                 │       (thin, no protocol)                     no vendor prims                        └────────┘  │
                  └─────────────────────────────────────────────────────────────────────────────────────────────────┘
                        clk / clk90 / clk_ref / rst  (one PLL, phase-related; ctrl uses only clk)
 
-  Simulation only:  the same hb_* device pins connect to sim/model/hyperram_model.sv (golden HyperRAM model),
-                    with DQ/RWDS bus resolution done in the testbench (split-driver, Verilator-safe, no inout).
+  Simulation:  the same hb_* device pins connect to sim/model/hyperram_model.sv (golden HyperRAM model,
+               including the row/wound behaviors above as opt-in knobs), bus resolution in the testbench.
 ```
-
-Module roles (frozen boundaries in [`docs/INTERFACES.md`](docs/INTERFACES.md);
-architecture in [`docs/DESIGN.md`](docs/DESIGN.md)):
 
 | Module | Role | Vendor prims | Verilator |
 |---|---|---|---|
 | `hyperbus_pkg` | params, typedefs, CA pack/unpack, latency & wrap tables | no | yes |
-| `hyperbus_ctrl` | protocol engine (CA, latency, RWDS-gated read, write mask, burst chop, POR init) | **no** | yes |
+| `hyperbus_ctrl` | protocol engine (CA, latency, RWDS-gated read, write mask, coalescing, row segmenting, POR/CR init, DPD, clock-stop) | **no** | yes |
 | `hyperbus_phy` | PHY wrapper; selects one variant by `PHY_VARIANT` | — | — |
 | `hyperbus_phy_generic` | inferrable DDR I/O + RWDS→clk CDC | **no** | **yes** |
-| `hyperbus_phy_altera` | Intel/Altera DDR-IO variant | yes | skeleton |
-| `hyperbus_phy_xilinx` | AMD/Xilinx 7-series ODDR/IDDR variant | yes | yes (via primitive shim) |
-| `hyperbus_avalon` | Avalon-MM slave → native (thin) | no | yes |
-| `hyperbus_axi` | AXI4 slave → native (thin) | no | yes |
-| `hyperram_axi` / `hyperram_avalon` | tops = front-end + ctrl + phy | per PHY variant | yes (generic) |
-| `hyperram_model` | behavioral device model (sim only) | no | yes |
+| `hyperbus_phy_sdr` | portable single-periphery-clock variant (byte engine at 2×CK) | **no** | **yes** |
+| `hyperbus_phy_xilinx` | AMD/Xilinx 7-series ODDR/IDDR/IDELAYE2 datapath | yes | yes (via primitive shim) |
+| `hyperbus_phy_altera` | Intel/Altera DDIO variant | yes | no (fitter/hardware-validated) |
+| `hyperbus_avalon` / `hyperbus_axi` | bus slave → native (thin) | no | yes |
+| `hyperram_avalon` / `hyperram_axi` | tops = front-end + ctrl + phy | per PHY | yes |
+| `hyperram_bw_test` (`rtl/bench/`) | synthesizable bandwidth/integrity engine + CSRs | no | yes |
+| `hyperram_model` (`sim/`) | behavioral golden device (sim only) | no | yes |
+
+Frozen module boundaries: [`docs/INTERFACES.md`](docs/INTERFACES.md) (currently v10).
+Architecture rationale: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ---
 
 ## Host interfaces
 
-Full signal tables are in [`docs/INTERFACES.md`](docs/INTERFACES.md); a summary follows.
+Full signal tables in [`docs/INTERFACES.md`](docs/INTERFACES.md); summary:
 
 ### AXI4 slave (`hyperram_axi`)
 
-Standard AXI4 (AW / W / B / AR / R). Data beats map 1:1 to 16-bit HyperBus words
-when `AXI_DATA_WIDTH == 16`.
-
-| Channel | Ports | Notes |
-|---|---|---|
-| Address write | `awid, awaddr, awlen, awsize, awburst, awvalid, awready` | `awaddr` is a byte address; MSB selects register space |
-| Write data | `wdata, wstrb, wlast, wvalid, wready` | `wstrb` → HyperBus byte mask |
-| Write resp | `bid, bresp, bvalid, bready` | `bresp = SLVERR` on controller error |
-| Address read | `arid, araddr, arlen, arsize, arburst, arvalid, arready` | INCR / WRAP / FIXED decomposed into linear native segments |
-| Read data | `rid, rdata, rresp, rlast, rvalid, rready` | `rresp = SLVERR` on timeout |
-
-Burst handling: **INCR** → one segment; **WRAP** → two segments reproducing AXI
-order for any boundary (WRAP2/4…); **FIXED** → N single-word segments. A narrow
-`AxSIZE` is accepted but flagged SLVERR. Ready/valid outputs are held Low in reset.
+Standard AXI4 (AW/W/B/AR/R); data beats map 1:1 to 16-bit HyperBus words at
+`AXI_DATA_WIDTH=16`. `awaddr`/`araddr` MSB selects register space (CR0/CR1/ID0/ID1). INCR bursts
+→ one native segment; WRAP → two segments in AXI order; FIXED → per-beat segments. Controller
+errors surface as `SLVERR` on B/R.
 
 ### Avalon-MM slave (`hyperram_avalon`)
 
-| Port | Dir | Notes |
-|---|---|---|
-| `avs_address` | I | word address; MSB selects register space |
-| `avs_read` / `avs_write` | I | request |
-| `avs_writedata` / `avs_byteenable` | I | write word + byte enables |
-| `avs_burstcount` | I | words in burst (linear; `cmd_wrap` tied 0) |
-| `avs_readdata` / `avs_readdatavalid` | O | read return |
-| `avs_waitrequest` | O | back-pressure |
+Word-addressed pipelined slave with `burstcount`, `byteenable`, `readdatavalid`, `waitrequest`;
+address MSB selects register space. An `err_underrun` strobe reports write-data underruns.
 
-### HyperBus device pins (both tops, from `hyperbus_phy`)
+### HyperBus device pins (from `hyperbus_phy`)
 
-`hb_ck, hb_ck_n, hb_cs_n, hb_rst_n, hb_dq_o[DQ_WIDTH-1:0], hb_dq_oe,
-hb_dq_i[DQ_WIDTH-1:0], hb_rwds_o, hb_rwds_oe, hb_rwds_i`, plus status `init_done` (and,
-on `hyperram_avalon`, an `err_underrun` write-underrun strobe — the AXI top folds the
-same error into `BRESP`=SLVERR instead).
-Pins are **split** (separate `_o`/`_oe`/`_i`); the board wrapper adds the tristate
-buffers (`IOBUF`) — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md). Clocking:
-`clk` (bus word rate), `clk90` (CK centering), `clk_ref` (vendor PHY delay ref;
-tie for generic), `rst` (synchronous active-high).
+`hb_ck`, `hb_ck_n` (if `DIFF_CK=1`), `hb_cs_n`, `hb_rst_n`, and **split** data pins
+(`hb_dq_o/_oe/_i`, `hb_rwds_o/_oe/_i`) — the board wrapper adds the tristate pads
+([`docs/INTEGRATION.md`](docs/INTEGRATION.md)). Status: `init_done`. Runtime calibration inputs:
+`cal_capture_phase`, `cal_preamble_skip[2:0]`, `cal_rx_tap[4:0]`, `cal_pair_skew`.
 
 ---
 
-## Parameters
+## Key parameters
 
-Common to every module (defaults from `hyperbus_pkg`):
+Common: `DQ_WIDTH` (8), `DATA_WIDTH` (16), `ADDR_WIDTH` (32), `LEN_WIDTH` (16).
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `DQ_WIDTH` | 8 | HyperBus DQ pins |
-| `DATA_WIDTH` | 16 | native word = `2*DQ_WIDTH` (one HyperBus word) |
-| `ADDR_WIDTH` | 32 | word-address width |
-| `LEN_WIDTH` | 16 | burst-length counter width (words) |
-
-Controller (`hyperbus_ctrl`, and forwarded through the tops):
+Controller (`hyperbus_ctrl`, forwarded through both tops):
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `LATENCY_CLOCKS` | 6 | initial latency, CA1→data, in clocks (spec Table 5.3) |
-| `FIXED_LATENCY` | 1 | 1 = fixed initial latency (POR default) |
-| `MAX_BURST_WORDS` | 0 | 0 = no chop; else tCSM/tCK — linear bursts chopped to this |
-| `PROGRAM_CR` | 1 | write CR0 during POR init |
-| `POR_DELAY_CYCLES` | 0 | power-up delay in clocks (set to ~150 µs worth on hardware) |
-| `INIT_LATENCY_CODE` | derived | CR0[7:4] code written at init |
-| `INIT_CR0` | `0x0008` | CR0 image written at init |
+| `LATENCY_CLOCKS` / `FIXED_LATENCY` | 6 / 1 | initial latency (spec Table 5.3) and fixed/variable select |
+| `MAX_BURST_WORDS` | 0 (off) | segment cap — set to the device **row size** (W957D8NB: 1024) |
+| `BURST_BOUNDARY_WORDS` | 0 (off) | never let a burst cross this boundary — set to the **row** (`'h400`) |
+| `WR_COALESCE` / `WR_COALESCE_WAIT` | 0 / 8 | splice contiguous write commands into one CS# burst |
+| `WR_LAT_TRIM` | 0 | write-window calibration offset (CK); board-measured (AXC3000: 3) |
+| `PROGRAM_CR` / `INIT_CR0` / `INIT_LATENCY_CODE` | 1 / device | CR0 programming at init |
+| `PROGRAM_CR1` / `INIT_CR1` | 0 / device | optional CR1 programming at init |
+| `CLK_FREQ_MHZ` + `T_RP_NS/T_RPH_NS/T_RH_NS/T_VCS_US` | 0 (legacy) | ns-derived POR/reset AC timing |
+| `SUPPORT_DPD` / `TDPDOUT_CYCLES` | 0 | Deep-Power-Down detect + guarded wake |
+| `ACTIVE_CLK_STOP` | 0 | stop CK during read back-pressure |
+| `WR_COMMIT_READ*`, `WR_CHOP_REPLAY*`, `WR_CHOP_PAUSE*` | off | parked experiment family (see limitations §5) |
 
-AXI front-end adds `ID_WIDTH` (4), `AXI_DATA_WIDTH` (16), `AXI_ADDR_WIDTH`
-(`ADDR_WIDTH+1`). PHY adds `PHY_VARIANT` (`"GENERIC"` | `"INTEL"` | `"XILINX"`)
-and `DIFF_CK` (1 = drive `hb_ck_n`).
+PHY adds `PHY_VARIANT` (`"GENERIC"`\|`"SDR"`\|`"XILINX"`\|`"INTEL"`), `DIFF_CK`,
+`RD_PREAMBLE_SKIP`, and per-variant capture knobs (all runtime-tunable via the `cal_*` ports on
+the SDR variant). AXI adds `ID_WIDTH`, `AXI_DATA_WIDTH`, `AXI_ADDR_WIDTH`.
 
 ---
 
 ## Quick start
 
-### Prerequisites
-
-- **Verilator ≥ 5.020** (`--binary` + `--timing`), a C++17 toolchain, and `bash`.
-  On Debian/Ubuntu: `sudo apt-get install -y verilator build-essential`.
-
-### Run the simulation
+Prerequisites: **Verilator ≥ 5.020**, C++17 toolchain, `bash`.
 
 ```bash
 git clone <this-repo> hyperram
 cd hyperram
-bash sim/run.sh
+bash sim/run.sh        # builds + runs all 23 self-checking TBs; exits non-zero on any failure
 ```
 
-`sim/run.sh` builds and runs each self-checking testbench with
-`verilator --binary --timing -Wall` and exits non-zero on any build,
-elaboration, or simulation failure. Expected tail:
+Coverage by area:
 
-```
-== Running tb_avalon    TB_RESULT: PASS
-== Running tb_axi       TB_RESULT: PASS
-== Running tb_fixed2x   TB_RESULT: PASS
-== Running tb_timeout   TB_RESULT: PASS
-ALL TESTBENCHES PASSED
-```
-
-| Testbench | What it exercises |
+| Area | Testbenches |
 |---|---|
-| `tb_avalon` | Avalon-MM POR init, single + burst write/read-back, CR/ID access |
-| `tb_axi` | AXI4 INCR single + burst, WRAP burst read, CR0 write/read-back, ID0 read, B/R = OKAY |
-| `tb_fixed2x` | fixed-latency device that drives RWDS High during CA → controller must use 2× latency for reads *and* writes |
-| `tb_timeout` | mid-burst RWDS stall (40 clocks) → `err_timeout`, clean `rd_last`, SLVERR, no deadlock |
-| `tb_chop` | tCSM burst chopping (`MAX_BURST_WORDS`=4): linear bursts longer than the segment → transparent multi-segment re-open, every word checked |
-| `tb_wrap` | native wrapped CA (`cmd_wrap=1`): legacy + hybrid bursts across all four CR0[1:0] wrap sizes, read + write, vs the device `next_addr` order |
-| `tb_masked` | byte-masked writes (every strobe combo + mixed-strobe burst, read-modify-merge) and the write-underrun path (`err_underrun`, masked-both) |
-| `tb_varlat` | true **variable** initial latency: device alternates 1×/2× per transaction (`REFRESH_EVERY`); byte-exact across the mix (per-transaction `rwds_hi` re-latch) |
-| `tb_reg` | CR1 write/read + ID1 read; non-zero `POR_DELAY_CYCLES` dwell; runtime-reset model register restore; both `DIFF_CK` settings pin-checked |
-| `tb_axi_wrap` | AXI WRAP **write** decomposition (seg0+seg1) and the AR/AW round-robin arbiter (both channels valid at once, grant order verified) |
+| Bus front-ends | `tb_avalon`, `tb_axi`, `tb_axi_wrap` (WRAP-write decomposition, AR/AW arbiter) |
+| Latency & timing | `tb_fixed2x`, `tb_varlat` (per-transaction 1×/2×), `tb_timeout`, `tb_por_timing` |
+| Bursts & data | `tb_chop`, `tb_wrap` (all four CR0 wrap sizes), `tb_masked`, `tb_multiburst`, `tb_multiburst_generic` |
+| Registers & init | `tb_reg`, `tb_cr1init` |
+| Power management | `tb_dpd`, `tb_clkstop` |
+| Device quirks | `tb_commit` (wound/row model: coalescing, row segmenting, the parked replay family — 11 stacks) |
+| PHY variants | `tb_sdr`, `tb_preamble`, `tb_preamble_generic`, `tb_xilinx` (7-series datapath via shim), `tb_cal` (live REG_CAL retune, no recompile) |
+| Bench engine | `tb_bw` (bandwidth engine + CSRs) |
 
-Each testbench wires the DUT top to the golden `hyperram_model` and checks
-byte-exact read-back; any mismatch raises `$fatal` (non-zero exit).
+(A 24th testbench, `tb_local1x`, phase-sweeps the AXC3000 board I/O layer and lives outside
+`run.sh` because it references board files.)
 
-### Instantiate
-
-See [`docs/INTEGRATION.md`](docs/INTEGRATION.md) for a complete board wrapper
-(tristate IOBUFs, PLL clock plan, `.sdc` notes) and
-[`docs/PHY_PORTING.md`](docs/PHY_PORTING.md) for filling in the vendor PHY
-primitives.
+Every testbench checks byte-exact read-back against the golden model and `$fatal`s on mismatch.
 
 ---
 
 ## Porting to your device
 
-The controller (`hyperbus_ctrl`), the AXI4/Avalon front-ends, and the generic PHY are
-**device-independent** and simulate on any toolchain. Bringing this IP up on a new FPGA + HyperRAM is
-almost entirely a **PHY + board** job:
+The controller, front-ends, and generic/SDR PHYs are device-independent. Bring-up on a new
+FPGA + HyperRAM is a PHY + board job:
 
-1. **Pick a PHY** (`hyperbus_phy` selects by `PHY_VARIANT`):
-   - `"GENERIC"` — inferrable DDR; simulation + any FPGA (not I/O-timing-tuned).
-   - `"SDR"` (`hyperbus_phy_sdr`) — **portable, ONE clock in the I/O periphery**: runs the byte engine at
-     2×CK and derives CK-centring from that clock's negedge. This is the variant proven to **~342 MB/s**
-     on the AXC3000. Best first target on any device — no vendor DDR primitives, no per-bit calibration.
-   - `"XILINX"` (`hyperbus_phy_xilinx`) — real 7-series ODDR/IDDR/IDELAYE2 DDR-I/O (I/O at 1×CK);
-     **simulates via a Verilator-only primitive shim, still not hardware-proven or timing-closed**.
-   - `"INTEL"` (`hyperbus_phy_altera`) — hard DDR-I/O for the highest speed (I/O at 1×CK); vendor
-     DDIO/IDELAY primitives (see `docs/PHY_PORTING.md`).
-2. **Clock plan** (one PLL, phase-related):
-   - *SDR PHY* — `clk` = HyperBus CK word rate; `clk90` is **repurposed** as the 2×CK byte clock (0°). Only
-     one clock reaches the I/O. Scale both together (the `CK_MHZ` knob) to trade clock for bandwidth.
-   - *DDIO PHY* — `clk` (0°) + `clk90` (90°, CK-centring); **both** phases enter the I/O, so the device/bank
-     must route two periphery phases (the AXC3000 could not → the SDR PHY is the workaround).
-3. **Board wrapper.** The PHY exposes **split** `hb_*_o` / `_oe` / `_i` (no `inout`, stays Verilator-shaped);
-   add the tri-state pad ring in a board wrapper (`fpga/axc3000/hyperbus_pads_altera.sv`,
-   [`docs/INTEGRATION.md`](docs/INTEGRATION.md)).
-4. **Pins + I/O standard** for your HyperRAM (`hb_dq[7:0]`, `hb_rwds`, `hb_cs_n`, `hb_ck`, `hb_rst_n`;
-   `hb_ck_n` only if `DIFF_CK=1`). Get `hb_ck` / `hb_cs_n` right — wrong pins = the device never responds.
-5. **Timing (`.sdc`).** For bring-up, `false_path` the off-chip HyperBus pins and close on the internal
-   fabric; production high-speed needs real source-synchronous input/output-delay closure.
-6. **Device specifics from your datasheet:** `LATENCY_CLOCKS`, `FIXED_LATENCY`, `INIT_CR0` (CR0
-   latency/drive/burst fields), and `MAX_BURST_WORDS` (= tCSM / tCK, so CS# never exceeds the device's max
-   Low time). Register/ID addresses default to W957D8NB-family values.
-7. **Read-eye calibration on hardware.** SDR PHY: sweep `CAPTURE_PHASE` (and `RD_PREAMBLE_SKIP` if your
-   device drives a read preamble). DDIO PHY: sweep the input delay taps / DPA. Write a known pattern, sweep,
-   pick the widest passing window.
+1. **Pick a PHY** (`PHY_VARIANT`):
+   - `"GENERIC"` — inferrable DDR; simulation and any-FPGA starting point.
+   - `"SDR"` — **recommended first hardware target**: one clock in the I/O periphery (byte engine
+     at 2×CK), no vendor primitives, no per-bit calibration; silicon-proven on the AXC3000.
+   - `"XILINX"` — real 7-series ODDR/IDDR/IDELAYE2 datapath; simulates under Verilator via the
+     included primitive shim; not yet hardware-proven — sweep its `RX_STROBE_DLY_TAPS` /
+     `RX_PAIR_SKEW` / `RD_PREAMBLE_SKIP` on silicon.
+   - `"INTEL"` — Agilex DDIO variant. The complete, silicon-proven Agilex 3 board build (I/O
+     layer, clocking, constraints, benchmark harness) is in [`fpga/axc3000/`](fpga/axc3000/) —
+     use it as the worked example; its README documents every board-level pitfall.
+2. **Clock plan:** one PLL; `clk` = CK word rate; the SDR variant repurposes `clk90` as the 2×CK
+   byte clock (only one clock enters the I/O periphery).
+3. **Board wrapper:** the PHY exposes split `_o/_oe/_i` pins (Verilator-shaped, no `inout`); add
+   the tristate pad ring at the top ([`docs/INTEGRATION.md`](docs/INTEGRATION.md)).
+4. **Pins + I/O standard** from your board; get `hb_cs_n`/`hb_ck` right or the device never
+   responds.
+5. **Timing:** false-path the HyperBus pins for bring-up; real source-synchronous closure for
+   production speeds.
+6. **Device parameters from your datasheet:** `LATENCY_CLOCKS`, `INIT_CR0`, and the row/segment
+   knobs (`MAX_BURST_WORDS` = row words, `BURST_BOUNDARY_WORDS` = row words, `WR_COALESCE=1`).
+   Then verify the device-limitation model on *your* part with the read-only-probe method
+   (limitations §5).
+7. **Read-eye calibration:** write a pattern, sweep the capture knobs (`CAPTURE_PHASE` /
+   `cal_*` CSR on SDR; delay taps on the DDR variants), pick the widest passing window.
+   `WR_LAT_TRIM` calibrates the write window (the first-error CSR offset tracks it 1:1).
 
-The AXC3000 build in [`fpga/axc3000/`](fpga/axc3000/) is a complete worked example of all of the above
-(SDR PHY, IOPLL clock plan, pins, `.sdc`, and the JTAG bandwidth-test harness).
+Porting details: [`docs/PHY_PORTING.md`](docs/PHY_PORTING.md).
 
 ---
 
-## Spec-compliance summary
+## Spec compliance
 
-Against **Infineon/Cypress HyperBus Specification 001-99253 Rev \*H**. "Simulated"
-means verified against the golden `hyperram_model` under Verilator; it is **not**
-a claim of silicon timing closure (see *Status & scope*).
+Against Infineon/Cypress **HyperBus Specification 001-99253 Rev \*H**. "Simulated" = verified
+against the golden model under Verilator; electrical/AC closure is board work.
 
-| Spec area | §     | Status | Where / evidence |
-|---|---|---|---|
-| 48-bit CA encoding (R/W#, AS, burst type, word address) | §2/§3 | Implemented, simulated | `hyperbus_pkg::hb_pack_ca`; `tb_axi`/`tb_avalon` |
-| DDR data phase, byte A / byte B ordering, big-endian registers | §4 | Implemented, simulated | `hyperbus_phy_generic`; all TBs |
-| Initial latency code table (3–16 clks, codes 1110/1111 = 3/4) | §3 | Implemented | `hb_latency_code_to_clocks` / `_to_latency_code` |
-| Fixed latency + RWDS-during-CA 2× select | §3.2/§5.2.4 | Implemented, simulated | `hyperbus_ctrl`; `tb_fixed2x` (constant fixed-2×) + `tb_varlat` (true **variable**, alternating 1×/2× via `REFRESH_EVERY`; asserts per-transaction re-latch of `rwds_hi`) |
-| RWDS-gated read completion; row/page latency gaps absorbed | §3.2/§7 | Implemented, simulated | `hyperbus_ctrl`; `hyperram_model` row penalty |
-| Read RWDS-stall ≥ 32 clks → abort + error | §3.2/§4 | Implemented, simulated | `err_timeout`; `tb_timeout` |
-| Byte-masked writes (RWDS = ~strobe, High = mask) | §4 | Implemented, simulated | `hyperbus_ctrl:295`; `tb_masked` (every strobe combo + mixed-strobe burst; verifies read-modify-merge keeps masked bytes) |
-| Zero-latency register/config writes (no mask, full word) | §5/§6 | Implemented, simulated | `hyperbus_ctrl`; `tb_axi` CR0 write |
-| Linear bursts (CA[45]=1) | §7 | Implemented, simulated | all TBs |
-| Wrapped/hybrid bursts (CA[45]=0) | §7 | Implemented, simulated | `tb_wrap` drives a **native** wrapped CA (`cmd_wrap=1`): legacy + hybrid, read + write, checked against the device's `next_addr` order. (Front-ends still tie `cmd_wrap=0`; `tb_axi` "WRAP" = AXI-wrap → linear segments.) |
-| Wrap boundary from CR0[1:0] (128/64/16/32 B) | §7 | Implemented, simulated | `hb_wrap_words`; `tb_wrap` exercises **all four** sizes via CR0[1:0] (00/01/10/11) |
-| Burst chopping to tCSM (MAX_BURST_WORDS) | §6 | Implemented, simulated | `hyperbus_ctrl`; `tb_chop` (`MAX_BURST_WORDS`=4, bursts > it → multi-segment chop/re-open, every word checked) |
-| CR0 / ID0 register access | §5/§8 | Implemented, simulated | `tb_axi` CR0 rw + ID0 rd; `tb_avalon` |
-| CR1 / ID1 register access | §8.2/§8.3 | Implemented, simulated (access) | `tb_reg` CR1 write/read-back + ID1 read (distinct reset image; write-ignored). CR1 still **not** programmed at init — [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
-| POR init + CR0 programming, `init_done` gating | §8/§9 | Implemented, simulated | `hyperbus_ctrl` init; all TBs wait `init_done`; `tb_reg` exercises non-zero `POR_DELAY_CYCLES` dwell + runtime-reset register restore. CR1 init + tRP/tRPH/tRH/tVCS timing not done — [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
-| Deep Power-Down, active clock-stop | §5.2.1/§8.7, §1 | **Not** implemented | [#5](https://github.com/fpga-professional-association/hyperram/issues/5) |
-| Differential vs single-ended CK (`DIFF_CK`) | §1 | Implemented, simulated | `hb_ck_n`; `tb_reg` pin-checks both settings (`DIFF_CK=1` complementary toggle vs `DIFF_CK=0` held High) |
-| AC timing (tRWR, tCSHI, tCSS, tACC…) closure | §9 | **Not** provided in RTL | device/board `.sdc` — hardware work, see below |
-| CR1 bit layout, latency↔frequency map | §8.2 | Device-specific, not hard-coded | pull from W957D8NB datasheet |
+| Spec area | § | Status |
+|---|---|---|
+| 48-bit CA encode (R/W#, AS, burst type, address) | §2/§3 | Implemented, simulated |
+| DDR data phase, byte ordering, big-endian registers | §4 | Implemented, simulated |
+| Initial latency codes (3–16 clocks) | §3 | Implemented |
+| Fixed latency + RWDS-during-CA 2× select | §3.2/§5.2.4 | Implemented, simulated (constant + per-transaction variable) |
+| RWDS-gated read completion, latency-gap absorption | §3.2/§7 | Implemented, simulated |
+| Read RWDS-stall ≥ 32 clk → abort + error | §3.2/§4 | Implemented, simulated |
+| Byte-masked writes | §4 | Implemented, simulated (all strobe combos) |
+| Zero-latency register writes | §5/§6 | Implemented, simulated |
+| Linear bursts + tCSM segmenting | §6/§7 | Implemented, simulated + silicon-verified |
+| Wrapped/hybrid bursts, all CR0[1:0] sizes | §7 | Implemented, simulated |
+| CR0/CR1/ID0/ID1 access | §5/§8 | Implemented, simulated |
+| POR init, CR0 + optional CR1 programming, ns-derived tRP/tRPH/tRH/tVCS | §8/§9 | Implemented, simulated |
+| Deep Power-Down (entry detect + guarded wake) | §5.2.1/§8.7 | Implemented, simulated |
+| Active clock-stop | §1 | Implemented, simulated |
+| Differential / single-ended CK (`DIFF_CK`) | §1 | Implemented, simulated |
+| AC timing closure (tRWR, tCSS, tACC…) | §9 | Board `.sdc` work — see `fpga/axc3000/` for the closed example |
 
-Device register addresses / reset values used in the package and model are
-**W957D8NB / HyperRAM-family** values (flagged `[device, not generic spec]` in the
-digest), cross-checked against the project BFM — the generic spec defers these to
-each datasheet.
+Register addresses/reset values default to W957D8NB-family; override from your datasheet.
 
 ---
 
-## Performance (measured on AXC3000 silicon)
+## Performance
 
-Real, integrity-verified HyperRAM bandwidth on the Arrow **AXC3000** (Agilex 3
-`A3CY100BM16AE7S` + Winbond **W957D8NB** HyperRAM), via the **SDR PHY**, read back over
-JTAG-Avalon with on-chip cycle counters (`fpga/axc3000/`). The SDR PHY runs a `CK_MHZ` word
-clock plus a 2×CK byte clock from one IOPLL, so bandwidth scales directly with the clock:
+Measured on the AXC3000 (Agilex 3 + W957D8NBRA4I, DDR x8 board build in
+[`fpga/axc3000/`](fpga/axc3000/), JTAG-read cycle counters, every word integrity-checked):
 
-| HyperBus CK | Byte clk | Write (LEN=512) | Read (LEN=512) | Notes |
-|------------:|---------:|----------------:|---------------:|-------|
-| 50 MHz  | 100 MHz | 96.8  | 94.8  MB/s | original bring-up |
-| 100 MHz | 200 MHz | 193.6 | 189.3 | |
-| 133 MHz | 266 MHz | 258.1 | 252.4 | |
-| 150 MHz | 300 MHz | 290.4 | 283.9 | |
-| 160 MHz | 320 MHz | 309.7 | 302.9 | |
-| **175 MHz** | **350 MHz** | **342.4** | **337.3 MB/s** | **SDR ceiling** (LEN=768) |
+| Shape | Write | Read | Errors |
+|---|---:|---:|---|
+| 768-word bursts (in-row) | 341.1 MB/s | 332.3 MB/s | 0 (25-run soak) |
+| 1024-word full-row bursts | 343.3 MB/s | 337.8 MB/s | the known 4-word row-transition cost |
+| Coalesced 64-word write commands | 331.9 MB/s | — | 0 |
 
-Every row is `STATUS.done`, `ERR_COUNT=0`, integrity PASS, re-confirmed on repeats. Bandwidth also
-grows with **burst length** as the fixed per-transaction overhead (6-beat CA + initial latency)
-amortizes. The read eye holds all the way to the 350 MHz byte clock with `CAPTURE_PHASE=0` (no tuning).
+Bandwidth scales with CK (`CK_MHZ` knob in `qsys/make_bw_sys.tcl`) and with burst length as the
+CA + latency overhead amortizes.
 
-- **Fit** (A3CY100, Quartus Pro 26.1, timing closed at 175 MHz CK): outclk0 (fabric) Fmax 189 MHz,
-  outclk1 (byte) restricted Fmax **352.98 MHz** — the min-pulse-width limit that caps this 2×-byte SDR
-  architecture at **~176 MHz CK**. ~1 k ALM / ~1.4 k reg / few M20K / 0 DSP / 1 PLL.
-- **Final DDR board build (branch `ddio-200`, 2026-07-09):** the DDIO/GPIO-cell build is the
-  shipping configuration — Fitter 24403/24404 solved, timing closed, **341.1 W / 332.3 R MB/s at
-  175 MHz, `ERR_COUNT=0`, 25-run soak clean**, with write coalescing and row-aligned segmenting
-  (`MAX_BURST_WORDS=1024` = `BURST_BOUNDARY_WORDS` = the device's 1024-word row). Multi-burst
-  write streams within one row are loss-free; row transitions cost exactly 4 known words each on
-  this silicon (the below-base wound — see the device-laws bullet at the top and issue #1). At
-  200 MHz everything logical works (writes pace 390 MB/s, reads 384) but data integrity degrades —
-  root-caused to **clock generation and board wiring**, not the IP. See the subsection below and
-  issue #12.
+### Reaching the device's rated 250 MHz / 500 MB/s
 
-### Reaching the chip's rated maximum: 250 MHz / 500 MB/s needs differential, dedicated-pin CK
+The W957D8NBRA4I is the 4 ns (250 MHz) speed grade; this IP's engine is not the bottleneck —
+the HyperBus **clock path** is:
 
-The AXC3000's device is a **W957D8NBRA4I — HyperRAM 2.1, 4 ns tCK = 250 MHz** (suffix decode:
-`RA4I` = 250 MHz grade, `RA5` = 200 MHz). The IP's protocol engine and datapath are not the
-bottleneck; the **HyperBus clock is**, in two measured ways:
-
-1. **Clean CK is speed-capped by how it's generated.** The only CK source measured clean on this
-   board is a fabric-register generator driven by an internal 2× clock — capped at **~176 MHz** by
-   the FPGA's minimum-pulse-width limit on that 2× clock. Every 1×-rate alternative (vendor GPIO
-   DDR-out cell in both gating styles, raw DDIO primitive) emits a waveform marginal enough that the
-   RAM's most timing-sensitive internal moments — its 32-byte page turnarounds — fail first
-   (~1 flipped bit per page at ≥190 MHz, immune to every launch/sample/drive calibration knob,
-   because the artifact tracks the device's clocking, not the FPGA's).
-2. **Single-ended CK wiring halves the margin.** This is a 1.2 V-class HyperBus device; Infineon's
-   HyperBus guidance specifies **differential CK/CK#** for the low-voltage classes (single-ended is
-   the 3.0 V-class configuration). The AXC3000 routes CK single-ended — there is no CK# trace — so a
-   slightly imperfect clock edge that a differential receiver would reject shows up as data errors.
-
-**How a board + design reaches 250 MHz with this IP:**
-
-- **Generate CK from a PLL dedicated clock-output pin pair, not from I/O-cell data registers.**
-  Route an IOPLL output clock directly to dedicated `CLKOUT`-capable pins as a true clock-network
-  drive (Agilex: PLL outclk → dedicated clock output; equivalent structures exist on other
-  families). This is the one clock path with launch jitter/duty characteristics of a real clock
-  tree. A free-running CK is HyperBus-spec-legal — the device acts only on CS#-scoped edges — and
-  CS# launched from the same PLL clock keeps command alignment deterministic. Controller-side
-  support (`CK_FREERUN`) is tracked in issue #12.
-- **Use a differential I/O standard on that pin pair and route CK/CK# as a matched differential
-  pair to the RAM** (a standard compatible with the device's 1.2 V CK inputs — check the datasheet's
-  input-level table). The IP already drives both legs: set `DIFF_CK=1` and `hb_ck_n` is generated.
-- **Then configure for the 250 MHz grade:** latency code per the RA4I AC table (`LATENCY_CLOCKS`/
-  `INIT_CR0`), re-run the write-latency calibration (`WR_LAT_TRIM` — the readback offset tracks the
-  knob 1:1), set `MAX_BURST_WORDS` = tCSM×250 MHz, and close fabric timing at 250 (Fmax is 210
-  today; the remaining gap is ordinary STA-guided pipelining, or the half-rate controller option).
-  The complete step list, with acceptance criteria, is **issue #12**.
-
-On boards without a CK# trace (like the AXC3000), the practical clean ceiling remains ~176 MHz
-(344/337 MB/s) unless the dedicated-pin free-running CK proves better margins single-ended — that
-experiment is issue #12's first work item.
-
-**Scope / open items.** Single bursts commit clean up to ~768 words (≥1024 hits tCSM refresh, ≈15 µs).
-Multi-burst *reads* complete correctly (over-stream drain). Multi-burst (split) *writes* drop the last
-word of each non-final burst — a W957D8NB write-commit quirk
-([issue #1](https://github.com/fpga-professional-association/hyperram/issues/1); workaround: single
-bursts ≤512 words). The board build adds runtime burst-size + first-error diagnostic CSRs and an
-on-chip logic analyzer (`fpga/axc3000/hyperbus_capture.sv`); details in `fpga/axc3000/README.md`.
-
-## Status & scope
-
-- **Simulation-validated.** The controller, both front-ends, and the **generic** and
-  **SDR** PHYs are verified against a behavioral HyperRAM model (incl. the real read
-  preamble) under Verilator 5.020 — protocol correctness, not electrical timing.
-- **Hardware-validated (AXC3000).** The SDR-PHY build is timing-closed, programmed,
-  and **measured on real silicon** (see Performance above): single-burst HyperRAM
-  read/write with verified integrity. This is the first on-silicon bandwidth for
-  this controller.
-- **The generic PHY is simulation-oriented.** It uses plain clocked registers and
-  behavioral DDR muxes (and a modeled RWDS strobe delay). It will *infer* on any
-  FPGA but is not tuned for a specific device's I/O timing.
-- **The AMD/Xilinx PHY simulates via a primitive shim; the Intel/Altera PHY does not.**
-  `hyperbus_phy_xilinx` is a real 7-series datapath (`ODDR`/`IDDR`/`IDELAYE2`/`IDELAYCTRL`/
-  `BUFIO`/`BUFR`/`OBUF`/`OBUFDS`) that **simulates end-to-end under `verilator --binary --timing`**
-  through a Verilator-only shim (`sim/model/xilinx_prims_sim.sv`, `tb_xilinx`) — but is **still not
-  hardware-proven or timing-closed**: the read-eye taps (`RX_STROBE_DLY_TAPS`), byte-pairing polarity
-  (`RX_PAIR_SKEW`) and preamble skip (`RD_PREAMBLE_SKIP`) are bring-up knobs to sweep on real silicon.
-  `hyperbus_phy_altera` uses Quartus/Agilex hard-IP primitives and is therefore **not** expected to
-  simulate under Verilator (validated by the fitter + on-hardware bring-up). Neither is a drop-in for a
-  new board without pin/XDC constraints and static timing closure. See
-  [`docs/PHY_PORTING.md`](docs/PHY_PORTING.md).
-- **Hardware measurement** is the AXC3000 SDR-PHY result in **Performance** above: single-burst
-  read/write clean and integrity-verified from 50 up to **175 MHz CK (~342/337 MB/s)**, and multi-burst
-  *reads* validated. Open on hardware: split multi-burst *writes* (issue #1) and the 200 MHz DDIO PHY
-  (issue #3). The generic/vendor DDIO PHY variants are not yet hardware-validated.
+- **CK must come from a dedicated PLL clock-output pin pair** (true clock-network drive), not
+  from I/O-cell data registers: on the AXC3000, every I/O-cell CK source shows a page-boundary
+  bit-margin artifact above ~176 MHz, while the fabric generator is clean but min-pulse-capped
+  at ~176 MHz.
+- **CK/CK# should be differential** on this 1.2 V-class device (Infineon guidance); set
+  `DIFF_CK=1` (the IP already drives both legs) and route a matched pair. The AXC3000 wires CK
+  single-ended, which is why its ceiling stands at ~176 MHz.
+- Then: latency code per the 250 MHz AC table, `WR_LAT_TRIM` recalibration, fabric timing at
+  250 MHz (Fmax today: 210). The complete plan with acceptance criteria is
+  [issue #12](https://github.com/fpga-professional-association/hyperram/issues/12).
 
 ---
 
@@ -470,21 +328,26 @@ on-chip logic analyzer (`fpga/axc3000/hyperbus_capture.sv`); details in `fpga/ax
 
 ```
 rtl/
-  hyperbus_pkg.sv            params, typedefs, CA/latency/wrap functions
-  hyperbus_ctrl.sv          protocol engine (native slave ⇄ PHY master)
-  hyperram_axi.sv           top: AXI4  + ctrl + phy
-  hyperram_avalon.sv        top: Avalon-MM + ctrl + phy
-  if/hyperbus_axi.sv        AXI4 slave front-end
-  if/hyperbus_avalon.sv     Avalon-MM slave front-end
-  phy/hyperbus_phy.sv       PHY wrapper (selects variant)
-  phy/hyperbus_phy_generic.sv   inferrable DDR + RWDS→clk CDC (sim + any FPGA)
-  phy/hyperbus_phy_altera.sv    Intel/Altera DDR-IO skeleton
-  phy/hyperbus_phy_xilinx.sv    AMD/Xilinx 7-series ODDR/IDDR DDR-I/O (simulates via primitive shim)
+  hyperbus_pkg.sv               params, typedefs, CA/latency/wrap functions
+  hyperbus_ctrl.sv              protocol engine (native slave ⇄ PHY master)
+  hyperram_axi.sv               top: AXI4      + ctrl + phy
+  hyperram_avalon.sv            top: Avalon-MM + ctrl + phy
+  if/hyperbus_axi.sv            AXI4 slave front-end
+  if/hyperbus_avalon.sv         Avalon-MM slave front-end
+  phy/hyperbus_phy.sv           PHY wrapper (selects variant)
+  phy/hyperbus_phy_generic.sv   inferrable DDR + RWDS→clk CDC
+  phy/hyperbus_phy_sdr.sv       portable single-periphery-clock variant
+  phy/hyperbus_phy_xilinx.sv    AMD/Xilinx 7-series datapath (simulates via shim)
+  phy/hyperbus_phy_altera.sv    Intel/Altera DDIO variant
+  bench/hyperram_bw_test.sv     synthesizable bandwidth/integrity engine + CSRs
+  bench/hyperram_bw_top.sv      bench top (engine + IP top)
 sim/
-  model/hyperram_model.sv       behavioral golden device
-  model/xilinx_prims_sim.sv     Verilator-only 7-series primitive shim (ODDR/IDDR/IDELAYE2/… ; tb_xilinx)
-  tb_avalon / tb_axi / tb_fixed2x / tb_timeout / tb_xilinx …   self-checking testbenches
-  run.sh                        build + run all TBs (Verilator)
+  model/hyperram_model.sv       behavioral golden device (incl. wound/row knobs)
+  model/xilinx_prims_sim.sv     Verilator-only 7-series primitive shim
+  tb_*.sv                       23 self-checking testbenches
+  run.sh                        build + run everything (Verilator)
+fpga/axc3000/                   complete Agilex 3 board build: I/O layer, qsys clocking,
+                                constraints, bitstreams, JTAG benchmark + probe scripts
 docs/
   SPEC_DIGEST.md  DESIGN.md  INTERFACES.md  INTEGRATION.md  PHY_PORTING.md
 ```
@@ -493,7 +356,7 @@ docs/
 
 ## License
 
-Apache-2.0. Copyright 2026 FPGA Professional Association. See [`LICENSE`](LICENSE)
-and [`NOTICE`](NOTICE). This is an **original clean-room** implementation of the
-public HyperBus specification; MJoergen/HyperRAM (MIT) and OpenHBMC (Apache-2.0)
-were consulted as design references only — no code was copied.
+Apache-2.0. Copyright 2026 FPGA Professional Association. See [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE). This is an **original clean-room** implementation of the public HyperBus
+specification; MJoergen/HyperRAM (MIT) and OpenHBMC (Apache-2.0) were consulted as design
+references only — no code was copied.
