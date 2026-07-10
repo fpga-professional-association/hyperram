@@ -32,6 +32,11 @@ module hyperram_axi
                                                                          //   WORD boundary (W957D8NB)
   parameter bit          WR_COMMIT_READ    = 1'b0,                       // interpose commit-read after
                                                                          //   each split memory write
+  parameter bit          WR_CHOP_REPLAY    = 1'b0,                       // re-send the last words at
+                                                                         //   intra-command write chops
+                                                                         //   (issue #1 direction 5)
+  parameter int unsigned WR_REPLAY_WORDS   = 4,                          // replay depth (= device
+                                                                         //   pending depth; W957D8NB: 4)
   parameter bit          PROGRAM_CR        = 1'b1,                       // program CR0 at init
   parameter int unsigned POR_DELAY_CYCLES  = 0,                         // POR init delay (sim: 0)
   parameter logic [3:0]  INIT_LATENCY_CODE = hb_clocks_to_latency_code(LATENCY_CLOCKS),
@@ -238,6 +243,8 @@ module hyperram_axi
     .MAX_BURST_WORDS   (MAX_BURST_WORDS),
     .BURST_BOUNDARY_WORDS (BURST_BOUNDARY_WORDS),
     .WR_COMMIT_READ    (WR_COMMIT_READ),
+    .WR_CHOP_REPLAY    (WR_CHOP_REPLAY),
+    .WR_REPLAY_WORDS   (WR_REPLAY_WORDS),
     .PROGRAM_CR        (PROGRAM_CR),
     .POR_DELAY_CYCLES  (POR_DELAY_CYCLES),
     .INIT_LATENCY_CODE (INIT_LATENCY_CODE),

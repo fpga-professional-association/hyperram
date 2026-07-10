@@ -35,10 +35,19 @@ Additional parameters: `LATENCY_CLOCKS` (default `HB_LATENCY_CLOCKS_DEFAULT`=6),
 `BURST_BOUNDARY_WORDS` (default 0 = off; else a linear segment is chopped so it never crosses this
 WORD-aligned boundary — the W957D8NB bus-release quirk), `WR_COMMIT_READ` (default 0 = off; when 1,
 after each split memory-write segment the controller self-issues an internal commit-read spanning the
-last written word — the W957D8NB write-commit quirk), `PROGRAM_CR` (default 1 = program CR0 at init),
-`POR_DELAY_CYCLES` (default 0 in sim), `INIT_LATENCY_CODE` / `INIT_CR0` (CR image written at init).
-The two device-quirk parameters default OFF so existing instantiations are bit-identical; they are
-threaded (defaulted) through `hyperram_avalon` / `hyperram_axi` / `hyperram_bw_top`.
+last written word — **documented-ineffective for write→write streams since v9/2026-07-10 silicon**;
+kept for read-terminated traffic), `COMMIT_READ_WORDS` / `COMMIT_READ_MODE`
+(`"SPAN_END"`|`"FULL_BURST"`|`"NEXT_ROW"`, shape of that internal read), `WR_COALESCE` (default 0;
+when 1, a contiguous linear memory-write command arriving within `WR_COALESCE_WAIT` cycles of a
+completing write is spliced onto the SAME open CS# burst — no CS# boundary at all), `WR_CHOP_REPLAY`
+(default 0; v9 — when 1, every intra-command write chop reopens `min(WR_REPLAY_WORDS, words sent)`
+words early and re-sends them from an internal shadow, re-writing the pending tail the device drops
+at the chop; `WR_REPLAY_WORDS` default 4 = the W957D8NB pending depth), `PROGRAM_CR` (default 1 =
+program CR0 at init), `POR_DELAY_CYCLES` (default 0 in sim), `INIT_LATENCY_CODE` / `INIT_CR0` (CR
+image written at init). The device-quirk parameters default OFF so existing instantiations are
+bit-identical; they are threaded (defaulted) through `hyperram_avalon` / `hyperram_axi` /
+`hyperram_bw_top` (the coalesce/commit-shape/replay set through `hyperram_avalon`, and
+replay additionally through `hyperram_axi`).
 
 Spec-feature options (v8, all defaulted OFF = legacy behavior — no port changes):
 `PROGRAM_CR1` (default 0) / `INIT_CR1` (default `HB_CR1_RESET`) — optional second zero-latency register
@@ -378,3 +387,27 @@ active driver at a time, enforced by the protocol). RWDS analogous.
   device state) — its frozen pin list is unchanged. `hyperbus_phy`, both front-ends, and the
   FPGA-referenced `hyperram_bw_top` are untouched. Regression: `sim/tb_cr1init.sv`, `sim/tb_por_timing.sv`,
   `sim/tb_dpd.sv`, `sim/tb_clkstop.sv`.
+- **v9 (2026-07-10):** `hyperbus_ctrl` gains `WR_CHOP_REPLAY` (default 0) / `WR_REPLAY_WORDS`
+  (default 4) — the WRITE-CHOP REPLAY remedy for the W957D8NB write-commit quirk at boundaries that
+  MUST exist (tCSM `MAX_BURST_WORDS` / `BURST_BOUNDARY_WORDS` chops of one long write stream).
+  **Defaulted parameters only; no frozen port name, direction, or width changed on any module.**
+  Threaded (defaulted) through `hyperram_avalon` and `hyperram_axi`. (This entry also records the
+  previously-unlogged 2026-07-09 ctrl parameters `COMMIT_READ_WORDS`/`COMMIT_READ_MODE`/`WR_COALESCE`/
+  `WR_COALESCE_WAIT`, threaded through `hyperram_avalon`.) Background — 2026-07-10 silicon falsified
+  the read-commit hypothesis: on the real device a CS#-closing write boundary permanently loses the
+  final `WR_REPLAY_WORDS` (=4) words of the closed segment as soon as the next memory-space WRITE CS#
+  opens; NO read-shaped interpose (SPAN_END or FULL_BURST commit-read) prevents it, so
+  `WR_COMMIT_READ` is now documented-ineffective for write→write streams (RTL kept for
+  read-terminated traffic). With `WR_CHOP_REPLAY=1` the controller keeps a `WR_REPLAY_WORDS`-deep
+  shadow of the last words+strobes sent in the current write CS# and reopens every intra-command chop
+  `min(WR_REPLAY_WORDS, words sent)` words early, sourcing those beats from the shadow (no extra
+  front-end data consumed) — re-writing exactly the words the device discards. Composition: replay
+  covers intra-command chop boundaries; command-level write→write boundaries remain `WR_COALESCE`'s
+  job. At a `BURST_BOUNDARY_WORDS` chop the replayed reopen deliberately starts before the boundary
+  (budget taken from the pre-rollback base). RESIDUAL (inherent device behavior): the FINAL segment's
+  last `WR_REPLAY_WORDS` words still pend at stream end — they are observably committed by any
+  subsequent covering host READ, and are lost for write-then-idle-forever workloads. The SIM model
+  `hyperram_model`'s `WR_COMMIT_QUIRK` is corrected to match silicon (non-frozen, sim-only): pending
+  words serve reads (buffer readback) but are NEVER flushed to the array by a read; the next
+  memory-space WRITE CS# discards them (array reads 0x0000 there). Regression: `sim/tb_commit.sv`
+  (idx 10/11 replay stacks; commit-read expectations flipped to the ineffective signature).

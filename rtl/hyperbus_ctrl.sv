@@ -55,6 +55,12 @@ module hyperbus_ctrl
     // After every SPLIT memory-write segment, self-issue an internal COMMIT-READ that spans the last
     // written word (the device only commits a write burst's final word when the next command is a
     // read that covers it; a following write drops it). 1 = interpose the commit-read (issue #1).
+    // 2026-07-10 SILICON STATUS: DOCUMENTED-INEFFECTIVE for write->write streams. On the real
+    // W957D8NB NO read-shaped interpose (any COMMIT_READ_MODE) commits the pending words when
+    // another write follows — the pending tail is lost the moment the next memory-space WRITE CS#
+    // opens, interposed reads notwithstanding. Kept for configurations whose traffic genuinely ends
+    // in a read; for chopped write streams use WR_CHOP_REPLAY (and WR_COALESCE for command-level
+    // boundaries) instead.
     parameter bit          WR_COMMIT_READ       = 1'b0,
     // Write-latency extension (board-calibration): ADD this many CK to the SECOND (2x) latency
     // count for WRITES only. Reads are RWDS-gated and self-align, so they never need it; on the
@@ -74,11 +80,15 @@ module hyperbus_ctrl
     // non-final write burst pending (ERR_COUNT = 4*(n_bursts-1), always words [len-4..len-1]) — a
     // 4-word SPAN_END read exactly spans those four words yet no longer triggers the commit (same
     // failure class as issue #1 attempt #3's short dummy read). FULL_BURST: re-read the ENTIRE
-    // just-closed write segment from its true base (wr_seg_base/wr_seg_len) — the shape silicon
-    // PROVES commits (bw's own full-range read-back phase always commits everything), and is robust
-    // to a pending depth the controller cannot otherwise know. NEXT_ROW (issue #1 direction 3,
-    // untried on silicon): read COMMIT_READ_WORDS words at last_wr_addr with bit 12 flipped (a
-    // different 4K row), on the row-close/precharge hypothesis.
+    // just-closed write segment from its true base (wr_seg_base/wr_seg_len). NEXT_ROW (issue #1
+    // direction 3, untried on silicon): read COMMIT_READ_WORDS words at last_wr_addr with bit 12
+    // flipped (a different 4K row), on the row-close/precharge hypothesis.
+    // 2026-07-10 CORRECTION: FULL_BURST was believed silicon-proven because bw's own full-range
+    // read-back phase always observes committed data — but that observation only holds when NO
+    // WRITE follows the read. On silicon a FULL_BURST commit-read interposed between two writes
+    // does NOT preserve the pending words (~4 lost per chop, same as no fix); the old sim model's
+    // covering-read-commits trigger was the artifact that made it look like a fix. See
+    // WR_CHOP_REPLAY for the working chop-boundary remedy.
     parameter              COMMIT_READ_MODE     = "SPAN_END",  // SPAN_END | FULL_BURST | NEXT_ROW
     // CS#-COALESCING (issue #1 direction 4 — the deterministic fix for transfers under tCSM). When a
     // memory-write command finishes and a NEW, contiguous (cmd_addr == just-written-end), linear,
@@ -99,6 +109,42 @@ module hyperbus_ctrl
     // instantiations).
     parameter bit          WR_COALESCE          = 1'b0,
     parameter int unsigned WR_COALESCE_WAIT     = 8,           // cycles to wait for a coalescing cmd
+    // WRITE-CHOP REPLAY (issue #1 direction 5 — 2026-07-10 silicon). The commit-read hypothesis is
+    // FALSIFIED on silicon: any CS#-closing write boundary permanently loses the final
+    // WR_REPLAY_WORDS (= device pending depth, 4 on the W957D8NB) words of the closed segment the
+    // moment the next memory-space WRITE CS# opens — NO read-shaped interpose (SPAN_END, FULL_BURST,
+    // anything) commits them when another write follows. The only robust fix for a boundary that
+    // MUST exist (a tCSM / MAX_BURST_WORDS / BURST_BOUNDARY_WORDS chop of one long write stream) is
+    // to RE-SEND the words the device is about to drop. When 1, the controller keeps a
+    // WR_REPLAY_WORDS-deep shadow of the last data words + byte-strobes sent in the current write
+    // CS# burst and, at every INTRA-COMMAND chop (ST_RECOVER with rem_left != 0 on a memory write),
+    // reopens the next segment rb = min(WR_REPLAY_WORDS, words sent in the closed CS#) words EARLY:
+    // cur_addr rolled back by rb, seg/rem accounting widened by rb so the total front-end word count
+    // is unchanged, and the first rb beats of the new segment sourced from the replay shadow
+    // (wr_ready is HELD LOW for them — no new front-end data is consumed for replayed beats). The
+    // re-write lands after the device has discarded/zeroed its pending tail, so the chopped stream
+    // reads back clean.
+    // COMPOSITION: replay handles exactly the boundaries WR_COALESCE cannot avoid — the
+    // intra-command chops. It does NOT apply at command-level (write-command -> write-command) CS#
+    // boundaries: avoiding those is coalescing's job (WR_COALESCE), and a command boundary that
+    // coalescing declines (non-contiguous, wait timeout, cap exhausted) still loses the closed
+    // burst's pending tail. When WR_COMMIT_READ is also enabled, replay takes precedence at chop
+    // boundaries and the chop commit-read is gated off there (silicon-proven useless for
+    // write->write); WR_COMMIT_READ's command-level deferred interpose is left as configured.
+    // BURST_BOUNDARY note: at a BURST_BOUNDARY_WORDS chop the rolled-back segment deliberately
+    // STARTS rb words BEFORE the boundary it just chopped at (the reopen's boundary budget is taken
+    // from the pre-rollback base, so the replayed prefix is not itself re-chopped) — the only way
+    // the pre-boundary tail can ever be re-written.
+    // RESIDUAL (inherent device behavior; this IP cannot fix it without inventing traffic): the
+    // FINAL segment's last WR_REPLAY_WORDS words still pend inside the device at stream end. They
+    // are observably committed by any subsequent covering READ the host performs
+    // (silicon-observed), and are lost for write-then-idle-forever workloads.
+    // Sizing: WR_REPLAY_WORDS must equal the device pending depth (W957D8NB: 4) and be smaller than
+    // MAX_BURST_WORDS when that cap is set (the replayed prefix + at least one real word share a
+    // segment; if MAX_BURST_WORDS <= WR_REPLAY_WORDS the reopened segment may exceed the cap by up
+    // to rb words). Default 0 = off (bit-identical to prior instantiations).
+    parameter bit          WR_CHOP_REPLAY       = 1'b0,
+    parameter int unsigned WR_REPLAY_WORDS      = 4,
     // ---- A3: optional CR1 programming at init (SPEC_DIGEST §5/§8.2). Default OFF = today's behavior
     //          (CR0 only). When set, a SECOND zero-latency register write of CR1 follows the CR0 write
     //          during init, before init_done. The device's distributed-refresh/PASR/hybrid-sleep fields
@@ -317,6 +363,27 @@ module hyperbus_ctrl
   logic [LEN_WIDTH-1:0]    seg_cap_left;
   logic [15:0]             coalesce_wait_cnt;
 
+  // -- Write-chop replay (WR_CHOP_REPLAY). rp_word/rp_strb is a WR_REPLAY_WORDS-deep shift shadow
+  //    of the last words sent in the CURRENT write CS# burst (index 0 = newest). It is captured at
+  //    every memory-space ST_WRITE beat — replayed beats included: a replayed word is the most
+  //    recently SENT word and would pend again if this CS# closed right behind it. An underrun
+  //    filler slot is captured with an all-zero strobe (a replay of it re-sends a fully-masked,
+  //    address-consuming, data-neutral word). rp_cnt counts words sent since this CS# opened,
+  //    saturating at WR_REPLAY_WORDS; it is reset at every genuine CS# open but NOT at a
+  //    ST_WR_COALESCE splice (the splice keeps the same CS#/HyperBus burst open, and coalescing is
+  //    address-contiguous, so the shadow always holds exactly addresses
+  //    [cur_addr-rp_cnt .. cur_addr-1] regardless of command splices). replay_left counts the
+  //    rolled-back segment's replayed-prefix beats still to send; the emit index replay_idx is
+  //    FIXED at rb-1 for the whole prefix — each emitted word re-enters the shift shadow at [0]
+  //    pushing the pipe down one, so the next-oldest word lands at the same index (and after rb
+  //    emits the shadow is back in newest-first order, holding the same rb words). --
+  localparam int unsigned RP_AW = (WR_REPLAY_WORDS > 1) ? $clog2(WR_REPLAY_WORDS) : 1;
+  logic [DATA_WIDTH-1:0]   rp_word [WR_REPLAY_WORDS];
+  logic [STRB_WIDTH-1:0]   rp_strb [WR_REPLAY_WORDS];
+  logic [LEN_WIDTH-1:0]    rp_cnt;
+  logic [LEN_WIDTH-1:0]    replay_left;
+  logic [RP_AW-1:0]        replay_idx;
+
   // read holding FIFO ({last, data})
   logic [DATA_WIDTH:0]     rd_fifo [RD_FIFO_DEPTH];
   logic [RD_AW:0]          rd_wptr, rd_rptr;
@@ -464,6 +531,33 @@ module hyperbus_ctrl
   wire [LEN_WIDTH-1:0] coalesce_accept_len = (coalesce_new_seg < seg_cap_left) ? coalesce_new_seg
                                                                                 : seg_cap_left;
 
+  // -- Write-chop replay (WR_CHOP_REPLAY) combinational helpers -------------------------------------
+  // This ST_WRITE beat is a REPLAYED one: sourced from the replay shadow, not the front-end
+  // (wr_ready held Low, underrun detection suppressed — the data is by construction available).
+  wire                  replay_beat = WR_CHOP_REPLAY & (replay_left != '0);
+  wire [DATA_WIDTH-1:0] rp_data_sel = rp_word[replay_idx];
+  wire [STRB_WIDTH-1:0] rp_strb_sel = rp_strb[replay_idx];
+
+  // Replay-reopen geometry (consumed at the ST_RECOVER chop branch, where cur_addr has already been
+  // advanced to the un-rolled next-segment base and rem_left/rp_cnt are stable):
+  //   rp_rb   — rollback = min(WR_REPLAY_WORDS, words sent in the just-closed CS#) (rp_cnt saturates
+  //             at WR_REPLAY_WORDS in ST_WRITE, so it IS that min);
+  //   rp_real — the segment's REAL (front-end-sourced) word budget. Boundary-capped from the
+  //             PRE-rollback base (cur_addr): the replayed prefix sits BEFORE that base, so capping
+  //             from rp_base instead would re-chop the reopen at the very boundary it just chopped
+  //             at (a 100%-replay segment => no forward progress => livelock). The prefix still
+  //             counts toward the tCSM budget, so rp_real is clipped to MAX_BURST_WORDS - rp_rb
+  //             (skipped if the cap is too small to honor — see the WR_CHOP_REPLAY sizing note);
+  //   rp_base — rolled-back segment base;  rp_seg — total reopened segment length.
+  wire [LEN_WIDTH-1:0]  rp_rb       = rp_cnt;
+  wire [LEN_WIDTH-1:0]  rp_real_raw = seg_size(rem_left, 1'b0, cur_addr);
+  wire [LEN_WIDTH-1:0]  rp_real     = ((MAX_BURST_WORDS != 0) &&
+                                       (LEN_WIDTH'(MAX_BURST_WORDS) > rp_rb) &&
+                                       (rp_real_raw > LEN_WIDTH'(MAX_BURST_WORDS) - rp_rb))
+                                      ? (LEN_WIDTH'(MAX_BURST_WORDS) - rp_rb) : rp_real_raw;
+  wire [ADDR_WIDTH-1:0] rp_base     = cur_addr - ADDR_WIDTH'(rp_rb);
+  wire [LEN_WIDTH-1:0]  rp_seg      = rp_rb + rp_real;
+
   // ------------------------------------------------------------------------
   // Read data-out (FIFO front)
   // ------------------------------------------------------------------------
@@ -530,12 +624,16 @@ module hyperbus_ctrl
         phy_cs_n  = 1'b0;
         phy_ck_en = 1'b1;
         phy_dq_oe = 1'b1;
-        phy_dq_o  = wsrc_data;
+        // WR_CHOP_REPLAY: a replayed beat is sourced from the replay shadow — the front-end's
+        // wr channel is NOT consumed (wr_ready stays Low) and its current word is left untouched
+        // for the first post-replay beat.
+        phy_dq_o  = replay_beat ? rp_data_sel : wsrc_data;
         if (!zlw) begin
           phy_rwds_oe = 1'b1;            // RWDS = byte mask (High = masked); underrun => mask both
-          phy_rwds_o  = wsrc_valid ? {~wsrc_strb[1], ~wsrc_strb[0]} : 2'b11;
+          phy_rwds_o  = replay_beat ? {~rp_strb_sel[1], ~rp_strb_sel[0]}
+                                    : (wsrc_valid ? {~wsrc_strb[1], ~wsrc_strb[0]} : 2'b11);
         end
-        if (wsrc_valid & ~doing_init) wr_ready = 1'b1;
+        if (wsrc_valid & ~doing_init & ~replay_beat) wr_ready = 1'b1;
         busy = ~doing_init;
       end
 
@@ -637,6 +735,9 @@ module hyperbus_ctrl
       sv_rem       <= '0;
       seg_cap_left      <= '0;
       coalesce_wait_cnt <= '0;
+      rp_cnt       <= '0;
+      replay_left  <= '0;
+      replay_idx   <= '0;
       cur_read     <= 1'b0;
       cur_reg      <= 1'b0;
       cur_wrap     <= 1'b0;
@@ -727,6 +828,8 @@ module hyperbus_ctrl
               ca_reg    <= hb_pack_ca(cmd_read, cmd_reg, ~cmd_wrap, cmd_addr);
               rwds_hi   <= 1'b0;
               ca_idx    <= 2'd0;
+              rp_cnt      <= '0;                   // fresh CS# (WR_CHOP_REPLAY word count)
+              replay_left <= '0;                   //   (a user command never starts with a replay)
               wr_pending_commit <= 1'b0;           // a normally-accepted command clears the pending
                                                    //   flag (a covering read commits the prior write)
               // A1: if the device is in Deep-Power-Down, wake it (CS# pulse + tDPDOUT) BEFORE running
@@ -865,7 +968,10 @@ module hyperbus_ctrl
 
         // ---------------- write data ----------------
         ST_WRITE: begin
-          if (!wsrc_valid) err_underrun <= 1'b1;   // host underrun: word gets masked, burst continues
+          // Host underrun: word gets masked, burst continues. A replayed beat (WR_CHOP_REPLAY) is
+          // sourced from the replay shadow and never consumes the front-end, so wsrc_valid Low is
+          // expected there — not an underrun.
+          if (!wsrc_valid && !replay_beat) err_underrun <= 1'b1;
           // A1: snoop a host CR0 register-write for the Deep-Power-Down bit (CR0[15]); 0 => the device
           // will enter DPD, 1 => normal. Register writes are single-word / zero-latency, so the value
           // is on the bus this cycle. The next command is then guarded by a wake (ST_DPD_WAKE).
@@ -877,6 +983,20 @@ module hyperbus_ctrl
           // WR_COALESCE hw-cap tracking: one word of this still-open CS# burst's budget is spent every
           // ST_WRITE cycle, regardless of which native command it belongs to (see seg_cap_left above).
           seg_cap_left <= seg_cap_left - 1'b1;
+          // WR_CHOP_REPLAY shadow capture: push every memory-space write beat sent this cycle —
+          // replayed beats included — into the replay shift shadow (see its declaration for why the
+          // fixed emit index stays correct under this shift), and count it toward rp_cnt (saturating
+          // at WR_REPLAY_WORDS). An underrun filler is captured with an all-zero strobe.
+          if (WR_CHOP_REPLAY && !zlw) begin
+            for (int p = int'(WR_REPLAY_WORDS) - 1; p > 0; p--) begin
+              rp_word[p] <= rp_word[p-1];
+              rp_strb[p] <= rp_strb[p-1];
+            end
+            rp_word[0] <= replay_beat ? rp_data_sel : wsrc_data;
+            rp_strb[0] <= replay_beat ? rp_strb_sel : (wsrc_valid ? wsrc_strb : '0);
+            if (rp_cnt != LEN_WIDTH'(WR_REPLAY_WORDS)) rp_cnt <= rp_cnt + 1'b1;
+            if (replay_beat) replay_left <= replay_left - 1'b1;
+          end
           if (seg_left == LEN_WIDTH'(1)) begin
             // Last word of this write segment: record its (pre-advance) WORD address, and the
             // segment's own base/length, so a subsequent commit-read (WR_COMMIT_READ) can be shaped
@@ -950,9 +1070,32 @@ module hyperbus_ctrl
           if (cnt == 32'd0) begin
             if (rem_left != LEN_WIDTH'(0)) begin
               // more linear segments remain in THIS transaction (chopped by tCSM / boundary)
-              if (WR_COMMIT_READ & ~cur_read & ~cur_reg & ~doing_commit) begin
+              if (WR_CHOP_REPLAY & ~cur_read & ~cur_reg & ~doing_commit & (rp_cnt != '0)) begin
+                // WRITE-CHOP REPLAY reopen (takes precedence over the WR_COMMIT_READ chop interpose
+                // below — read-shaped interposes are silicon-proven useless for write->write): the
+                // device is about to discard the just-closed segment's last rp_rb words the moment
+                // this next write CS# opens, so reopen rp_rb words EARLY and re-send them from the
+                // replay shadow. rem_left is widened by rp_rb so the front-end word count stays
+                // exact (the rp_rb replayed beats consume no wr channel data); seg_cap_left gets
+                // the same prefix allowance as rp_seg so coalescing's continuous budget tracking
+                // stays consistent with the segment actually opened.
+                cur_addr     <= rp_base;
+                rem_left     <= rem_left + rp_rb;
+                seg_count    <= rp_seg;
+                seg_left     <= rp_seg;
+                seg_cap_left <= rp_rb + hw_cap(cur_addr);
+                ca_reg       <= hb_pack_ca(1'b0, 1'b0, 1'b1, rp_base);   // write, memory, linear
+                replay_left  <= rp_rb;
+                replay_idx   <= RP_AW'(rp_rb - LEN_WIDTH'(1));
+                rp_cnt       <= '0;                   // fresh CS#: nothing sent in it yet
+                rwds_hi      <= 1'b0;
+                ca_idx       <= 2'd0;
+                state        <= ST_CS;
+              end else if (WR_COMMIT_READ & ~cur_read & ~cur_reg & ~doing_commit) begin
                 // tCSM / boundary CHOP interpose: commit the just-closed write segment's last word
                 // with an internal commit-read, remembering where to resume the write afterwards.
+                // (2026-07-10: documented-ineffective on silicon — see the parameter notes; reached
+                // only when WR_CHOP_REPLAY is off.)
                 sv_addr           <= cur_addr;        // next write-segment start (advanced in ST_WRITE)
                 sv_rem            <= rem_left;
                 commit_resume     <= 1'b1;
@@ -967,6 +1110,7 @@ module hyperbus_ctrl
                 ca_reg    <= hb_pack_ca(cur_read, cur_reg, ~cur_wrap, cur_addr);
                 rwds_hi   <= 1'b0;
                 ca_idx    <= 2'd0;
+                rp_cnt    <= '0;                   // fresh CS# (WR_CHOP_REPLAY word count)
                 state     <= ST_CS;
               end
             end else if (doing_commit) begin
@@ -987,6 +1131,7 @@ module hyperbus_ctrl
                 ca_reg    <= hb_pack_ca(1'b0, 1'b0, 1'b1, sv_addr);   // write, memory, linear
                 rwds_hi   <= 1'b0;
                 ca_idx    <= 2'd0;
+                rp_cnt    <= '0;                   // fresh CS# (WR_CHOP_REPLAY word count)
                 state     <= ST_CS;
               end else begin
                 state <= ST_IDLE;                     // deferred interpose done: take the pending cmd

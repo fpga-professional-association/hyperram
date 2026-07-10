@@ -32,6 +32,11 @@ module hyperram_avalon
   parameter              COMMIT_READ_MODE  = "SPAN_END",                 // SPAN_END|FULL_BURST|NEXT_ROW
   parameter bit          WR_COALESCE       = 1'b0,                       // CS#-coalescing (issue #1 #4)
   parameter int unsigned WR_COALESCE_WAIT  = 8,                          // cycles to await a splice cmd
+  parameter bit          WR_CHOP_REPLAY    = 1'b0,                       // re-send the last words at
+                                                                         //   intra-command write chops
+                                                                         //   (issue #1 direction 5)
+  parameter int unsigned WR_REPLAY_WORDS   = 4,                          // replay depth (= device
+                                                                         //   pending depth; W957D8NB: 4)
   parameter bit          PROGRAM_CR        = 1'b1,                       // program CR0 at init
   parameter int unsigned POR_DELAY_CYCLES  = 0,                         // POR init delay (sim: 0)
   parameter logic [3:0]  INIT_LATENCY_CODE = hb_clocks_to_latency_code(LATENCY_CLOCKS),
@@ -204,6 +209,8 @@ module hyperram_avalon
     .COMMIT_READ_MODE  (COMMIT_READ_MODE),
     .WR_COALESCE       (WR_COALESCE),
     .WR_COALESCE_WAIT  (WR_COALESCE_WAIT),
+    .WR_CHOP_REPLAY    (WR_CHOP_REPLAY),
+    .WR_REPLAY_WORDS   (WR_REPLAY_WORDS),
     .PROGRAM_CR        (PROGRAM_CR),
     .POR_DELAY_CYCLES  (POR_DELAY_CYCLES),
     .INIT_LATENCY_CODE (INIT_LATENCY_CODE),

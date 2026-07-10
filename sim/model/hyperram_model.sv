@@ -74,16 +74,25 @@ module hyperram_model
                                                                       //   below stops the instant CK stops and never exercised
                                                                       //   this; the SELF-TIMED tail below reproduces it.
                                                                       //   0 = ideal device (keeps all existing TBs aligned).
-    parameter bit          WR_COMMIT_QUIRK = 1'b0,                     // W957D8NB SPLIT-WRITE commit quirk (issue #1):
+    parameter bit          WR_COMMIT_QUIRK = 1'b0,                     // W957D8NB SPLIT-WRITE commit quirk (issue #1,
+                                                                      //   CORRECTED to the 2026-07-10 silicon evidence):
                                                                       //   when 1, the FINAL WR_PENDING_WORDS word(s) of
                                                                       //   every memory WRITE burst are held pending (NOT
-                                                                      //   committed to mem[]) and are committed only when
-                                                                      //   a subsequent READ transaction starts AT OR
-                                                                      //   BEFORE the oldest pending word and reaches the
-                                                                      //   newest one (i.e. covers the WHOLE pending
-                                                                      //   range, not merely touches it); a subsequent
-                                                                      //   WRITE drops them. 0 = ideal device (immediate
-                                                                      //   commit; keeps TBs aligned).
+                                                                      //   committed to mem[]). Reads of a pending address
+                                                                      //   return the held data (device-buffer readback —
+                                                                      //   the observable "commit" any trailing covering
+                                                                      //   read sees), but NO read ever FLUSHES the pending
+                                                                      //   words to the array; the next memory-space WRITE
+                                                                      //   CS# discards them regardless of any interposed
+                                                                      //   read (their array locations then read 0x0000 —
+                                                                      //   the silicon fingerprint). The pre-2026-07-10
+                                                                      //   model committed pend->mem on a covering read,
+                                                                      //   which made read-shaped interposes (SPAN_END /
+                                                                      //   FULL_BURST commit-reads) look like fixes; the
+                                                                      //   real device loses the words anyway when another
+                                                                      //   write follows, so that trigger was removed.
+                                                                      //   0 = ideal device (immediate commit; keeps TBs
+                                                                      //   aligned).
     parameter int unsigned WR_PENDING_WORDS = 1,                      // depth of the pending-write delay line (words
                                                                       //   held back at the tail of every write burst).
                                                                       //   1 = original issue #1 model (default, keeps
@@ -174,8 +183,10 @@ module hyperram_model
   // rest down, so a word commits only once WR_PENDING_WORDS newer words have arrived after it within
   // the SAME burst: the burst's LAST WR_PENDING_WORDS words are therefore never committed here (they
   // are still sitting in hold[] when CS# deasserts). At CS# deassert whatever remains valid in hold[]
-  // moves to `pend[]` — the just-closed burst's uncommitted tail, awaiting a covering read (commit, see
-  // the read-side trigger below) or the next write (drop, both modelled per-entry).
+  // moves to `pend[]` — the just-closed burst's uncommitted tail. From there (2026-07-10 silicon
+  // semantics) pend[] entries serve READS of their addresses directly (buffer readback) but are never
+  // flushed to mem[]; they are discarded (and their array locations zeroed) the moment the next
+  // memory-space WRITE CS# opens — interposed reads notwithstanding.
   logic                    hold_valid [WR_PENDING_WORDS];
   logic [AW-1:0]           hold_addr  [WR_PENDING_WORDS];
   logic [DATA_WIDTH-1:0]   hold_word  [WR_PENDING_WORDS];
@@ -356,8 +367,9 @@ module hyperram_model
           // previous write burst (models "a following WRITE leaves the pending word(s) uncommitted").
           // Each array location then reads back 0x0000 on the W957D8NB (issue #1: the lost word(s)
           // "read back as 0x0000"), so zero them here — this reproduces the exact silicon fingerprint
-          // AND is robust to any prior committed value at that address. A read (incl. the master's
-          // commit-read) does NOT unconditionally drop them — it may commit them below.
+          // AND is robust to any prior committed value at that address. This drop is UNCONDITIONAL on
+          // the next memory write (2026-07-10): interposed reads do not protect the pending words —
+          // reads only serve their data back (see the read side), they never flush pend[] to mem[].
           if (WR_COMMIT_QUIRK && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca)) begin
             for (int p = 0; p < WR_PENDING_WORDS; p++) begin
               if (pend_valid[p]) mem[pend_addr[p]] <= '0;
@@ -399,16 +411,16 @@ module hyperram_model
               bnd_rel <= 1'b1;
             // Split-write quirk: reading ANY currently-pending address returns its held (uncommitted)
             // value — readback correctness, the device's internal buffer still has the right data even
-            // though the array doesn't yet. Separately, the COMMIT trigger: reaching the NEWEST pending
-            // word (pend_addr[0], the burst's true last word — hold[]/pend[] are newest-first) on a
-            // read that started AT OR BEFORE the OLDEST pending word — i.e. this read has now delivered
-            // >= WR_PENDING_WORDS words, so it swept through the WHOLE pending range end-to-end, not
-            // merely touched it — commits every still-pending word. wcnt>=WR_PENDING_WORDS generalizes
-            // the original 1-word model's "wcnt>=1" trigger exactly (algebraically identical at
-            // WR_PENDING_WORDS=1, so every existing WR_COMMIT_QUIRK TB is untouched by this
-            // generalization); a short dummy read (issue #1 attempt #3) or a read spanning only the
-            // pending words themselves (e.g. a 4-word SPAN_END commit-read at WR_PENDING_WORDS=4 —
-            // 2026-07-09 silicon evidence) never satisfies it, matching both observed failures.
+            // though the array doesn't yet. This buffer readback is the ONLY read-side behaviour
+            // (2026-07-10 silicon correction): the pre-2026-07-10 model additionally FLUSHED pend[]
+            // to mem[] when a read swept the whole pending range ("covering read commits"), which the
+            // FULL_BURST commit-read satisfied — making it look like a working fix. On silicon a
+            // FULL_BURST interpose between two writes still loses the pending words (~4 per chop), so
+            // that flush trigger is falsified and removed: reads serve pend[] data but never commit
+            // it; only the next memory-space WRITE CS# resolves pend[] (by discarding it — see the
+            // CA-decode hook). A trailing covering read still OBSERVES committed data (served from
+            // pend[]), which is exactly what the silicon "commits if the host performs any subsequent
+            // covering READ" observation can and does see.
             if (WR_COMMIT_QUIRK) begin
               logic                  addr_pending;
               logic [DATA_WIDTH-1:0] pend_out;
@@ -422,19 +434,6 @@ module hyperram_model
               end
               if (addr_pending) out_word <= pend_out;
               else              out_word <= cur_as ? reg_val : mem[addr];
-
-              if (pend_valid[0] && !cur_as && (addr == pend_addr[0]) &&
-                  (wcnt >= 32'(WR_PENDING_WORDS))) begin
-                for (int q = 0; q < WR_PENDING_WORDS; q++) begin
-                  if (pend_valid[q]) begin
-                    if (pend_we[q][1])
-                      mem[pend_addr[q]][DATA_WIDTH-1:DQ_WIDTH] <= pend_word[q][DATA_WIDTH-1:DQ_WIDTH];
-                    if (pend_we[q][0])
-                      mem[pend_addr[q]][DQ_WIDTH-1:0]          <= pend_word[q][DQ_WIDTH-1:0];
-                    pend_valid[q] <= 1'b0;
-                  end
-                end
-              end
             end else begin
               out_word <= cur_as ? reg_val : mem[addr];
             end
