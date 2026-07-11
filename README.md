@@ -3,18 +3,148 @@
 A clean-room, vendor-neutral **HyperBus master** for HyperRAM devices: one protocol engine
 (`hyperbus_ctrl`) behind your choice of **AXI4** or **Avalon-MM** slave front-end and a swappable
 PHY (generic-inferrable, portable-SDR, AMD/Xilinx, Intel/Altera). Verified end-to-end against a
-behavioral device model under Verilator (23 self-checking testbenches) and on real silicon.
+behavioral device model under Verilator (24 self-checking testbenches) and on real silicon.
 
-**Measured on hardware** (Arrow AXC3000: Agilex 3 `A3CY100BM16AE7S` + Winbond **W957D8NBRA4I**,
-128 Mb ×8, 1.2 V, HyperRAM 2.1):
+---
 
-| Clock | Interface | Write | Read | Integrity |
-|------:|-----------|------:|-----:|-----------|
-| **175 MHz CK** | DDR x8 | **341.1 MB/s** | **332.3 MB/s** | `ERR_COUNT=0`, 25-run soak clean |
+## Performance
 
-Full-row 1024-word bursts pace 343.3 / 337.8 MB/s. The board's clean ceiling is ~176 MHz (FPGA
-clock-generation limit); the path to the device's rated 250 MHz / 500 MB/s is
-[issue #12](https://github.com/fpga-professional-association/hyperram/issues/12).
+Measured on hardware (Arrow AXC3000: Agilex 3 `A3CY100BM16AE7S` + Winbond **W957D8NBRA4I**,
+128 Mb ×8, 1.2 V, HyperRAM 2.1; DDR x8 at **175 MHz CK**; JTAG-read cycle counters, every word
+integrity-checked, read-only-probe ground truth, 25-run soak clean):
+
+| Shape | Write | Read | Integrity |
+|---|---:|---:|---|
+| 768-word bursts (in-row) | **341.1 MB/s** | **332.3 MB/s** | `ERR_COUNT=0` |
+| 1024-word full-row bursts | **343.3 MB/s** | 328.8 MB/s | `ERR_COUNT=0` (end-commit-write heals the row tail) |
+| 8192-word streams (8 rows) | 315.9 MB/s | 329.5 MB/s | `ERR_COUNT=0` (full defect-defense set, ~7 % write cost) |
+| Coalesced 64-word write commands | 331.9 MB/s | — | `ERR_COUNT=0` |
+
+Zero-loss on every measured shape is the [issue #13](https://github.com/fpga-professional-association/hyperram/issues/13)
+result: the W957D8NB's write defect was root-caused to a 4-word commit pipeline and neutralized
+with runtime knobs (see *Device limitations*). Bandwidth scales with CK and with burst length as
+the CA + latency overhead amortizes.
+
+**Reaching the device's rated 250 MHz / 500 MB/s** — the engine is not the bottleneck, the
+board-level CK path is: CK must come from a dedicated PLL clock-output pair (every I/O-cell CK
+source shows page-boundary artifacts above ~176 MHz) and should be differential (`DIFF_CK=1`) on
+this 1.2 V-class device. The AXC3000 wires CK single-ended, capping it at ~176 MHz; the full
+250 MHz plan is [issue #12](https://github.com/fpga-professional-association/hyperram/issues/12).
+
+---
+
+## Using the IP core in your design
+
+The integration surface is one module: **`hyperram_avalon`** (word-addressed pipelined
+Avalon-MM slave with `burstcount`) or **`hyperram_axi`** (full AXI4 slave) — each is
+front-end + controller + PHY in a single instance. Full signal tables live in
+[`docs/INTERFACES.md`](docs/INTERFACES.md); this is the practical checklist.
+
+### 1. Instantiate
+
+```systemverilog
+hyperram_avalon #(
+  // -- device parameters (defaults are W957D8NB-family; take yours from the datasheet) --
+  .LATENCY_CLOCKS       (6),          // initial latency (spec Table 5.3)
+  .FIXED_LATENCY        (1'b1),
+  .INIT_CR0             (16'h8F1F),   // CR0 image programmed at init (PROGRAM_CR=1 default)
+  .CLK_FREQ_MHZ         (175),        // enables ns-derived POR/reset AC timing
+
+  // -- device-row management (the W957D8NB zero-loss recipe; see Device limitations) --
+  .MAX_BURST_WORDS      (1024),       // segment cap = one device row
+  .BURST_BOUNDARY_WORDS ('h400),      // never let a burst cross a row
+  .WR_COALESCE          (1'b1),       // contiguous write commands share one CS# burst
+
+  // -- PHY --
+  .PHY_VARIANT          ("SDR"),      // "GENERIC" (sim/any-FPGA) | "SDR" (first hardware
+  .RD_PREAMBLE_SKIP     (1),          //   target, silicon-proven) | "XILINX" | "INTEL"
+  .DIFF_CK              (1'b1)        // 0 only if your board wires CK single-ended
+) u_hyperram (
+  .clk    (clk),                      // system + HyperBus CK word clock (one PLL)
+  .clk90  (clk2x),                    // SDR PHY: the 2x byte clock; GENERIC: 90-deg phase
+  .clk_ref(1'b0),                     // XILINX IDELAYCTRL refclk only; tie otherwise
+  .rst    (rst),                      // synchronous, active-high
+
+  // Avalon-MM slave — connect to your fabric/DMA (AXI variant: AW/W/B/AR/R instead)
+  .avs_address(addr), .avs_burstcount(len), .avs_read(rd), .avs_write(wr),
+  .avs_writedata(wdata), .avs_byteenable(be),
+  .avs_readdata(rdata), .avs_readdatavalid(rvalid), .avs_waitrequest(wait_n),
+
+  // runtime read-eye calibration — tie to your calibrated seeds, or wire to CSRs
+  .cal_capture_phase(1'b0), .cal_preamble_skip(3'd1),
+  .cal_rx_tap('0),          .cal_pair_skew(1'b0),
+
+  // issue-#13 runtime knob bundle — LEGACY tie-off shown (behavior identical to a
+  // build without the knobs). To enable the zero-loss fix set, drive from CSRs:
+  // prewin_drive=1, prewin_n=4, prewin_contig=1, end_cwrite=1, spray_defuse=1.
+  // All are quasi-static: change them only while the controller is idle.
+  .dbg_wr_lat_trim (4'd0),            // = your calibrated WR_LAT_TRIM (AXC3000: 3)
+  .dbg_lat_clocks  (4'd6),            // = LATENCY_CLOCKS
+  .dbg_cr0_reprog(1'b0), .dbg_prewin_drive(1'b0), .dbg_prewin_n('0),
+  .dbg_prewin_marker(1'b0), .dbg_postwin_hold(1'b0), .dbg_prewin_contig(1'b0),
+  .dbg_end_cwrite(1'b0), .dbg_spray_defuse(1'b0), .wrap_en(1'b0),
+
+  // HyperBus device pins — split _o/_oe/_i (Verilator-shaped); pad ring is yours (step 3)
+  .hb_ck(hb_ck), .hb_ck_n(hb_ck_n), .hb_cs_n(hb_cs_n), .hb_rst_n(hb_rst_n),
+  .hb_dq_o(dq_o), .hb_dq_oe(dq_oe), .hb_dq_i(dq_i),
+  .hb_rwds_o(rwds_o), .hb_rwds_oe(rwds_oe), .hb_rwds_i(rwds_i),
+
+  .init_done(init_done), .err_underrun(), .dbg_bus()
+);
+```
+
+### 2. Clocks and reset
+
+One PLL, single clock domain, synchronous active-high reset. `clk` runs at the HyperBus CK
+word rate and clocks the controller, front-end, and your bus logic. `clk90`'s meaning is
+per-PHY: the SDR variant uses it as the **2× byte clock** (the only silicon-proven scheme on
+Agilex 3 — see `fpga/axc3000/`), the GENERIC variant as a 90° launch phase. `clk_ref` is only
+consumed by the XILINX variant (200 MHz IDELAYCTRL reference).
+
+### 3. Pad ring
+
+The PHY exposes split pins so the core stays `inout`-free and Verilator-clean. Add tristates at
+your board top:
+
+```systemverilog
+assign hb_dq   = dq_oe   ? dq_o   : 'z;    assign dq_i   = hb_dq;
+assign hb_rwds = rwds_oe ? rwds_o : 'z;    assign rwds_i = hb_rwds;
+```
+
+Details (including the Agilex DDIO-cell variant where the pads live inside the I/O layer):
+[`docs/INTEGRATION.md`](docs/INTEGRATION.md).
+
+### 4. Address map and transactions
+
+Addresses are **16-bit-word** addresses; the address MSB selects register space (CR0/CR1/
+ID0/ID1) versus memory. Bursts are `burstcount` words (Avalon) or AXI INCR/WRAP/FIXED; the
+core chops long transfers at `MAX_BURST_WORDS`/`BURST_BOUNDARY_WORDS` transparently and
+coalesces contiguous writes into one CS# burst when `WR_COALESCE=1`. Byte-masked writes use
+`byteenable`/`wstrb` (RWDS masking on the bus).
+
+### 5. Init and status
+
+Hold off traffic until **`init_done`** — the core sequences POR/reset AC timing and programs
+CR0 (and optionally CR1) itself. Read errors (RWDS-stall watchdog) surface as AXI `SLVERR`;
+Avalon write-data underruns pulse `err_underrun`.
+
+### 6. Runtime knobs in production
+
+The `cal_*` ports retune the read eye without a recompile; the `dbg_*` bundle carries the
+write-path fix set (heal, contiguity, end-commit-write, spray defuse) plus live latency/trim
+overrides. Tie them constant (as in step 1) or map them to CSRs the way the reference bench
+does (`REG_DBG`, word 14 in `rtl/bench/hyperram_bw_test.sv` — `0x0007_1263` = full fix set with
+the AXC3000's calibrated trim). On a **different HyperRAM part**, verify the device-limitation
+model first (the probe method is in *Device limitations* §4) before enabling the fix set.
+
+### 7. Simulate your integration
+
+Wire the `hb_*` pins to `sim/model/hyperram_model.sv` (the golden device, including the
+silicon-verified defect semantics as opt-in knobs) — `sim/tb_avalon.sv` / `sim/tb_axi.sv` are
+minimal single-DUT harnesses to copy. `bash sim/run.sh` must stay green after any local change.
+
+New board or new FPGA family? That is a PHY + constraints job — see *Porting to your device*
+below and the complete worked example in [`fpga/axc3000/`](fpga/axc3000/).
 
 ---
 
@@ -57,7 +187,7 @@ clock-generation limit); the path to the device's rated 250 MHz / 500 MB/s is
 - Controller + front-ends contain **no vendor primitives**; single clock domain, synchronous
   reset, Hyperflex-friendly. The one true CDC (RWDS → `clk`) is isolated inside the PHY.
 - Four PHY variants behind one frozen port list (see *Porting*).
-- 23 Verilator testbenches against a golden device model that reproduces the real silicon's
+- 24 Verilator testbenches against a golden device model that reproduces the real silicon's
   behaviors (read preamble, variable latency, row quirks — see below); `bash sim/run.sh` runs
   everything and fails non-zero on any mismatch.
 
@@ -219,7 +349,7 @@ Prerequisites: **Verilator ≥ 5.020**, C++17 toolchain, `bash`.
 ```bash
 git clone <this-repo> hyperram
 cd hyperram
-bash sim/run.sh        # builds + runs all 23 self-checking TBs; exits non-zero on any failure
+bash sim/run.sh        # builds + runs all 24 self-checking TBs; exits non-zero on any failure
 ```
 
 Coverage by area:
@@ -235,7 +365,7 @@ Coverage by area:
 | PHY variants | `tb_sdr`, `tb_preamble`, `tb_preamble_generic`, `tb_xilinx` (7-series datapath via shim), `tb_cal` (live REG_CAL retune, no recompile) |
 | Bench engine | `tb_bw` (bandwidth engine + CSRs) |
 
-(A 24th testbench, `tb_local1x`, phase-sweeps the AXC3000 board I/O layer and lives outside
+(A 25th testbench, `tb_local1x`, phase-sweeps the AXC3000 board I/O layer and lives outside
 `run.sh` because it references board files.)
 
 Every testbench checks byte-exact read-back against the golden model and `$fatal`s on mismatch.
@@ -305,38 +435,6 @@ Register addresses/reset values default to W957D8NB-family; override from your d
 
 ---
 
-## Performance
-
-Measured on the AXC3000 (Agilex 3 + W957D8NBRA4I, DDR x8 board build in
-[`fpga/axc3000/`](fpga/axc3000/), JTAG-read cycle counters, every word integrity-checked):
-
-| Shape | Write | Read | Errors |
-|---|---:|---:|---|
-| 768-word bursts (in-row) | 341.1 MB/s | 332.3 MB/s | 0 (25-run soak) |
-| 1024-word full-row bursts | 343.3 MB/s | 337.8 MB/s | the known 4-word row-transition cost |
-| Coalesced 64-word write commands | 331.9 MB/s | — | 0 |
-
-Bandwidth scales with CK (`CK_MHZ` knob in `qsys/make_bw_sys.tcl`) and with burst length as the
-CA + latency overhead amortizes.
-
-### Reaching the device's rated 250 MHz / 500 MB/s
-
-The W957D8NBRA4I is the 4 ns (250 MHz) speed grade; this IP's engine is not the bottleneck —
-the HyperBus **clock path** is:
-
-- **CK must come from a dedicated PLL clock-output pin pair** (true clock-network drive), not
-  from I/O-cell data registers: on the AXC3000, every I/O-cell CK source shows a page-boundary
-  bit-margin artifact above ~176 MHz, while the fabric generator is clean but min-pulse-capped
-  at ~176 MHz.
-- **CK/CK# should be differential** on this 1.2 V-class device (Infineon guidance); set
-  `DIFF_CK=1` (the IP already drives both legs) and route a matched pair. The AXC3000 wires CK
-  single-ended, which is why its ceiling stands at ~176 MHz.
-- Then: latency code per the 250 MHz AC table, `WR_LAT_TRIM` recalibration, fabric timing at
-  250 MHz (Fmax today: 210). The complete plan with acceptance criteria is
-  [issue #12](https://github.com/fpga-professional-association/hyperram/issues/12).
-
----
-
 ## Repository layout
 
 ```
@@ -357,7 +455,7 @@ rtl/
 sim/
   model/hyperram_model.sv       behavioral golden device (incl. wound/row knobs)
   model/xilinx_prims_sim.sv     Verilator-only 7-series primitive shim
-  tb_*.sv                       23 self-checking testbenches
+  tb_*.sv                       24 self-checking testbenches
   run.sh                        build + run everything (Verilator)
 fpga/axc3000/                   complete Agilex 3 board build: I/O layer, qsys clocking,
                                 constraints, bitstreams, JTAG benchmark + probe scripts
