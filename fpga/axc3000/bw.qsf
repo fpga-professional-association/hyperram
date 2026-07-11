@@ -78,4 +78,4 @@ set_instance_assignment -name D5_DELAY 15 -to hb_ck -entity top
 # DQ0 write-eye nudge (200 MHz): the only marginal bit on silicon — byte-B slot, reads-as-1,
 # count varies run-to-run, read path proven stable (ID0 12/12). Shift DQ0's launch a fraction
 # of the eye so the device's CK falling-edge latch clears the transition.
-set_global_assignment -name SEED 3
+set_global_assignment -name SEED 4
