@@ -62,6 +62,11 @@ module hyperbus_avalon
     input  logic [DATA_WIDTH-1:0]    rd_data,
     input  logic                     rd_last,
 
+    // -- wrapped-burst enable (issue #13): drives cmd_wrap for the wrap-probe burst. Quasi-static,
+    //    same `clk` domain. POR-legacy 0 => cmd_wrap=0 = today's linear-only front end. NO port
+    //    default value (Verilator rejects them); every instantiation ties it (legacy 0). --
+    input  logic                     wrap_en,
+
     // -- DEBUG tap (bring-up only; leave unconnected in normal instantiations) --
     output logic [1:0]               dbg_state       // front-end FSM state (IDLE/WR_DATA/RD_WAIT)
 );
@@ -105,7 +110,7 @@ module hyperbus_avalon
         cmd_valid = 1'b0;
         cmd_read  = 1'b0;
         cmd_reg   = avs_address[REG_SEL_BIT];
-        cmd_wrap  = 1'b0;                                     // always linear
+        cmd_wrap  = wrap_en;                                  // issue #13: 1 = wrapped probe burst (else linear)
         cmd_addr  = {1'b0, avs_address[ADDR_WIDTH-2:0]};
         cmd_len   = avs_burstcount;
 

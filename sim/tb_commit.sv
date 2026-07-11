@@ -82,7 +82,7 @@
 module commit_stack
   import hyperbus_pkg::*;
 #(
-    parameter int unsigned CSR_ADDR_WIDTH = 4,
+    parameter int unsigned CSR_ADDR_WIDTH = 5,   // issue #13: 32 word-regs — avoids REG_PAT/WRAP/EMAP aliasing
     // -- DUT (hyperbus_ctrl) chop / remedy knobs (all default OFF = a single unbounded CS#) --
     parameter int unsigned DUT_BOUNDARY        = 0,      // BURST_BOUNDARY_WORDS (0x2000-word chop)
     parameter int unsigned DUT_MAXBURST        = 0,      // MAX_BURST_WORDS (tCSM chop)
@@ -153,7 +153,11 @@ module commit_stack
     .m_writedata (av_writedata), .m_readdata (av_readdata),
     .m_readdatavalid (av_readdatavalid), .m_waitrequest (av_waitrequest),
     // REG_CAL outputs unused here — the PHY's cal is tied to constants below (empty = PINCONNECTEMPTY)
-    .cal_capture_phase (), .cal_preamble_skip (), .cal_rx_tap (), .cal_pair_skew ()
+    .cal_capture_phase (), .cal_preamble_skip (), .cal_rx_tap (), .cal_pair_skew (),
+    // issue #13: new bench debug-bundle outputs left dangling here (this TB ties off the ctrl-side
+    // dbg inputs to legacy constants independently) — empty = PINCONNECTEMPTY, not PINMISSING.
+    .dbg_wr_lat_trim (), .dbg_lat_clocks (), .dbg_cr0_reprog (), .dbg_prewin_drive (),
+    .dbg_prewin_n (), .dbg_prewin_marker (), .dbg_postwin_hold (), .dbg_ck_stretch_off (), .wrap_en ()
   );
 
   // -------------------------------------------------------------------------
@@ -181,6 +185,8 @@ module commit_stack
     .cmd_wrap (cmd_wrap), .cmd_addr (cmd_addr), .cmd_len (cmd_len),
     .wr_valid (wr_valid), .wr_ready (wr_ready), .wr_data (wr_data), .wr_strb (wr_strb), .wr_last (wr_last),
     .rd_valid (rd_valid), .rd_ready (rd_ready), .rd_data (rd_data), .rd_last (rd_last),
+    // issue #13: new front-end wrap_en input tied off (legacy linear bursts) (A1).
+    .wrap_en (1'b0),
     .dbg_state ()
   );
 
@@ -227,7 +233,10 @@ module commit_stack
     .phy_dq_o (phy_dq_o), .phy_dq_oe (phy_dq_oe), .phy_rwds_o (phy_rwds_o), .phy_rwds_oe (phy_rwds_oe),
     .phy_rd_arm (phy_rd_arm),
     .phy_dq_i (phy_dq_i), .phy_dq_i_valid (phy_dq_i_valid), .phy_rwds_i (phy_rwds_i),
-    .dbg_state (), .dbg_rd_wptr (), .dbg_rd_rptr ()
+    .dbg_state (), .dbg_rd_wptr (), .dbg_rd_rptr (),
+    // issue #13: new hyperbus_ctrl debug bundle tied to per-instance legacy (A1; no wrap_en on ctrl).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0), .dbg_postwin_hold (1'b0)
   );
 
   // -------------------------------------------------------------------------
@@ -272,7 +281,7 @@ endmodule
 module tb_commit;
   import hyperbus_pkg::*;
 
-  localparam int unsigned CSR_ADDR_WIDTH = 4;                  // 16 word-regs (REG_RBURSTW = word 12)
+  localparam int unsigned CSR_ADDR_WIDTH = 5;                  // issue #13: 32 word-regs (REG_RBURSTW = word 12) — avoids REG_PAT/WRAP/EMAP aliasing
 
   // CSR word-register indices (byte offset >> 2) — must match hyperram_bw_test.
   localparam logic [CSR_ADDR_WIDTH-1:0] REG_CTRL    = 4'd0;    // W: CTRL / R: STATUS

@@ -99,6 +99,8 @@ run_one tb_reg.sv      tb_reg
 run_one tb_axi_wrap.sv tb_axi_wrap
 run_one tb_xilinx.sv   tb_xilinx     "${XILINX_SIM_SRCS[@]}"
 run_one tb_commit.sv     tb_commit     "${BENCH_SRCS[@]}"
+# issue #13 instrumented build: REG_DBG/EMAP/PAT/WRAP knobs vs the wound model (needs WP-A/WP-B ports).
+run_one tb_dbg.sv        tb_dbg        "${BENCH_SRCS[@]}"
 # Spec-feature TBs (issue #5): CR1 init write, POR/reset AC-timing, Deep-Power-Down enter/exit, and
 # active clock-stop on read back-pressure.
 run_one tb_cr1init.sv    tb_cr1init      # issue #5 A3: CR1 init write

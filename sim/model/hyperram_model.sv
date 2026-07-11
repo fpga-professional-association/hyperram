@@ -115,6 +115,34 @@ module hyperram_model
                                                                       //   unsuppressible (apply the wound
                                                                       //   regardless of masking; keeps all
                                                                       //   existing TBs aligned).
+    parameter bit          WR_WOUND_SAMPLE_BUS = 1'b0,                 // issue #13 (L-C/L-D, the HEAL): the
+                                                                      //   load-bearing sampling hypothesis.
+                                                                      //   When 1 the wound content is NOT a
+                                                                      //   hard zero but the DQ words the
+                                                                      //   device SAMPLES off the bus in the
+                                                                      //   pre-data window — the last
+                                                                      //   2*WR_WOUND_WORDS latency edges
+                                                                      //   before first_data_beat, mapped
+                                                                      //   oldest-first (see wound_samp). So
+                                                                      //   whatever the controller drives in
+                                                                      //   that window lands in mem[B-N..B-1]:
+                                                                      //   idle bus -> 0x0000 (the 8-aligned-
+                                                                      //   zero observation); residual CA
+                                                                      //   bytes -> foreign (0x0404 @508);
+                                                                      //   dbg_prewin_drive shadow -> the exact
+                                                                      //   [B-4..B-1] (readback ERR=0 = the
+                                                                      //   heal); dbg_prewin_marker -> 0xA5xx
+                                                                      //   (content attribution). 0 = hard-
+                                                                      //   zero the wound (identical to the
+                                                                      //   pre-#13 model; keeps every existing
+                                                                      //   TB aligned).
+    parameter bit          WR_WOUND_WRAP_IMMUNE = 1'b0,                // issue #13 (L-F): when 1 a WRAPPED
+                                                                      //   memory write (CA[45]=0) does NOT
+                                                                      //   arm a wound. Makes a wrapped write
+                                                                      //   over a wound zone a REPAIR primitive
+                                                                      //   (it writes real data and re-arms
+                                                                      //   nothing). 0 = wrapped writes wound
+                                                                      //   like linear (keeps TBs aligned).
     parameter bit          WR_BOUNDARY_END_GARBLE = 1'b0,              // silicon ladder finding 5 (a
                                                                       //   separate, rarer defect from the
                                                                       //   wound above): a memory WRITE
@@ -134,6 +162,31 @@ module hyperram_model
                                                                       //   row-accurate device sim is needed
                                                                       //   (the controller now never crosses
                                                                       //   rows, so sim never exercises it).
+    parameter int unsigned WR_END_GARBLE_ROW_WORDS = 32'h2000,        // issue #13: the WR_BOUNDARY_END_
+                                                                      //   GARBLE granularity, parameterized.
+                                                                      //   Default 0x2000 preserves tb_commit
+                                                                      //   idx7 (a burst ending at 0x2000);
+                                                                      //   instantiate 1024 for the true
+                                                                      //   W957D8NB law — a write ending on
+                                                                      //   ANY 1024-word ROW multiple garbles
+                                                                      //   its own last 4 words.
+    parameter logic [15:0] WR_END_GARBLE_VALUE     = 16'h5050,        // issue #13: the persistent garble fill
+                                                                      //   (0x5050 observed). A param so a
+                                                                      //   content-attribution run can retarget
+                                                                      //   it. Default keeps tb_commit idx7.
+    parameter bit          WR_END_GARBLE_SAMPLE_BUS = 1'b0,           // issue #13 (L-E, optional, default off):
+                                                                      //   the Law-3 analog of WR_WOUND_SAMPLE_
+                                                                      //   BUS. When 1 the end-garble stores the
+                                                                      //   last written word (what dbg_postwin_
+                                                                      //   hold parks on DQ into the tail)
+                                                                      //   instead of WR_END_GARBLE_VALUE — so a
+                                                                      //   postwin heal CHANGES the garble
+                                                                      //   content. Only ONE word is held, so
+                                                                      //   B-4..B-2 still cannot fully heal —
+                                                                      //   matching the L-E prediction that
+                                                                      //   postwin-hold is a separate, partial
+                                                                      //   mechanism from the pre-window heal.
+                                                                      //   0 = constant fill (keeps TBs aligned).
     // ---- DEPRECATED (2026-07-09): the split-write "commit quirk" (pending/discard on the next
     //      write) this pair used to model is FALSIFIED on silicon — see WR_WOUND_WORDS above for the
     //      real defect. Both names are kept, ACCEPTED BUT IGNORED (no-ops), only so any stale
@@ -225,6 +278,15 @@ module hyperram_model
   logic                    wound_pending;   // an armed, not-yet-resolved wound from this CS#'s CA decode
   logic [AW-1:0]           wound_base;      // CA base (B) for the armed wound
   logic                    wound_mask_hi;   // beat-0 byte-A (rising-edge) RWDS sample
+
+  // ---- WR_WOUND_SAMPLE_BUS pre-data sampling buffer (issue #13) ----
+  // The DQ words captured off the bus in the last 2*WR_WOUND_WORDS latency edges before first_data_beat.
+  // wound_samp[0] is the OLDEST slot (sampled first, at cnt=N-1 = the earliest window edge) and
+  // wound_samp[N-1] the NEWEST (sampled last, at cnt=0 = the edge just before data). Applied newest->
+  // B-1: mem[B-k] <= wound_samp[N-k]. Depth is guarded >=1 so the default WR_WOUND_WORDS=0 build
+  // elaborates (the buffer is dead when WR_WOUND_SAMPLE_BUS=0).
+  localparam int unsigned  WOUND_SAMP_DEPTH = (WR_WOUND_WORDS == 0) ? 1 : WR_WOUND_WORDS;
+  logic [15:0]             wound_samp [WOUND_SAMP_DEPTH];
 
   // ---- 0x2000-word boundary release quirk (BURST_BOUNDARY_WORDS) ----
   logic                    bnd_rel;         // this transaction crossed a boundary -> bus released
@@ -341,16 +403,24 @@ module hyperram_model
       // only fires once per CS# (a re-invocation of this branch — e.g. from CK still toggling while
       // CS# is High, WR_CHOP_PAUSE_CK — sees wcnt already cleared to 0 by the first pass).
       if (WR_BOUNDARY_END_GARBLE && !cur_rw && !cur_as && (wcnt != 32'd0) &&
-          ((32'(addr) % 32'h2000) == 32'd0)) begin
+          ((32'(addr) % WR_END_GARBLE_ROW_WORDS) == 32'd0)) begin
+        // Fill: WR_END_GARBLE_VALUE (constant, the pre-#13 behaviour) unless WR_END_GARBLE_SAMPLE_BUS —
+        // then the postwin-held last word (mem[addr-1] still holds it here, garble not yet applied) is
+        // stored instead, the Law-3 analog of the pre-window sampling heal. addr>=1 guard: never index
+        // below the array.
+        logic [DATA_WIDTH-1:0] eg_val;
+        eg_val = (WR_END_GARBLE_SAMPLE_BUS && (addr >= AW'(1))) ? mem[addr - AW'(1)]
+                                                                : DATA_WIDTH'(WR_END_GARBLE_VALUE);
         for (int k = 1; k <= 4; k++)
-          if (addr >= AW'(k)) mem[addr - AW'(k)] <= 16'h5050;
+          if (addr >= AW'(k)) mem[addr - AW'(k)] <= eg_val;
       end
       // Safety net: a wound armed at CA decode is normally resolved at beat 0 of the data phase (see
       // below) long before CS# can deassert. If CS# somehow closes with no data beats at all, apply
       // the wound unconditionally here rather than lose it silently.
       if (wound_pending) begin
         for (int k = 1; k <= int'(WR_WOUND_WORDS); k++)
-          if (wound_base >= AW'(k)) mem[wound_base - AW'(k)] <= '0;
+          if (wound_base >= AW'(k))
+            mem[wound_base - AW'(k)] <= WR_WOUND_SAMPLE_BUS ? wound_samp[int'(WR_WOUND_WORDS) - k] : '0;
         wound_pending <= 1'b0;
       end
     end else if (cs_q) begin
@@ -400,8 +470,11 @@ module hyperram_model
           // base. Resolution (apply, vs. WR_WOUND_MASK_SUPPRESS-discard) happens once beat 0 of the
           // data phase is fully sampled (see the write data-phase handling below) — NOT here — so the
           // mask-suppress decision can see beat 0's RWDS before committing to zeroing anything. Any
-          // non-memory-write CA (read or register) leaves no wound armed.
-          if ((WR_WOUND_WORDS != 0) && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca)) begin
+          // non-memory-write CA (read or register) leaves no wound armed. WR_WOUND_WRAP_IMMUNE (issue
+          // #13, L-F): a WRAPPED memory write (CA[45]=0 => !hb_ca_linear) also leaves no wound armed, so
+          // a wrapped write over a wound zone repairs it instead of re-wounding.
+          if ((WR_WOUND_WORDS != 0) && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca) &&
+              !(WR_WOUND_WRAP_IMMUNE && !hb_ca_linear(full_ca))) begin
             wound_pending <= 1'b1;
             wound_base    <= start_addr;
           end else begin
@@ -491,8 +564,13 @@ module hyperram_model
               // is enabled and beat 0 arrived fully byte-masked on both phases (the E-D hypothesis).
               if (wound_pending && (wcnt == 32'd0)) begin
                 if (!(WR_WOUND_MASK_SUPPRESS && wound_mask_hi && hb_rwds_i)) begin
+                  // Content: hard zero (pre-#13) unless WR_WOUND_SAMPLE_BUS, in which case the words
+                  // sampled off the bus in the pre-data window are stored newest-first (mem[B-k] <=
+                  // wound_samp[N-k]) — idle bus -> 0x0000 (== hard zero), controller shadow -> the heal.
                   for (int k = 1; k <= int'(WR_WOUND_WORDS); k++)
-                    if (wound_base >= AW'(k)) mem[wound_base - AW'(k)] <= '0;
+                    if (wound_base >= AW'(k))
+                      mem[wound_base - AW'(k)] <= WR_WOUND_SAMPLE_BUS ? wound_samp[int'(WR_WOUND_WORDS) - k]
+                                                                      : '0;
                 end
                 wound_pending <= 1'b0;
               end
@@ -501,8 +579,25 @@ module hyperram_model
             wcnt <= wcnt + 32'd1;
           end
         end
+      end else if (WR_WOUND_SAMPLE_BUS && wound_pending &&
+                   (bnew >= first_data_beat - 16'(2*WR_WOUND_WORDS)) && (bnew < first_data_beat)) begin
+        // -------- Initial-latency window: sample the pre-data bus (issue #13, WR_WOUND_SAMPLE_BUS) --------
+        // These are the edges the ideal model ignores. On silicon the write-CA wound content is whatever
+        // the device latches off DQ here; the controller's dbg_prewin_drive parks [B-4..B-1] on the bus
+        // in exactly this window (oldest-first: B-4 earliest, B-1 just before data), so sampling it and
+        // storing it as the wound turns the wound into a heal. Byte A on the rising (hb_ck High) phase,
+        // byte B on the falling — the SAME big-endian mapping the write data phase uses, so a faithful
+        // shadow drive reconstructs the exact [B-N..B-1] words. rel/j map the 2N window edges to N word
+        // slots, oldest (rel 0..1 -> slot 0) to newest (rel 2N-2..2N-1 -> slot N-1).
+        int rel; int j;
+        rel = int'(bnew) - (int'(first_data_beat) - 2*int'(WR_WOUND_WORDS));  // 0 .. 2N-1
+        j   = rel >> 1;                                                       // word slot 0 .. N-1
+        if (j >= 0 && j < int'(WR_WOUND_WORDS)) begin
+          if (hb_ck) wound_samp[j][15:8] <= hb_dq_i;   // byte A (rising edge)
+          else       wound_samp[j][7:0]  <= hb_dq_i;   // byte B (falling edge)
+        end
       end
-      // else: initial-latency edges (bnew in 7..first_data_beat-1) — nothing captured/driven here.
+      // else: initial-latency edges outside the sampling window — nothing captured/driven here.
 
       beat <= bnew;
     end

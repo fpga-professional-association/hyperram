@@ -88,17 +88,19 @@ module top (
   // =========================================================================
   // Byte-address (JTAG master)  ->  word-address CSR slave adapter + 2-slave address decode
   //   Two CSR slaves hang off the single JTAG-Avalon master, decoded on byte-address bit [8]:
-  //     m_address[8] == 0  ->  hyperram_bw_test CSR   (base 0x000, regs 0x00..0x1C)
-  //     m_address[8] == 1  ->  hyperbus_capture CSR   (base 0x100, regs 0x100..0x10C)
+  //     m_address[8] == 0  ->  hyperram_bw_test CSR   (base 0x000, regs 0x00..0x7C)
+  //     m_address[8] == 1  ->  hyperbus_capture CSR   (base 0x100, regs 0x100..0x110)
   //   Both slaves are word-addressed (csr_address = byte_offset>>2), read combinationally, and tie
   //   waitrequest low. The JTAG-Avalon master is byte-addressed, pipelined (expects readdatavalid),
   //   and single-outstanding, so a combinational readdata/waitrequest mux on the decode bit is safe.
   // =========================================================================
-  localparam int CSR_AW = 4;   // 16 bw_test regs (0x00..0x3C): STATUS/LEN/BASE/cycles/ERR + first-err diag
+  // issue #13: widened 4->5 for the new REG_DBG/EMAP/PAT/WRAP registers (words 14..20). 0x7C < 0x100
+  // so sel_cap = m_address[8] is unaffected by the extra CSR bit.
+  localparam int CSR_AW = 5;   // 32 bw_test regs (0x00..0x7C): STATUS/LEN/BASE/cycles/ERR + first-err diag + issue-#13 knobs
 
   wire              sel_cap        = m_address[8];    // 0x100 window = capture CSR
 
-  // hyperram_bw_test CSR: 16 registers (0x00..0x3C) => 4 word-address bits = m_address[5:2]
+  // hyperram_bw_test CSR: 32 registers (0x00..0x7C) => 5 word-address bits = m_address[6:2]
   wire [CSR_AW-1:0] csr_address    = m_address[CSR_AW+1:2];
   wire              csr_read       = m_read  & ~sel_cap;
   wire              csr_write      = m_write & ~sel_cap;
@@ -106,8 +108,9 @@ module top (
   wire [31:0]       csr_readdata;
   wire              csr_waitrequest;
 
-  // hyperbus_capture CSR: 4 registers (0x100..0x10C) => 2 word-address bits = m_address[3:2]
-  wire [1:0]        cap_address    = m_address[3:2];
+  // hyperbus_capture CSR: 5 registers (0x100..0x110) => 3 word-address bits = m_address[4:2]
+  // (issue #13: widened 2->3 for REG_CAPCFG at word 4 / byte 0x110 = the Nth-CS#-fall trigger)
+  wire [2:0]        cap_address    = m_address[4:2];
   wire              cap_read       = m_read  & sel_cap;
   wire              cap_write      = m_write & sel_cap;
   wire [31:0]       cap_readdata;
@@ -167,17 +170,9 @@ module top (
   // =========================================================================
   // Bandwidth harness: bw_test (CSR + Avalon master) -> hyperram_avalon (Agilex PHY) -> split pins
   // =========================================================================
-  // Split HyperBus device pins between the IP and the board pad ring.
-  wire        hb_ck_int;
-  wire        hb_ck_n_int;   // single-ended board: driven but not brought to a pin (DIFF_CK=0 ties it)
-  wire        hb_cs_n_int;
-  wire        hb_rst_n_int;
-  wire [7:0]  hb_dq_o_int;
-  wire        hb_dq_oe_int;
-  wire [7:0]  hb_dq_i_int;
-  wire        hb_rwds_o_int;
-  wire        hb_rwds_oe_int;
-  wire        hb_rwds_i_int;
+  // Split HyperBus device pins between the IP and the board pad ring. (The old hb_*_int capture
+  // probe stand-ins were retired here: issue #13 re-points the capture probes at the fabric-side
+  // phy_*_w controller nets — see the cap_* wires just above the u_cap instance below.)
   wire        init_done;
 
   // ---- bench master <-> HyperBus IP slave Avalon-MM link, hoisted to the top --------------------
@@ -194,6 +189,20 @@ module top (
   wire        av_waitrequest;
   wire [31:0] av_dbg;         // DEBUG: ctrl/front-end/FIFO taps (see hyperram_avalon dbg_bus map)
 
+  // ---- issue #13 live debug bundle: bench (u_bw) outputs -> ctrl / gpio / front-end ------------
+  // Unlike the cal_* outputs (readback-only, dangling — the I/O-layer knobs are QSF-static), these
+  // are WIRED to the fabric (amendment A8): the host pokes REG_DBG/REG_WRAP at runtime and the knob
+  // acts this build. All live in the single `clk` domain shared by bench/ctrl/gpio -> no CDC.
+  wire [3:0]  dbg_wr_lat_trim;
+  wire [3:0]  dbg_lat_clocks;
+  wire        dbg_cr0_reprog;
+  wire        dbg_prewin_drive;
+  wire [2:0]  dbg_prewin_n;
+  wire        dbg_prewin_marker;
+  wire        dbg_postwin_hold;
+  wire        dbg_ck_stretch_off;   // -> u_io: disable the board ck_stretch trailing masked cycle
+  wire        wrap_en;              // -> u_fe: drive front-end cmd_wrap for the wrapped-write probe
+
   hyperram_bw_test #(
     .DATA_WIDTH     (16),
     .ADDR_WIDTH     (32),
@@ -201,11 +210,15 @@ module top (
     .BURST_WORDS    (64),              // EXPERIMENT: larger Avalon burst — writes LEN<=64 as ONE HyperBus
                                        // burst (no write->write boundary) to confirm the boundary drop
     .CSR_ADDR_WIDTH (CSR_AW),
-    .VERSION_MAGIC  (32'h4842_5754),   // "HBWT"
+    .VERSION_MAGIC  (32'h4842_5755),   // "HBWU" — issue #13 instrumented build (was 0x48425754 "HBWT")
     // REG_CAL (word 13/0x34) POR seed: [3:1]=preamble_skip=1 matches u_io's RD_PREAMBLE_SKIP(1).
     // On THIS build the cal_* outputs are readback-only: the GPIO-cell I/O layer's knobs are
     // compile-time (ALTERA DDIO runtime paths are issue-#3-gated), so they fan out nowhere.
-    .CAL_RESET      (32'h0000_0002)
+    .CAL_RESET      (32'h0000_0002),
+    // REG_DBG (word 14/0x38) POR seed (amendment A2): [7:4]=dbg_lat_clocks=6, [3:0]=dbg_wr_lat_trim=3
+    // -> bit-identical to this instance's ctrl LATENCY_CLOCKS(6) / WR_LAT_TRIM(3) below, so out of
+    // reset the live seeds equal the parameters (POR-legacy). All other REG_DBG bits reset 0.
+    .DBG_RESET      (32'h0000_0063)
   ) u_bw (
     .clk             (clk),     // 50 MHz CK word clock (controller)
     .rst             (sys_rst),
@@ -229,7 +242,17 @@ module top (
     .cal_capture_phase (),
     .cal_preamble_skip (),
     .cal_rx_tap        (),
-    .cal_pair_skew     ()
+    .cal_pair_skew     (),
+    // issue #13 live debug bundle (spec §0). WIRED, not dangling (A8) — these reach ctrl/gpio/fe.
+    .dbg_wr_lat_trim   (dbg_wr_lat_trim),
+    .dbg_lat_clocks    (dbg_lat_clocks),
+    .dbg_cr0_reprog    (dbg_cr0_reprog),
+    .dbg_prewin_drive  (dbg_prewin_drive),
+    .dbg_prewin_n      (dbg_prewin_n),
+    .dbg_prewin_marker (dbg_prewin_marker),
+    .dbg_postwin_hold  (dbg_postwin_hold),
+    .dbg_ck_stretch_off(dbg_ck_stretch_off),
+    .wrap_en           (wrap_en)
   );
 
   // ---- native fe <-> ctrl channels (hyperram_avalon inlined for the GPIO-cell I/O build) ------
@@ -259,6 +282,7 @@ module top (
   ) u_fe (
     .clk               (clk),
     .rst               (sys_rst),
+    .wrap_en           (wrap_en),   // issue #13: 1 during the REG_WRAP probe -> cmd_wrap=1 (else 0 = linear)
     .avs_address       (av_address),
     .avs_read          (av_read),
     .avs_write         (av_write),
@@ -365,7 +389,16 @@ module top (
     .phy_rwds_i     (phy_rwds_i_w),
     .dbg_state      (ctrl_dbg_state),
     .dbg_rd_wptr    (ctrl_dbg_rem),
-    .dbg_rd_rptr    (ctrl_dbg_seg)
+    .dbg_rd_rptr    (ctrl_dbg_seg),
+    // issue #13 live knobs (spec §2): quasi-static, same clk domain, no synchronizer. POR-legacy at
+    // DBG_RESET=0x63 (dbg_lat_clocks=6, dbg_wr_lat_trim=3 == this instance's params; all others 0).
+    .dbg_wr_lat_trim   (dbg_wr_lat_trim),
+    .dbg_lat_clocks    (dbg_lat_clocks),
+    .dbg_cr0_reprog    (dbg_cr0_reprog),
+    .dbg_prewin_drive  (dbg_prewin_drive),
+    .dbg_prewin_n      (dbg_prewin_n),
+    .dbg_prewin_marker (dbg_prewin_marker),
+    .dbg_postwin_hold  (dbg_postwin_hold)
   );
 
   // dbg_bus for the capture module — REPURPOSED as an Avalon read-stream logger (error-map debug):
@@ -393,6 +426,7 @@ module top (
     .phy_rwds_o     (phy_rwds_o_w),
     .phy_rwds_oe    (phy_rwds_oe_w),
     .phy_rd_arm     (phy_rd_arm_w),
+    .dbg_ck_stretch_off (dbg_ck_stretch_off),   // issue #13 L-E: 1 = kill the ck_stretch trailing cycle
     .phy_dq_i       (phy_dq_i_w),
     .phy_dq_i_valid (phy_dq_i_valid_w),
     .phy_rwds_i     (phy_rwds_i_w),
@@ -403,17 +437,26 @@ module top (
     .hb_rwds        (hb_rwds)
   );
 
-  // Fabric-visible probe stand-ins for the capture module (GPIO cells own the DQ pads; a raw DQ
-  // fanout would re-create the P2X input-term conflict — tie those probes off).
-  assign hb_ck_int      = 1'b0;
-  assign hb_cs_n_int    = phy_cs_n_w;
-  assign hb_rst_n_int   = phy_rst_n_w;
-  assign hb_dq_o_int    = 8'h00;
-  assign hb_dq_oe_int   = phy_dq_oe_w;
-  assign hb_dq_i_int    = 8'h00;
-  assign hb_rwds_o_int  = 1'b0;
-  assign hb_rwds_oe_int = phy_rwds_oe_w;
-  assign hb_rwds_i_int  = hb_rwds;
+  // Capture probes (issue #13 item 5): re-point from the pre-issue-13 tied-off constants to the
+  // FABRIC-side controller nets (phy_*_w) — freely-routable core logic, NOT the pad-side DDIO atoms
+  // (hb_ck / hb_dq_o / hb_rwds_o live inside the tennm_ph2_ddio_out cells and reach only the pad —
+  // Fitter 175006 — and a raw hb_dq_i ibuf fanout steals the DQ cell's periphery-to-core input term,
+  // Fitter 24403). The fabric side carries the same TX word / recovered RX word / CK-enable one
+  // launch stage before the pad — exactly the wound-window truth the ladder wants, and freely probed.
+  //
+  // A6 FALLBACK: if the fabric fanout still re-trips the Fitter (175006/24403 class), set
+  // CAP_PROBE_LIVE = 1'b0 — that single flip reverts hb_ck / hb_dq_o / hb_dq_i / hb_rwds_o to the
+  // old tied-off constants (the cs_n / oe / rwds_i probes were always live and never implicated).
+  // Capture is OFF the critical path for the L-B/L-C/L-D ladder, so this revert is a safe out.
+  localparam bit CAP_PROBE_LIVE = 1'b1;
+  wire        cap_cs_n    = phy_cs_n_w;                                     // always live (never tied)
+  wire        cap_ck      = CAP_PROBE_LIVE ? phy_ck_en_w      : 1'b0;       // fabric CK-enable proxy (pad CK unprobeable)
+  wire        cap_dq_oe   = phy_dq_oe_w;                                    // always live
+  wire [15:0] cap_dq_o    = CAP_PROBE_LIVE ? phy_dq_o_w       : 16'h0000;   // fabric TX word ([hi]=byte A, [lo]=byte B)
+  wire [15:0] cap_dq_i    = CAP_PROBE_LIVE ? phy_dq_i_w       : 16'h0000;   // fabric recovered RX word
+  wire        cap_rwds_oe = phy_rwds_oe_w;                                  // always live
+  wire        cap_rwds_o  = CAP_PROBE_LIVE ? phy_rwds_o_w[1]  : 1'b0;       // 1st-phase write mask
+  wire        cap_rwds_i  = hb_rwds;                                        // raw RWDS pad input (always live)
 
   // =========================================================================
   // On-chip logic analyzer (DEBUG): records the HyperBus pin-side signals + the av_* handshake at
@@ -426,25 +469,20 @@ module top (
     .clk              (clk),
     .rst              (sys_rst),
     .cap_clk          (clk2x),
-    // probes
-    // DDIO PHY build: hb_ck / hb_dq_o / hb_rwds_o are tennm_ph2_ddio_out outputs that live INSIDE
-    // the I/O cell — they can only drive the pad (via the OUT_DELAY_CHAIN), never core logic; a
-    // fabric probe on them is unplaceable (Fitter 175006 "no routing connectivity between source
-    // DDIO_OUT and the CORE_LOGIC"). Tie those three probes off; TX visibility is gone in this
-    // build, but the RX side (hb_dq_i / hb_rwds_i, pad-input ibufs) and the OE / CS# / Avalon
-    // handshake probes — the ones that matter for read-eye bring-up — all remain live.
-    // hb_dq_i must also be tied off: the raw ibuf-to-core fanout for a probe consumes the DQ I/O
-    // cell's periphery-to-core input term that the DDIO_IN's REGOUTHI/REGOUTLO need (Fitter 24403
-    // "routing resource is used by"). RWDS keeps its probe — its I/O cell has no DDIO_IN (the raw
-    // input already goes to the fabric delay line + level sync by design).
-    .hb_cs_n          (hb_cs_n_int),
-    .hb_ck            (1'b0),
-    .hb_dq_oe         (hb_dq_oe_int),
-    .hb_dq_o          (8'h00),
-    .hb_dq_i          (hb_dq_i_int),   // legal again with FABRIC RX capture (plain fabric fanout)
-    .hb_rwds_oe       (hb_rwds_oe_int),
-    .hb_rwds_o        (1'b0),
-    .hb_rwds_i        (hb_rwds_i_int),
+    // probes (issue #13: FABRIC-side, see the cap_* wires above). The old build tied hb_ck / hb_dq_o
+    // / hb_dq_i / hb_rwds_o off because the PAD-side DDIO atoms are unprobeable (Fitter 175006/24403);
+    // here we instead tap the freely-routable phy_*_w controller nets — the TX word we drive, the
+    // recovered RX word, and phy_ck_en as the CK proxy — which is what the wound-window capture needs.
+    // hb_dq_o / hb_dq_i are now the full 16-bit fabric words (byte A hi / byte B lo). Flip
+    // CAP_PROBE_LIVE=1'b0 above to revert to tied-off probes if the fabric fanout re-trips the Fitter.
+    .hb_cs_n          (cap_cs_n),
+    .hb_ck            (cap_ck),          // fabric CK-enable proxy (phy_ck_en)
+    .hb_dq_oe         (cap_dq_oe),
+    .hb_dq_o          (cap_dq_o),        // 16-bit fabric TX word (widened for issue #13)
+    .hb_dq_i          (cap_dq_i),        // 16-bit fabric recovered RX word
+    .hb_rwds_oe       (cap_rwds_oe),
+    .hb_rwds_o        (cap_rwds_o),      // 1st-phase write mask
+    .hb_rwds_i        (cap_rwds_i),
     .av_read          (av_read),
     .av_write         (av_write),
     .av_waitrequest   (av_waitrequest),

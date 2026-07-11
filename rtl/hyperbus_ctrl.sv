@@ -244,7 +244,21 @@ module hyperbus_ctrl
     // -- DEBUG taps (bring-up only; leave unconnected in normal instantiations) --
     output logic [3:0]              dbg_state,      // FSM state (state_e ordinal)
     output logic [5:0]              dbg_rd_wptr,    // (repurposed) rem_left[5:0]  — words remaining in burst
-    output logic [5:0]              dbg_rd_rptr     // (repurposed) seg_left[5:0]  — words remaining in segment
+    output logic [5:0]              dbg_rd_rptr,    // (repurposed) seg_left[5:0]  — words remaining in segment
+
+    // -- issue #13 live controller knobs (bench REG_DBG). Quasi-static, driven from the SAME `clk`
+    //    domain as bench+PHY (host changes them only while STATUS.busy=0) so they are used DIRECTLY —
+    //    NO synchronizer (contrast cal_*'s clk->clk90 crossing). Out of reset the bench holds
+    //    dbg_wr_lat_trim/dbg_lat_clocks at the WR_LAT_TRIM/LATENCY_CLOCKS parameter seeds, so behavior
+    //    is bit-identical to the elaboration constants until the host pokes. NO port default values
+    //    (Verilator rejects them) — every instantiation ties these to per-instance legacy values. --
+    input  logic [3:0]              dbg_wr_lat_trim,  // overrides WR_LAT_TRIM (2x write-latency add; POR 3)
+    input  logic [3:0]              dbg_lat_clocks,   // overrides LATENCY_CLOCKS (both latency seeds; 6/7)
+    input  logic                    dbg_cr0_reprog,   // 1-clk pulse: relaunch init CR0 write w/ new code
+    input  logic                    dbg_prewin_drive, // heal probe: drive [B-4..B-1] in the pre-data window
+    input  logic [2:0]              dbg_prewin_n,     // # trailing latency CK to drive (0..7)
+    input  logic                    dbg_prewin_marker,// 1 = drive 0xA5xx marker instead of shadow data
+    input  logic                    dbg_postwin_hold  // hold last data word 4 CK into the tail (Law-3 analog)
 );
 
   // ------------------------------------------------------------------------
@@ -354,6 +368,8 @@ module hyperbus_ctrl
   logic                    lat_extra_done; // the additional (2x) latency count has been inserted
   logic                    doing_init;   // current transaction is an internal CR0/CR1 init write
   logic                    init_cr1;     // A3: the internal init write in flight is CR1 (else CR0)
+  logic                    doing_cr0_reprog; // issue #13: the internal init write in flight is a RUNTIME
+                                             //   CR0 reprogram (dbg_lat_clocks code), not the POR CR0/CR1
   logic                    in_dpd;       // A1: device believed to be in Deep-Power-Down (needs wake)
 
   // -- Write-commit interpose (WR_COMMIT_READ). A memory-write burst's final word is only committed
@@ -408,6 +424,18 @@ module hyperbus_ctrl
   logic [LEN_WIDTH-1:0]    replay_real;   // real (shadow-sourced) beats within replay_left (mask lead)
   logic [RP_AW-1:0]        replay_idx;
 
+  // -- issue #13 heal/hold state ---------------------------------------------------------------------
+  //  shadow_full  : sticky "rp_word holds a full WR_REPLAY_WORDS-deep tail [B-4..B-1]". Set when rp_cnt
+  //                 saturates in ST_WRITE; cleared ONLY at a genuine ST_IDLE write CS# open and at reset
+  //                 (NOT in ST_RECOVER) — so an internal row-chop reopen (ST_RECOVER->ST_CS, bypassing
+  //                 ST_IDLE) still sees the prior segment's tail even though rp_cnt is reset there. That
+  //                 is what makes dbg_prewin_drive a HEAL for the contiguous row chops (the L-D target).
+  //  last_wr_word : the final data word of the FINAL segment, replayed onto DQ through the extended tail
+  //                 when dbg_postwin_hold (Law-3 analog).  postwin_active : that hold is armed.
+  logic                    shadow_full;
+  logic [DATA_WIDTH-1:0]   last_wr_word;
+  logic                    postwin_active;
+
   // read holding FIFO ({last, data})
   logic [DATA_WIDTH:0]     rd_fifo [RD_FIFO_DEPTH];
   logic [RD_AW:0]          rd_wptr, rd_rptr;
@@ -424,10 +452,21 @@ module hyperbus_ctrl
   wire                     commit_gate = WR_COMMIT_READ & wr_pending_commit &
                                          cmd_valid & ~cmd_read & ~cmd_reg;
 
-  // write-data source: internal CR0/CR1 image during init (A3: CR1 when init_cr1), else native write.
-  wire [DATA_WIDTH-1:0]    wsrc_data  = doing_init ? (init_cr1 ? DATA_WIDTH'(INIT_CR1)
-                                                               : DATA_WIDTH'(INIT_CR0))
-                                                   : wr_data;
+  // issue #13 runtime CR0 image: the POR INIT_CR0 with its latency code (CR0[7:4]) replaced by the
+  // code synthesized from the LIVE dbg_lat_clocks, written by the dbg_cr0_reprog strobe (§2.2). Pure
+  // combinational — hb_clocks_to_latency_code is a `function automatic` LUT, evaluable on live inputs
+  // (no pkg edit needed). dbg_lat_clocks=6 => code 0001 => cr0_rt == INIT_CR0 (POR-legacy).
+  wire [DATA_WIDTH-1:0]    cr0_rt     = {INIT_CR0[15:8],
+                                         hb_clocks_to_latency_code(32'(dbg_lat_clocks)),
+                                         INIT_CR0[3:0]};
+
+  // write-data source: internal CR0/CR1 image during init (A3: CR1 when init_cr1; issue #13: the live
+  // cr0_rt when doing_cr0_reprog), else native write.
+  wire [DATA_WIDTH-1:0]    wsrc_data  = doing_init
+                                        ? (doing_cr0_reprog ? cr0_rt
+                                           : (init_cr1 ? DATA_WIDTH'(INIT_CR1)
+                                                       : DATA_WIDTH'(INIT_CR0)))
+                                        : wr_data;
   wire [STRB_WIDTH-1:0]    wsrc_strb  = doing_init ? {STRB_WIDTH{1'b1}} : wr_strb;
   wire                     wsrc_valid = doing_init ? 1'b1 : wr_valid;
 
@@ -629,6 +668,22 @@ module hyperbus_ctrl
   wire [ADDR_WIDTH-1:0] acc_base    = cmd_addr - ADDR_WIDTH'(acc_pfx);
   wire [LEN_WIDTH-1:0]  acc_seg     = acc_pfx + acc_real;
 
+  // -- Pre-window heal probe (issue #13, dbg_prewin_drive) combinational helpers ---------------------
+  // prewin_widx = min(cnt,3), the word index into the replay shadow for the pre-data drive window: the
+  // LAST latency CK (cnt=0) emits rp_word[0] = the segment's NEWEST tail word (B-1); cnt=1 -> B-2;
+  // cnt=2 -> B-3; every earlier CK (cnt>=3) holds rp_word[3] = B-4. So the 4 CK before the first data
+  // beat carry B-4,B-3,B-2,B-1 in order (oldest-first) — exactly the [B-4..B-1] the device wounds,
+  // turning the wound into a heal. prewin_ok gates shadow-drive to a FULL shadow (suppressed on a run's
+  // first segment => legacy idle bus); marker mode is content-agnostic and always drives (attribution).
+  wire [RP_AW-1:0]      prewin_widx = (cnt >= 32'd3) ? RP_AW'(3) : cnt[RP_AW-1:0];
+  wire                  prewin_ok   = dbg_prewin_marker | shadow_full;
+
+  // Post-window hold (issue #13, dbg_postwin_hold) tail-dwell seed: the ST_TAIL dwell stretches to 4 CK
+  // (32'd3 => 4 cycles) when the FINAL segment of a memory write closes, so last_wr_word can be held on
+  // DQ into the tail (CK not extended). The select matches the postwin_active arm in ST_WRITE below.
+  wire [31:0]           postwin_seed = (dbg_postwin_hold & ~cur_read & ~cur_reg & ~doing_init &
+                                        (rem_left == LEN_WIDTH'(1))) ? 32'd3 : 32'(TAIL_CYCLES - 1);
+
   // ------------------------------------------------------------------------
   // Read data-out (FIFO front)
   // ------------------------------------------------------------------------
@@ -655,7 +710,10 @@ module hyperbus_ctrl
     unique case (state)
       ST_RESET: phy_rst_n = 1'b0;
 
-      ST_IDLE:  cmd_ready = init_done & rd_fifo_empty & ~commit_gate;
+      // A3 (issue #13): when a CR0-reprogram pulse is being consumed this cycle, do NOT complete a
+      // command handshake — gate cmd_ready so the launch (ST_IDLE sequential) and a cmd accept are
+      // mutually exclusive. ~dbg_cr0_reprog is 1 in legacy, so cmd_ready is unchanged when idle.
+      ST_IDLE:  cmd_ready = init_done & rd_fifo_empty & ~commit_gate & ~dbg_cr0_reprog;
 
       ST_CS: begin
         phy_cs_n  = 1'b0;
@@ -680,6 +738,18 @@ module hyperbus_ctrl
         end else begin
           phy_rwds_oe = 1'b1;             // latency write: master drives RWDS Low preamble (mask)
           phy_rwds_o  = 2'b00;
+          // issue #13 pre-window HEAL probe: in the LAST dbg_prewin_n CK of the SECOND (2x) latency
+          // count, drive DQ with the just-closed segment's tail [B-4..B-1] (replay shadow, oldest
+          // first — prewin_widx) instead of leaving the bus idle; or an 0xA5xx marker for content
+          // attribution. The RWDS masked-Low preamble above is UNTOUCHED. lat_extra_done restricts
+          // this to the second count only, long after CA (ST_CS/ST_CA), so OE is never re-asserted
+          // during the CA phase and there is no bus gap at cnt=0 -> ST_WRITE (OE stays 1). With
+          // dbg_prewin_drive=0 the branch is inert (phy_dq_oe keeps its ST_LAT default 0) = today.
+          if (dbg_prewin_drive && lat_extra_done && (cnt < 32'(dbg_prewin_n)) && prewin_ok) begin
+            phy_dq_oe = 1'b1;
+            phy_dq_o  = dbg_prewin_marker ? (16'hA500 | 16'(prewin_widx))
+                                          : rp_word[prewin_widx];
+          end
         end
         busy = ~doing_init;
       end
@@ -729,7 +799,17 @@ module hyperbus_ctrl
         busy        = ~doing_init;
       end
 
-      ST_TAIL:     busy = ~doing_init;
+      ST_TAIL: begin
+        busy = ~doing_init;
+        // issue #13 post-window HOLD (Law-3 analog): keep the FINAL data word on DQ through the
+        // extended tail dwell (4 CK; see postwin_seed) before CS# raises — the write end-of-burst
+        // counterpart of the pre-window heal. phy_ck_en stays 0 (default) so CK is NOT extended; CS#
+        // is forced Low for ST_TAIL just below (:phy_cs_n). Inert when postwin_active=0 (dbg off).
+        if (postwin_active) begin
+          phy_dq_oe = 1'b1;
+          phy_dq_o  = last_wr_word;
+        end
+      end
       ST_RECOVER: begin
         busy = ~doing_init;
         // WR_CHOP_PAUSE_CK (2026-07-09 silicon experiment): keep CK toggling through the post-WRITE
@@ -801,6 +881,7 @@ module hyperbus_ctrl
       init_done    <= 1'b0;
       doing_init   <= 1'b0;
       init_cr1     <= 1'b0;
+      doing_cr0_reprog <= 1'b0;
       in_dpd       <= 1'b0;
       doing_commit <= 1'b0;
       wr_pending_commit <= 1'b0;
@@ -816,6 +897,9 @@ module hyperbus_ctrl
       replay_left  <= '0;
       replay_real  <= '0;
       replay_idx   <= '0;
+      shadow_full     <= 1'b0;   // issue #13 heal/hold state
+      last_wr_word    <= '0;
+      postwin_active  <= 1'b0;
       cur_read     <= 1'b0;
       cur_reg      <= 1'b0;
       cur_wrap     <= 1'b0;
@@ -886,7 +970,30 @@ module hyperbus_ctrl
           rd_wptr <= '0;
           rd_rptr <= '0;
           if (init_done & rd_fifo_empty) begin
-            if (commit_gate) begin
+            if (dbg_cr0_reprog & ~doing_init & ~doing_commit) begin
+              // issue #13 CR0-REPROGRAM launch (§2.2, A3): re-run the init CR0 write with the LIVE
+              // dbg_lat_clocks latency code (wsrc_data selects cr0_rt while doing_cr0_reprog). Reuses
+              // the init machinery — a zero-latency register write that flows
+              // ST_CS->ST_CA->ST_WRITE(1 word)->ST_TAIL->ST_RECOVER. Checked FIRST and cmd_ready is
+              // gated by ~dbg_cr0_reprog (above), so no command handshake completes this cycle: the
+              // reprogram and a cmd accept are mutually exclusive. dbg_cr0_reprog is a 1-cycle bench
+              // pulse (edge-detected there), so no ctrl-side edge detect is needed. Host contract:
+              // pulse only while STATUS.busy=0 (the pulse is lost if the ctrl is busy).
+              doing_init       <= 1'b1;
+              doing_cr0_reprog <= 1'b1;
+              init_cr1         <= 1'b0;
+              cur_read         <= 1'b0;
+              cur_reg          <= 1'b1;
+              cur_wrap         <= 1'b0;
+              cur_addr         <= HB_REG_CR0[ADDR_WIDTH-1:0];
+              rem_left         <= LEN_WIDTH'(1);
+              seg_left         <= LEN_WIDTH'(1);
+              seg_count        <= LEN_WIDTH'(1);
+              ca_reg           <= hb_pack_ca(1'b0, 1'b1, 1'b1, HB_REG_CR0[ADDR_WIDTH-1:0]);
+              rwds_hi          <= 1'b0;
+              ca_idx           <= 2'd0;
+              state            <= ST_CS;
+            end else if (commit_gate) begin
               // DEFERRED write->write interpose: a new memory write is pending but the previous
               // write still needs committing. Self-issue the commit-read (shaped by COMMIT_READ_MODE);
               // the pending write command is NOT accepted (cmd_ready gated) and is taken after the
@@ -927,7 +1034,12 @@ module hyperbus_ctrl
               // rp_cnt tracks the LAST WRITE burst's tail; preserve it across READ accepts (reads
               // do not disturb the array or the shadow validity — silicon ladder L5/X2), reset it
               // for anything that writes (a new write rebuilds it; reg/wrap writes invalidate it).
-              if (~cmd_read) rp_cnt <= '0;
+              // issue #13: clear shadow_full here too — a genuine new write CS# open starts rebuilding
+              // the shadow, so its first segment's pre-window drive is suppressed (= legacy idle bus).
+              if (~cmd_read) begin
+                rp_cnt      <= '0;
+                shadow_full <= 1'b0;
+              end
               wr_pending_commit <= 1'b0;           // a normally-accepted command clears the pending
                                                    //   flag (a covering read commits the prior write)
               // A1: if the device is in Deep-Power-Down, wake it (CS# pulse + tDPDOUT) BEFORE running
@@ -954,7 +1066,8 @@ module hyperbus_ctrl
             if (zlw) begin
               state <= ST_WRITE;                   // zero-latency write: data follows CA immediately
             end else begin
-              cnt            <= 32'(LATENCY_CLOCKS - 1);  // one latency count; doubled in ST_LAT if RWDS-high
+              cnt            <= 32'(dbg_lat_clocks - 1);  // one latency count; doubled in ST_LAT if RWDS-high
+                                                          //   (issue #13: runtime override; POR 6 = legacy)
               lat_extra_done <= 1'b0;
               state          <= ST_LAT;
             end
@@ -974,9 +1087,10 @@ module hyperbus_ctrl
           if (cnt == 32'd0) begin
             if (lat_double & ~lat_extra_done) begin
               lat_extra_done <= 1'b1;
-              // WR_LAT_TRIM: writes only — see the parameter note (board write-window calibration)
-              cnt            <= cur_read ? 32'(LATENCY_CLOCKS - 1)
-                                         : 32'(LATENCY_CLOCKS - 1 + WR_LAT_TRIM);
+              // WR_LAT_TRIM: writes only — see the parameter note (board write-window calibration).
+              // issue #13: dbg_lat_clocks/dbg_wr_lat_trim are runtime overrides (POR 6/3 = legacy).
+              cnt            <= cur_read ? 32'(dbg_lat_clocks - 1)
+                                         : 32'(dbg_lat_clocks - 1 + dbg_wr_lat_trim);
             end else if (cur_read) begin
               stall_cnt <= '0;
               state     <= ST_READ;
@@ -1039,7 +1153,7 @@ module hyperbus_ctrl
           if (phy_dq_i_valid) drain_cnt <= '0;             // a straggler arrived: not quiet yet
           else                drain_cnt <= drain_cnt + 8'd1;
           if (drain_done) begin
-            cnt   <= 32'(TAIL_CYCLES - 1);
+            cnt   <= postwin_seed;   // issue #13: read path -> postwin select is 0 => TAIL_CYCLES (legacy)
             state <= ST_TAIL;
           end
         end
@@ -1087,7 +1201,10 @@ module hyperbus_ctrl
           // at WR_REPLAY_WORDS). An underrun filler is captured with an all-zero strobe.
           // Mask-led beats are NOT captured: they are array-neutral dummies, and shifting them in
           // would evict the real shadow words before their own replay emission.
-          if (WR_CHOP_REPLAY && !zlw && !lead_beat) begin
+          // issue #13: also capture the shadow when dbg_prewin_drive is on (the heal reuses rp_word's
+          // STORAGE only — no replay reopen paths are enabled). With replay off, lead_beat/replay_beat
+          // are 0, so this reduces to rp_word[0]<=wsrc_data and rp_cnt saturating at WR_REPLAY_WORDS.
+          if ((WR_CHOP_REPLAY | dbg_prewin_drive) && !zlw && !lead_beat) begin
             for (int p = int'(WR_REPLAY_WORDS) - 1; p > 0; p--) begin
               rp_word[p] <= rp_word[p-1];
               rp_strb[p] <= rp_strb[p-1];
@@ -1095,6 +1212,9 @@ module hyperbus_ctrl
             rp_word[0] <= replay_beat ? rp_data_sel : wsrc_data;
             rp_strb[0] <= replay_beat ? rp_strb_sel : (wsrc_valid ? wsrc_strb : '0);
             if (rp_cnt != LEN_WIDTH'(WR_REPLAY_WORDS)) rp_cnt <= rp_cnt + 1'b1;
+            // Sticky "shadow holds a full WR_REPLAY_WORDS-deep tail" — set as rp_cnt saturates. Gates
+            // the pre-window heal (prewin_ok) so a run's first segment (shadow not yet full) stays idle.
+            if (rp_cnt >= LEN_WIDTH'(WR_REPLAY_WORDS - 1)) shadow_full <= 1'b1;
           end
           if (WR_CHOP_REPLAY && !zlw && replay_beat) replay_left <= replay_left - 1'b1;
           if (seg_left == LEN_WIDTH'(1)) begin
@@ -1105,11 +1225,17 @@ module hyperbus_ctrl
             last_wr_addr <= cur_addr + ADDR_WIDTH'(seg_count) - ADDR_WIDTH'(1);
             wr_seg_base  <= cur_addr;
             wr_seg_len   <= seg_count;
+            // issue #13 post-window hold: latch this beat's data word and arm the hold, but ONLY for
+            // the FINAL segment of a memory write (rem_left==1); a chop (rem_left!=1) leaves it off so
+            // the hold applies once, at the burst's true end (the Law-3 end-at-row target).
+            last_wr_word   <= replay_beat ? rp_data_sel : wsrc_data;
+            postwin_active <= dbg_postwin_hold & ~cur_read & ~cur_reg & ~doing_init &
+                              (rem_left == LEN_WIDTH'(1));
             if (rem_left != LEN_WIDTH'(1)) begin
               // more of THIS native command remains beyond this segment's tCSM/boundary cap: normal
               // internal chop, unaffected by WR_COALESCE (which only applies at command completion).
               cur_addr <= cur_addr + ADDR_WIDTH'(seg_count);
-              cnt      <= 32'(TAIL_CYCLES - 1);
+              cnt      <= postwin_seed;   // issue #13: chop (rem_left!=1) => TAIL_CYCLES (legacy)
               state    <= ST_TAIL;
             end else if (coalesce_try) begin
               // WR_COALESCE: this command's data is exhausted but the CS# burst still has hw-cap room
@@ -1119,7 +1245,7 @@ module hyperbus_ctrl
               coalesce_wait_cnt <= '0;
               state             <= ST_WR_COALESCE;
             end else begin
-              cnt   <= 32'(TAIL_CYCLES - 1);
+              cnt   <= postwin_seed;   // issue #13: final segment => 4-CK hold dwell when dbg_postwin_hold
               state <= ST_TAIL;
             end
           end
@@ -1167,6 +1293,7 @@ module hyperbus_ctrl
             cnt   <= (~cur_read & ~cur_reg & ~doing_init & (WR_CHOP_PAUSE_CYCLES != 0))
                      ? 32'(RECOVERY_CYCLES - 1 + WR_CHOP_PAUSE_CYCLES)
                      : 32'(RECOVERY_CYCLES - 1);
+            postwin_active <= 1'b0;   // issue #13: the post-window hold is over; CS# raises in ST_RECOVER
             state <= ST_RECOVER;
           end else begin
             cnt <= cnt - 1'b1;
@@ -1244,8 +1371,11 @@ module hyperbus_ctrl
               end else begin
                 state <= ST_IDLE;                     // deferred interpose done: take the pending cmd
               end
-            end else if (doing_init & ~init_cr1 & PROGRAM_CR1) begin
+            end else if (doing_init & ~init_cr1 & PROGRAM_CR1 & ~doing_cr0_reprog) begin
               // A3: CR0 init write done -> chain the CR1 zero-latency register write before init_done.
+              // issue #13: a runtime CR0 REPROGRAM (doing_cr0_reprog) never chains CR1 — it completes
+              // straight to ST_IDLE below (with PROGRAM_CR1 off everywhere relevant this is moot, but
+              // keeps the reprogram a pure single-register write regardless of the CR1 option).
               // (Placed AFTER the doing_commit branch: doing_init/doing_commit are mutually exclusive —
               // an internal commit-read is never in flight during init — so ordering vs. it is moot, but
               // the commit/coalesce machinery above always gets first refusal of this cnt==0 event.)
@@ -1269,6 +1399,7 @@ module hyperbus_ctrl
                 init_done  <= 1'b1;
                 doing_init <= 1'b0;
                 init_cr1   <= 1'b0;
+                doing_cr0_reprog <= 1'b0;   // issue #13: reprogram write complete (init_done stays 1)
               end
               state <= ST_IDLE;
             end

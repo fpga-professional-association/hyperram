@@ -63,6 +63,8 @@ module hyperbus_gpio_io #(
     input  logic [1:0]            phy_rwds_o,   // [1]=1st-phase mask, [0]=2nd-phase mask
     input  logic                  phy_rwds_oe,
     input  logic                  phy_rd_arm,
+    input  logic                  dbg_ck_stretch_off,  // issue #13 L-E: 1 = disable the ck_stretch trailing
+                                                       // masked cycle (A/B whether law-3 is stretch-inflicted)
     output logic [2*DQ_WIDTH-1:0] phy_dq_i,     // recovered read word (byte A high half)
     output logic                  phy_dq_i_valid,
     output logic                  phy_rwds_i,
@@ -158,7 +160,10 @@ module hyperbus_gpio_io #(
   // (issue #1 trailing-masked-edge experiment).
   logic cken_d1;
   always_ff @(posedge clk) cken_d1 <= rst ? 1'b0 : cken_q;
-  wire ck_stretch = cken_d1 & ~cken_q;   // exactly the first cycle after enable falls
+  // issue #13 L-E: dbg_ck_stretch_off=1 kills the stretch cycle at its single source, so all three
+  // fan-outs (rwoe_q hold, RWDS datainhi/datainlo mask, vendor-CK cke) drop together. Default 0 =
+  // legacy (the stretch cycle is present exactly as shipped).
+  wire ck_stretch = (cken_d1 & ~cken_q) & ~dbg_ck_stretch_off;   // first cycle after enable falls
 
   generate
     if (CK_GEN == "FABRIC2X") begin : g_ck_fab2x

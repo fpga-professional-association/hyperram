@@ -23,9 +23,9 @@ module hyperram_bw_top
     parameter int unsigned LEN_WIDTH        = HB_LEN_WIDTH_DEFAULT,        // 16 (burstcount)
     // ---- bandwidth-test engine ---------------------------------------------
     parameter int unsigned BURST_WORDS      = HB_BURST_WORDS_DEFAULT,      // 16 words / Avalon burst
-    parameter int unsigned CSR_ADDR_WIDTH   = 4,                          // 16 CSR word-registers (REG_CAL
-                                                                          //   at word 13 needs 4 addr bits)
-    parameter logic [31:0] VERSION_MAGIC    = 32'h4842_5754,              // "HBWT"
+    parameter int unsigned CSR_ADDR_WIDTH   = 5,                          // 32 CSR word-registers (issue #13
+                                                                          //   REG_EMAP_DATA at word 20 needs 5)
+    parameter logic [31:0] VERSION_MAGIC    = 32'h4842_5755,              // "HBWU" (instrumented; was 0x..54)
     // ---- controller / PHY (defaults mirror sim/tb_avalon.sv) ---------------
     parameter int unsigned LATENCY_CLOCKS   = 6,
     parameter bit          FIXED_LATENCY    = 1'b1,
@@ -40,7 +40,13 @@ module hyperram_bw_top
     // ---- runtime read-eye calibration (POR seeds + REG_CAL image; defaults reproduce today) --------
     parameter int unsigned RD_PREAMBLE_SKIP = 0,                          // SDR PHY preamble-skip POR seed
     parameter bit          CAPTURE_PHASE    = 1'b0,                       // SDR read-capture edge seed
-    parameter logic [31:0] CAL_RESET        = 32'h0000_0000               // POR image of REG_CAL
+    parameter logic [31:0] CAL_RESET        = 32'h0000_0000,              // POR image of REG_CAL
+    // ---- issue #13 REG_DBG POR image (per-instance-derived, A2) --------------
+    // This sim/GENERIC leg's hyperram_avalon uses the ctrl default WR_LAT_TRIM=0 (the sim model has no
+    // trim analog and always ran trim=0), so the POR trim field is 0 — a hard 0x63 would shift every
+    // sim write by 3 words and break the suite. dbg_lat_clocks = this instance's LATENCY_CLOCKS.
+    // (Board top.sv overrides this to 0x63 to match its ctrl WR_LAT_TRIM(3).)
+    parameter logic [31:0] DBG_RESET        = {24'h0, 4'(LATENCY_CLOCKS), 4'h0}   // [7:4]=lat, [3:0]=trim=0
 ) (
     // ---- clocking / reset ---------------------------------------------------
     input  logic                        clk,        // system + bus word clock
@@ -94,6 +100,19 @@ module hyperram_bw_top
     logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap;
     logic                                  cal_pair_skew;
 
+    // ---- issue #13 debug bundle: bench REG_DBG image -> hyperram_avalon dbg_* + wrap_en inputs ------
+    // Same single clk domain end-to-end (bench/ctrl), quasi-static, no synchronizer. dbg_ck_stretch_off
+    // is BOARD-only (drives the gpio_io ck_stretch, which this sim wrapper does not instantiate) so the
+    // bench output is left unconnected here. All knobs are POR-legacy at REG_DBG=DBG_RESET.
+    logic [3:0] dbg_wr_lat_trim;
+    logic [3:0] dbg_lat_clocks;
+    logic       dbg_cr0_reprog;
+    logic       dbg_prewin_drive;
+    logic [2:0] dbg_prewin_n;
+    logic       dbg_prewin_marker;
+    logic       dbg_postwin_hold;
+    logic       wrap_en;
+
     // ------------------------------------------------------------------------
     // Bandwidth-test engine (Avalon-MM master + CSR slave)
     // ------------------------------------------------------------------------
@@ -104,7 +123,8 @@ module hyperram_bw_top
         .BURST_WORDS    (BURST_WORDS),
         .CSR_ADDR_WIDTH (CSR_ADDR_WIDTH),
         .VERSION_MAGIC  (VERSION_MAGIC),
-        .CAL_RESET      (CAL_RESET)
+        .CAL_RESET      (CAL_RESET),
+        .DBG_RESET      (DBG_RESET)
     ) u_bw (
         .clk             (clk),
         .rst             (rst),
@@ -128,7 +148,18 @@ module hyperram_bw_top
         .cal_capture_phase (cal_capture_phase),
         .cal_preamble_skip (cal_preamble_skip),
         .cal_rx_tap        (cal_rx_tap),
-        .cal_pair_skew     (cal_pair_skew)
+        .cal_pair_skew     (cal_pair_skew),
+        // issue #13 debug bundle (REG_DBG image -> hyperram_avalon -> ctrl). dbg_ck_stretch_off is
+        // board-only (gpio_io not present in sim) -> left unconnected.
+        .dbg_wr_lat_trim   (dbg_wr_lat_trim),
+        .dbg_lat_clocks    (dbg_lat_clocks),
+        .dbg_cr0_reprog    (dbg_cr0_reprog),
+        .dbg_prewin_drive  (dbg_prewin_drive),
+        .dbg_prewin_n      (dbg_prewin_n),
+        .dbg_prewin_marker (dbg_prewin_marker),
+        .dbg_postwin_hold  (dbg_postwin_hold),
+        .dbg_ck_stretch_off (/* board-only: gpio ck_stretch, no sim consumer */),
+        .wrap_en           (wrap_en)
     );
 
     // ------------------------------------------------------------------------
@@ -161,6 +192,17 @@ module hyperram_bw_top
         .cal_preamble_skip (cal_preamble_skip),
         .cal_rx_tap        (cal_rx_tap),
         .cal_pair_skew     (cal_pair_skew),
+        // issue #13 debug bundle (frozen §0 contract; hyperram_avalon forwards to u_ctrl / front-end).
+        // WP-A adds these inputs to hyperram_avalon — written blind to the frozen names/widths, so this
+        // wrapper cannot elaborate against the BASELINE hyperram_avalon (expected, A9).
+        .dbg_wr_lat_trim   (dbg_wr_lat_trim),
+        .dbg_lat_clocks    (dbg_lat_clocks),
+        .dbg_cr0_reprog    (dbg_cr0_reprog),
+        .dbg_prewin_drive  (dbg_prewin_drive),
+        .dbg_prewin_n      (dbg_prewin_n),
+        .dbg_prewin_marker (dbg_prewin_marker),
+        .dbg_postwin_hold  (dbg_postwin_hold),
+        .wrap_en           (wrap_en),
         // Avalon-MM slave (driven by the bench master)
         .avs_address       (m_address),
         .avs_read          (m_read),

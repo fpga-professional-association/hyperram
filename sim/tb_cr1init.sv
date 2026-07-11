@@ -83,7 +83,10 @@ module tb_cr1init;
       .phy_dq_o(PFX``_dq_o), .phy_dq_oe(PFX``_dq_oe), .phy_rwds_o(PFX``_rwds_o),                     \
       .phy_rwds_oe(PFX``_rwds_oe), .phy_rd_arm(PFX``_rd_arm),                                        \
       .phy_dq_i(PFX``_dq_i), .phy_dq_i_valid(PFX``_dq_iv), .phy_rwds_i(PFX``_rwds_i),                \
-      .dbg_state(), .dbg_rd_wptr(), .dbg_rd_rptr());                                                 \
+      .dbg_state(), .dbg_rd_wptr(), .dbg_rd_rptr(),                                                  \
+      /* issue #13: new ctrl debug bundle tied to legacy (A1) */                                    \
+      .dbg_wr_lat_trim(4'd0), .dbg_lat_clocks(4'd6), .dbg_cr0_reprog(1'b0), .dbg_prewin_drive(1'b0), \
+      .dbg_prewin_n(3'd0), .dbg_prewin_marker(1'b0), .dbg_postwin_hold(1'b0));                       \
     hyperbus_phy_generic #(.DQ_WIDTH(DQ_WIDTH), .DATA_WIDTH(DATA_WIDTH), .DIFF_CK(1'b1)) PFX``_phy ( \
       .clk(clk), .clk90(clk90), .clk_ref(clk_ref), .rst(rst),                                        \
       .cal_capture_phase(1'b0), .cal_preamble_skip(3'd0), .cal_rx_tap(5'd0),                         \

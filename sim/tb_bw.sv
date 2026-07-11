@@ -24,7 +24,7 @@ module tb_bw;
   localparam int unsigned DATA_WIDTH     = 2 * DQ_WIDTH;           // 16
   localparam int unsigned ADDR_WIDTH     = HB_ADDR_WIDTH;          // 32
   localparam int unsigned LEN_WIDTH      = HB_LEN_WIDTH_DEFAULT;   // 16
-  localparam int unsigned CSR_ADDR_WIDTH = 3;
+  localparam int unsigned CSR_ADDR_WIDTH = 5;   // issue #13: 32-reg instrumented bench (avoids new-register aliasing)
   localparam int unsigned BURST_WORDS    = HB_BURST_WORDS_DEFAULT; // 16
 
   // CR0 image: latency code 0001 (=6), fixed-latency, legacy wrap, 32B group (matches tb_avalon).
