@@ -1,4 +1,4 @@
-# cap_arm.tcl <N> — TEMP (issue #13 forensics): poke REG_CAPCFG=N and ARM the capture, then exit
+# cap_arm.tcl <N> — poke REG_CAPCFG=N and ARM the capture, then exit
 # WITHOUT triggering a run. Pair with an external bw_read.tcl run and cap_dumponly.tcl.
 set CAP_CTRL   0x100
 set REG_CAPCFG 0x110

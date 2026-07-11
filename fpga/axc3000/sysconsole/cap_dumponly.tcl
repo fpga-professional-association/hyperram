@@ -1,4 +1,5 @@
-# cap_dumponly.tcl — TEMP (issue #13 forensics): dump a COMPLETED capture. No arm, no trigger.
+# cap_dumponly.tcl — dump a COMPLETED capture without arming or triggering (pair with cap_arm.tcl
+# around your own bw_read.tcl run — the arm/run/dump split that cracked issue #13).
 set CAP_CTRL  0x100
 set CAP_RDADD 0x104
 set CAP_LO    0x108
