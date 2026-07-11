@@ -231,7 +231,7 @@ Coverage by area:
 | Bursts & data | `tb_chop`, `tb_wrap` (all four CR0 wrap sizes), `tb_masked`, `tb_multiburst`, `tb_multiburst_generic` |
 | Registers & init | `tb_reg`, `tb_cr1init` |
 | Power management | `tb_dpd`, `tb_clkstop` |
-| Device quirks | `tb_commit` (wound/row model: coalescing, row segmenting, the parked replay family — 11 stacks) |
+| Device quirks | `tb_commit` (wound/row model: coalescing, row segmenting, the parked replay family — 11 stacks); `tb_dbg` (issue #13: REG_DBG knobs, heal/marker, EMAP wound map, REG_PAT, wrapped-write probe, orphan/spray model + the defuse — 12 checks) |
 | PHY variants | `tb_sdr`, `tb_preamble`, `tb_preamble_generic`, `tb_xilinx` (7-series datapath via shim), `tb_cal` (live REG_CAL retune, no recompile) |
 | Bench engine | `tb_bw` (bandwidth engine + CSRs) |
 

@@ -9,7 +9,7 @@ each phase; a host reads the counters back over JTAG and computes MB/s.
 **JTAG is control plane only** — the measured `WR_CYCLES`/`RD_CYCLES` cover the on-chip Avalon
 datapath, never the JTAG access time, so the reported MB/s is the true HyperBus throughput.
 
-## Architecture (DDIO/GPIO-cell build, `ddio-200` branch)
+## Architecture (DDIO/GPIO-cell build)
 
 The board build inlines the IP's front-end and controller and pairs them with a **board-local I/O
 layer** instead of a portable PHY:
@@ -132,13 +132,22 @@ the first-error CSRs (`0x20` addr / `0x24` got / `0x28` expected — the offset 
 
 ## Measured on hardware (W957D8NBRA4I)
 
-**Clean, integrity-verified ceiling — 175 MHz CK, DDR x8** (final row-aligned build,
-`ERR_COUNT=0`, 25-run soak clean; bitstream: `bitstreams/ddio_row_175_final.sof`):
+**Zero-loss, integrity-verified — 175 MHz CK, DDR x8** (issue-#13 instrumented build with the
+runtime fix set `REG_DBG=0x0007_1263` — prewin heal pn=4 / contig / end-commit-write / spray
+defuse; every shape RO-ground-truth `ERR_COUNT=0`, 25-run 8192-word soak clean; bitstream:
+`bitstreams/ddio_row_175_issue13_fixset_seed4_20260711.sof`, magic `0x48425755`):
 
 | hb_ck | shape | WRITE MB/s | READ MB/s | notes |
 |-------|-------|-----------:|----------:|-------|
 | **175 MHz** | LEN=768 (in-row) | **341.1** | **332.3** | ERR=0; FABRIC2X CK; ceiling set by the 2× clock's ~353 MHz min-pulse limit (~176 MHz CK max) |
-| 175 MHz | LEN=1024 (full row) | 343.3 | 337.8 | best pacing; costs the deterministic 4-word row-end garble |
+| 175 MHz | LEN=1024 (full row) | 343.3 | 328.8 | ERR=0 — the end-commit-write heals the row-aligned tail (~1 % read-window cost) |
+| 175 MHz | LEN=8192 (8 rows) | 315.9 | 329.5 | ERR=0 — full defense set: ~7 % write cost for the per-boundary defuse pair |
+
+With the fix set **off** (POR default `REG_DBG=0x63`) the legacy 2026-07-09 cost model applies:
+in-row loss-free, 4 known words lost per row transition. **Refit discipline:** the DQ/CK pad
+launch is trim-calibrated, not SDC-constrained — one refit met STA yet silently failed to commit
+2 words per row-end close. Re-run the bw_read shape suite (768/1024/1536/2048/4096-by-256/
+crosser/8192, `PAT=3`) after **every** recompile before trusting a new `.sof`.
 
 - **200 MHz**: everything the FPGA controls is proven — fit + static timing (Fmax 210 MHz), CA
   decode, reads pace 383.5 MB/s / writes 389.9 MB/s — but data integrity degrades with a
@@ -170,8 +179,17 @@ the first-error CSRs (`0x20` addr / `0x24` got / `0x28` expected — the offset 
   the `WR_CHOP_REPLAY`/`WR_CHOP_PAUSE_*` parameter notes in `rtl/hyperbus_ctrl.sv` and
   `docs/INTERFACES.md` v10 — the machinery is retained default-off for devices with true
   pending-discard semantics.
+- **Issue #13 postscript (2026-07-11)**: the three laws above are ONE mechanism — a 4-word
+  write-commit pipeline (open-sampling commit at `[B-4,B)`, row-end orphan discard, orphan spray
+  one row low at the first read). Marker-proven, healed to zero loss by the runtime fix set; the
+  main README's "Device limitations" section is the current contract. The paragraph above is kept
+  as the falsification trail that got there.
 - Diagnostic CSRs: burst size (`0x2C` write / `0x30` read), first-error triplet
-  (`0x20/0x24/0x28`), live read-eye cal (`0x34`, issue #10).
+  (`0x20/0x24/0x28`), live read-eye cal (`0x34`, issue #10). Issue #13 added: `REG_DBG` (`0x38`,
+  runtime knobs — `dbg_poke.tcl` is the named-field interface), the 64-deep EMAP wound map
+  (`0x3C`/`0x48-0x50`, `emap_dump.tcl`), `REG_PAT` (`0x40`, `pat_set.tcl`), `REG_WRAP` (`0x44`,
+  `wrap_probe.tcl`), capture Nth-CS# retrigger (`0x110`, `cap_cfg.tcl` / `cap_arm.tcl` +
+  `cap_dumponly.tcl` for the arm→own-run→dump flow).
 
 ## Bring-up history (hard-won, condensed)
 
