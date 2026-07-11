@@ -130,7 +130,7 @@ module tb_multiburst_generic;
     // issue #13: new bench debug-bundle outputs left dangling here (u_hyperram's dbg inputs are tied
     // off to legacy constants independently) — empty = PINCONNECTEMPTY, not PINMISSING.
     .dbg_wr_lat_trim (), .dbg_lat_clocks (), .dbg_cr0_reprog (), .dbg_prewin_drive (),
-    .dbg_prewin_n (), .dbg_prewin_marker (), .dbg_postwin_hold (), .dbg_ck_stretch_off (), .dbg_prewin_contig (), .dbg_end_cread (), .wrap_en ()
+    .dbg_prewin_n (), .dbg_prewin_marker (), .dbg_postwin_hold (), .dbg_ck_stretch_off (), .dbg_prewin_contig (), .dbg_end_cwrite (), .wrap_en ()
   );
 
   hyperram_avalon #(
@@ -167,7 +167,7 @@ module tb_multiburst_generic;
     // issue #13: new hyperram_avalon debug bundle + wrap_en tied to per-instance legacy (A1).
     .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
     .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0),
-    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cread (1'b0), .wrap_en (1'b0)
+    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .wrap_en (1'b0)
   );
 
   // --------------------------------------------------------------------

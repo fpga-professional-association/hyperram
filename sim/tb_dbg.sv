@@ -37,13 +37,17 @@
 //      SUPPRESSED the prewin heal (the 2048->8 / 4096/256->16 command-edge losses). With prewin_drive
 //      on: bit16=0 leaves the ST_IDLE-reopen wound (RO ERR>0); bit16=1 keeps the shadow at the
 //      contiguous reopen so the heal fires there too (RO ERR==0).
-//  10  ROUND 2 Feature B — dbg_end_cread (REG_DBG[17]). A memory-write stream ending EXACTLY on a
-//      BURST_BOUNDARY_WORDS row multiple self-issues one DISCARDED 1-word end-read. Smoke: bit17=1 on a
-//      row-aligned-end run completes (no hang), leaves user-visible ERR identical to bit17=0 (the read
-//      is discarded), and opens exactly ONE extra read CS#; on a NON-aligned-end run bit17 is inert
-//      (identical ERR and CS# count). NOTE: the model does NOT reproduce the real flush-home BENEFIT
-//      (mechanism (b)/(d), read-open flush into [end-4,end), is unmodeled) — it still applies its
-//      WR_END_GARBLE, so ERR is unchanged by the cread in sim. Silicon is the oracle for the fix.
+//  10  ROUND 3 Feature B — dbg_end_cwrite (REG_DBG[17]). A memory-write stream ending EXACTLY on a
+//      BURST_BOUNDARY_WORDS row multiple self-issues one internal FULLY-MASKED 4-word WRITE at the end
+//      (superseding round 2's end-READ, falsified by silicon fact (4): a read sprays the orphan one row
+//      low, never home). Smoke: bit17=1 on a row-aligned-end run completes (no hang), (a) adds exactly
+//      ONE extra WRITE-shaped CS# (not a read — proven by the write/read CS# type counters), (b) leaves
+//      the array at [end,end+4) UNCHANGED (the masked write writes nothing there — the model honors
+//      RWDS masking), (c) leaves user-visible ERR identical to bit17=0, (d) is inert on a NON-aligned
+//      end (identical ERR and CS# counts). NOTE: the model does NOT reproduce the real heal BENEFIT
+//      (silicon fact (1)'s commit-pipe sampling of the prewin tail into [end-4,end) is unmodeled) — it
+//      still applies its WR_END_GARBLE, so ERR is unchanged by the cwrite in sim. Silicon is the oracle
+//      for the heal itself; this TB proves the SHAPE (write-not-read, masked, no user-data disturbance).
 //
 // NOTE (integration): the dbg_* bundle + wrap_en + CSR_ADDR_WIDTH=5 + DBG_RESET reach the controller
 // only after WP-A/WP-B are applied, so this TB elaborates ONLY in the integrated tree (per A9 it is
@@ -96,10 +100,12 @@ module tb_dbg;
   localparam logic [31:0] DBG_LAT6_RP = 32'h0000_0060 | (32'h1<<8);    // lat=6 + fire CR0-reprogram   = 0x0160
   localparam logic [31:0] DBG_POSTWIN = 32'h0000_0060 | (32'h1<<14);   // dbg_postwin_hold             = 0x4060
   localparam logic [31:0] DBG_CKSTR   = 32'h0000_0060 | (32'h1<<15);   // dbg_ck_stretch_off           = 0x8060
-  // ROUND 2 images. Feature A (contig) rides on prewin_drive+n=4; Feature B (endcread) is standalone.
+  // ROUND 2/3 images. Feature A (contig) rides on prewin_drive+n=4; Feature B (end commit-write, bit17)
+  // is standalone here (the real heal also needs prewin_drive on, but sim does not model the heal — see
+  // check 10 — so bit17 alone exercises the SHAPE: one extra masked WRITE CS#, no user-data disturbance).
   localparam logic [31:0] DBG_A9_OFF  = DBG_HEAL_N4;                    // prewin n=4, contig OFF       = 0x01260
   localparam logic [31:0] DBG_A9_ON   = DBG_HEAL_N4 | (32'h1<<16);     // prewin n=4, contig ON        = 0x11260
-  localparam logic [31:0] DBG_ENDCR   = 32'h0000_0060 | (32'h1<<17);  // dbg_end_cread                = 0x20060
+  localparam logic [31:0] DBG_ENDCW   = 32'h0000_0060 | (32'h1<<17);  // dbg_end_cwrite                = 0x20060
 
   // ROUND 2 check-9 geometry: two CONTIGUOUS 16-word write commands. cmd2 base == cmd1 end, so cmd2's
   // ST_IDLE reopen wounds [cmd2-4, cmd2) = cmd1's last 4 words (Feature A's target). Both < 0x600.
@@ -168,10 +174,10 @@ module tb_dbg;
     .LATENCY_CLOCKS   (6),
     .FIXED_LATENCY    (1'b1),
     .MAX_BURST_WORDS  (MAXBURST),
-    // ROUND 2: a row boundary the controller's Feature B (dbg_end_cread) keys off. Set to 2048 — far
+    // ROUND 2/3: a row boundary the controller's Feature B (dbg_end_cwrite) keys off. Set to 2048 — far
     // above every wound-check region (all < 0x600), so its chop cap NEVER binds for checks 1-9 (they are
     // bit-identical to a 0 boundary) — yet non-zero so check 10 can end a write EXACTLY on 2048 and fire
-    // the end-commit-read. The model's own BURST_BOUNDARY_WORDS stays 0 (no bus-release quirk here).
+    // the end-commit-WRITE. The model's own BURST_BOUNDARY_WORDS stays 0 (no bus-release quirk here).
     .BURST_BOUNDARY_WORDS (2048),
     .PROGRAM_CR       (1'b1),
     .POR_DELAY_CYCLES (0),
@@ -234,10 +240,20 @@ module tb_dbg;
   // ------------------------------------------------------------------
   int unsigned errors = 0;
 
-  // ROUND 2 check-10: count CS# opens (falling edges of the master-driven hb_cs_n). Sampled as a delta
-  // around a run() so the Feature-B end-commit-read shows up as exactly one extra transaction.
+  // ROUND 2/3 check-10: count CS# opens (falling edges of the master-driven hb_cs_n). Sampled as a delta
+  // around a run() so the Feature-B end-commit-WRITE shows up as exactly one extra transaction.
   int unsigned cs_fall_cnt = 0;
   always @(negedge hb_cs_n) cs_fall_cnt = cs_fall_cnt + 1;
+
+  // ROUND 3 check-10(a): classify each COMPLETED transaction as write- vs read-shaped so the extra CS#
+  // the end-commit-WRITE opens is proven to be a WRITE (not the falsified round-2 read). model.cur_rw
+  // (CA[47], 1=read) is latched during CA decode and stable for the whole transaction; sample it at CS#
+  // DEASSERT (posedge hb_cs_n = transaction end), when it definitely reflects the transaction just ended.
+  int unsigned cs_wr_cnt = 0, cs_rd_cnt = 0;
+  always @(posedge hb_cs_n) begin
+    if (model.cur_rw) cs_rd_cnt = cs_rd_cnt + 1;
+    else              cs_wr_cnt = cs_wr_cnt + 1;
+  end
 
   task automatic check(input logic cond, input string msg);
     if (!cond) begin
@@ -330,8 +346,10 @@ module tb_dbg;
   int unsigned guard;
   logic [31:0] wound_base;   // ERR of the PAT=1 drive=0 run — the pure wound count, reused everywhere
   logic [31:0] emap_count;
-  logic [31:0] err_off, err_on;                       // ROUND 2 check-10 A/B ERR captures
-  int unsigned c_snap, cs_off, cs_on, cs_na_on, cs_na_off;   // ROUND 2 check-10 CS#-open deltas
+  logic [31:0] err_off, err_on;                       // ROUND 3 check-10 A/B ERR captures
+  int unsigned c_snap, cs_off, cs_on, cs_na_on, cs_na_off;   // ROUND 3 check-10 CS#-open deltas
+  int unsigned wr_snap, rd_snap, wr_off, rd_off, wr_on, rd_on;  // check-10(a) write/read CS# type deltas
+  logic [DATA_WIDTH-1:0] endblk_pre [4];              // check-10(b) [end,end+4) array snapshot pre-cwrite
 
   initial begin
     csr_address = '0; csr_read = 1'b0; csr_write = 1'b0; csr_writedata = '0;
@@ -577,47 +595,65 @@ module tb_dbg;
           $sformatf("[9] contig-on ERR=%0d exp 0 (bit16 keeps shadow_full at the command-edge reopen)", err));
 
     // =============================================================================================
-    // CHECK 10 — ROUND 2 Feature B: end-commit-read (dbg_end_cread, bit17). A write ending EXACTLY on
-    // the 2048 row boundary (BURST_BOUNDARY_WORDS) fires ONE discarded 1-word end-read; a write ending
-    // off-boundary does not. The model does NOT reproduce the real flush-home benefit (read-open flush
-    // is unmodeled) — it still applies WR_END_GARBLE at the 1024-multiple end — so the cread must leave
-    // user-visible ERR IDENTICAL (the read data is discarded) while adding exactly one read CS#. Silicon
-    // is the oracle for the actual repair; here we prove no-hang, no-user-disturb, and the extra CS#.
+    // CHECK 10 — ROUND 3 Feature B: end-commit-WRITE (dbg_end_cwrite, bit17). A write ending EXACTLY on
+    // the 2048 row boundary (BURST_BOUNDARY_WORDS) self-issues ONE internal FULLY-MASKED 4-word WRITE at
+    // the end (superseding round 2's end-READ — silicon fact (4): a read sprays the orphan one row low).
+    // The model does NOT reproduce the heal BENEFIT (fact (1)'s commit-pipe sampling into [end-4,end) is
+    // unmodeled) — it still applies WR_END_GARBLE at the 1024-multiple end — so the cwrite must leave
+    // user-visible ERR IDENTICAL. Here we prove the SHAPE, which the model DOES honor: (a) exactly ONE
+    // extra WRITE-shaped CS# (not a read), (b) [end,end+4) array content UNCHANGED (masked write writes
+    // nothing there), (c) no user-data disturbance (ERR identical), (d) inert off-boundary. Silicon is
+    // the oracle for the heal itself. end = B10_ALIGN(0x7F0) + 16 = 0x800.
     // =============================================================================================
     csr_wr(REG_PAT, 32'd1);                          // 0xFFFF background
     csr_wr(REG_DBG, TB_DBG_POR);                     // bit17=0
-    c_snap = cs_fall_cnt;
+    c_snap = cs_fall_cnt; wr_snap = cs_wr_cnt; rd_snap = cs_rd_cnt;
     run(1'b0, 32'd16, B10_ALIGN, done, err_off);     // [2032,2048), end=0x800 aligned; bit17 off
-    cs_off = cs_fall_cnt - c_snap;
+    cs_off = cs_fall_cnt - c_snap; wr_off = cs_wr_cnt - wr_snap; rd_off = cs_rd_cnt - rd_snap;
     check(done, "[10] aligned-end run (bit17=0) did not complete");
 
-    csr_wr(REG_DBG, DBG_ENDCR);                      // bit17=1
-    csr_rd(REG_DBG, rb); check(rb === DBG_ENDCR, $sformatf("[10] REG_DBG readback 0x%08x exp 0x%08x", rb, DBG_ENDCR));
-    c_snap = cs_fall_cnt;
-    run(1'b0, 32'd16, B10_ALIGN, done, err_on);      // same run, bit17 on -> end-commit-read fires
-    cs_on = cs_fall_cnt - c_snap;
-    $display("-- [10] aligned end: bit17=0 ERR=%0d CS#=%0d | bit17=1 ERR=%0d CS#=%0d", err_off, cs_off, err_on, cs_on);
+    csr_wr(REG_DBG, DBG_ENDCW);                      // bit17=1
+    csr_rd(REG_DBG, rb); check(rb === DBG_ENDCW, $sformatf("[10] REG_DBG readback 0x%08x exp 0x%08x", rb, DBG_ENDCW));
+    // (b) snapshot the array at [end,end+4)=[0x800,0x804) — the masked internal write must not touch it.
+    for (int i = 0; i < 4; i++) endblk_pre[i] = model.mem[32'h800 + i];
+    c_snap = cs_fall_cnt; wr_snap = cs_wr_cnt; rd_snap = cs_rd_cnt;
+    run(1'b0, 32'd16, B10_ALIGN, done, err_on);      // same run, bit17 on -> end-commit-WRITE fires
+    cs_on = cs_fall_cnt - c_snap; wr_on = cs_wr_cnt - wr_snap; rd_on = cs_rd_cnt - rd_snap;
+    $display("-- [10] aligned end: bit17=0 ERR=%0d CS#=%0d (wr=%0d rd=%0d) | bit17=1 ERR=%0d CS#=%0d (wr=%0d rd=%0d)",
+             err_off, cs_off, wr_off, rd_off, err_on, cs_on, wr_on, rd_on);
     check(done, "[10] aligned-end run (bit17=1) did not complete (Feature B hang)");
-    check(err_on === err_off,
-          $sformatf("[10] aligned ERR changed by bit17 (%0d vs %0d) — the end-read must NOT disturb user data", err_on, err_off));
+    check(err_on === err_off,                        // (c)
+          $sformatf("[10] aligned ERR changed by bit17 (%0d vs %0d) — the end-write must NOT disturb user data", err_on, err_off));
+    // (a) exactly one extra WRITE-shaped CS#, and NO extra read-shaped CS#.
+    check(wr_on === wr_off + 1,
+          $sformatf("[10] aligned WRITE CS# opens %0d vs %0d — expected exactly ONE extra (the end-commit-WRITE)", wr_on, wr_off));
+    check(rd_on === rd_off,
+          $sformatf("[10] aligned READ CS# opens %0d vs %0d — the extra CS# must be a WRITE, not a read", rd_on, rd_off));
     check(cs_on === cs_off + 1,
-          $sformatf("[10] aligned CS# opens %0d vs %0d — expected exactly ONE extra (the end-commit-read)", cs_on, cs_off));
+          $sformatf("[10] aligned total CS# opens %0d vs %0d — expected exactly ONE extra", cs_on, cs_off));
+    // (b) [end,end+4) unchanged through the masked write (the model honors RWDS masking).
+    for (int i = 0; i < 4; i++)
+      check(model.mem[32'h800 + i] === endblk_pre[i],
+            $sformatf("[10] [end+%0d]=0x%04x changed (was 0x%04x) — the masked end-write wrote user-visible data",
+                      i, model.mem[32'h800 + i], endblk_pre[i]));
 
-    // Non-aligned end: Feature B inert -> identical ERR and CS# count with bit17 on vs off.
-    csr_wr(REG_DBG, DBG_ENDCR);                      // bit17=1
-    c_snap = cs_fall_cnt;
+    // (d) Non-aligned end: Feature B inert -> identical ERR and CS# counts with bit17 on vs off.
+    csr_wr(REG_DBG, DBG_ENDCW);                      // bit17=1
+    c_snap = cs_fall_cnt; wr_snap = cs_wr_cnt;
     run(1'b0, 32'd16, B10_NALGN, done, err_on);      // [2016,2032), end=0x7F0 NOT aligned
-    cs_na_on = cs_fall_cnt - c_snap;
+    cs_na_on = cs_fall_cnt - c_snap; wr_on = cs_wr_cnt - wr_snap;
     csr_wr(REG_DBG, TB_DBG_POR);                     // bit17=0
-    c_snap = cs_fall_cnt;
+    c_snap = cs_fall_cnt; wr_snap = cs_wr_cnt;
     run(1'b0, 32'd16, B10_NALGN, done, err_off);
-    cs_na_off = cs_fall_cnt - c_snap;
-    $display("   [10] non-aligned end (feature inert): bit17=1 ERR=%0d CS#=%0d | bit17=0 ERR=%0d CS#=%0d",
-             err_on, cs_na_on, err_off, cs_na_off);
+    cs_na_off = cs_fall_cnt - c_snap; wr_off = cs_wr_cnt - wr_snap;
+    $display("   [10] non-aligned end (feature inert): bit17=1 ERR=%0d CS#=%0d wr=%0d | bit17=0 ERR=%0d CS#=%0d wr=%0d",
+             err_on, cs_na_on, wr_on, err_off, cs_na_off, wr_off);
     check(err_on === err_off,
           $sformatf("[10] non-aligned ERR differs (%0d vs %0d) — bit17 must be inert off-boundary", err_on, err_off));
     check(cs_na_on === cs_na_off,
-          $sformatf("[10] non-aligned CS# opens differ (%0d vs %0d) — no end-read off-boundary", cs_na_on, cs_na_off));
+          $sformatf("[10] non-aligned CS# opens differ (%0d vs %0d) — no end-write off-boundary", cs_na_on, cs_na_off));
+    check(wr_on === wr_off,
+          $sformatf("[10] non-aligned WRITE CS# opens differ (%0d vs %0d) — no end-write off-boundary", wr_on, wr_off));
 
     csr_wr(REG_DBG, TB_DBG_POR);
     repeat (8) @(posedge clk);

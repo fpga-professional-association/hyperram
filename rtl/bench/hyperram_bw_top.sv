@@ -112,7 +112,7 @@ module hyperram_bw_top
     logic       dbg_prewin_marker;
     logic       dbg_postwin_hold;
     logic       dbg_prewin_contig;   // issue #13 round 2 (A)
-    logic       dbg_end_cread;       // issue #13 round 2 (B)
+    logic       dbg_end_cwrite;       // issue #13 round 3 (B): end-of-row commit-WRITE
     logic       wrap_en;
 
     // ------------------------------------------------------------------------
@@ -162,7 +162,7 @@ module hyperram_bw_top
         .dbg_postwin_hold  (dbg_postwin_hold),
         .dbg_ck_stretch_off (/* board-only: gpio ck_stretch, no sim consumer */),
         .dbg_prewin_contig (dbg_prewin_contig),
-        .dbg_end_cread     (dbg_end_cread),
+        .dbg_end_cwrite     (dbg_end_cwrite),
         .wrap_en           (wrap_en)
     );
 
@@ -207,7 +207,7 @@ module hyperram_bw_top
         .dbg_prewin_marker (dbg_prewin_marker),
         .dbg_postwin_hold  (dbg_postwin_hold),
         .dbg_prewin_contig (dbg_prewin_contig),
-        .dbg_end_cread     (dbg_end_cread),
+        .dbg_end_cwrite     (dbg_end_cwrite),
         .wrap_en           (wrap_en),
         // Avalon-MM slave (driven by the bench master)
         .avs_address       (m_address),

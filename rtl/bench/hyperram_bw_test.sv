@@ -62,7 +62,10 @@
 //            |      |                      |        |   [15]=dbg_ck_stretch_off
 //            |      |                      |        |   [16]=dbg_prewin_contig (round 2 A: heal contiguous
 //            |      |                      |        |        command-edge ST_IDLE write reopens)
-//            |      |                      |        |   [17]=dbg_end_cread (round 2 B: end-of-row commit-read)
+//            |      |                      |        |   [17]=dbg_end_cwrite (round 3 B: end-of-row commit-WRITE
+//            |      |                      |        |        — masked 4-word write at the row-aligned end; the
+//            |      |                      |        |        prewin tail heals the orphan home. Was end-READ
+//            |      |                      |        |        (round 2), falsified: a read sprays it one row low)
 //            |      |                      |        |   reset = DBG_RESET
 //    0x3C    | 15   | REG_EMAP_STAT        |  R     | wound-map FIFO status: [6:0]=count(0..64),
 //            |      |                      |        |   [7]=valid(count>0), [8]=overflow(sticky/run)
@@ -138,7 +141,7 @@ module hyperram_bw_test
     output logic       dbg_postwin_hold,   // hold last data word 4 CK into the tail (law-3 analog)
     output logic       dbg_ck_stretch_off, // board-only: disable gpio_io ck_stretch trailing masked cycle
     output logic       dbg_prewin_contig,  // round 2 (A): keep shadow at a contiguous command-edge reopen
-    output logic       dbg_end_cread,      // round 2 (B): end-of-row (BURST_BOUNDARY-aligned) commit-read
+    output logic       dbg_end_cwrite,      // round 3 (B): end-of-row (BURST_BOUNDARY-aligned) commit-WRITE
     output logic       wrap_en             // 1 = drive front-end cmd_wrap for the REG_WRAP probe burst
 );
 
@@ -229,7 +232,7 @@ module hyperram_bw_test
     assign dbg_postwin_hold  = r_dbg[14];
     assign dbg_ck_stretch_off = r_dbg[15];
     assign dbg_prewin_contig = r_dbg[16];   // round 2 (A)
-    assign dbg_end_cread     = r_dbg[17];   // round 2 (B)
+    assign dbg_end_cwrite     = r_dbg[17];   // round 3 (B): end-of-row commit-WRITE (was end-READ)
     // dbg_cr0_reprog is a generated 1-cycle pulse (in the sequential block), NOT a decode of r_dbg[8].
 
     // REG_PAT store (pattern select) and REG_WRAP arm (target word address + go-strobe).
