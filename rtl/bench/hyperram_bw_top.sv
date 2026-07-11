@@ -113,6 +113,7 @@ module hyperram_bw_top
     logic       dbg_postwin_hold;
     logic       dbg_prewin_contig;   // issue #13 round 2 (A)
     logic       dbg_end_cwrite;       // issue #13 round 3 (B): end-of-row commit-WRITE
+    logic       dbg_spray_defuse;     // issue #13 round 4: per-boundary spray defuse (REG_DBG[18])
     logic       wrap_en;
 
     // ------------------------------------------------------------------------
@@ -163,6 +164,7 @@ module hyperram_bw_top
         .dbg_ck_stretch_off (/* board-only: gpio ck_stretch, no sim consumer */),
         .dbg_prewin_contig (dbg_prewin_contig),
         .dbg_end_cwrite     (dbg_end_cwrite),
+        .dbg_spray_defuse   (dbg_spray_defuse),
         .wrap_en           (wrap_en)
     );
 
@@ -208,6 +210,7 @@ module hyperram_bw_top
         .dbg_postwin_hold  (dbg_postwin_hold),
         .dbg_prewin_contig (dbg_prewin_contig),
         .dbg_end_cwrite     (dbg_end_cwrite),
+        .dbg_spray_defuse   (dbg_spray_defuse),
         .wrap_en           (wrap_en),
         // Avalon-MM slave (driven by the bench master)
         .avs_address       (m_address),

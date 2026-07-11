@@ -92,6 +92,7 @@ module hyperram_avalon
   input  logic                        dbg_postwin_hold,  // hold last data word 4 CK into the tail
   input  logic                        dbg_prewin_contig, // ROUND 2 (A): keep shadow at a contiguous reopen
   input  logic                        dbg_end_cwrite,     // ROUND 3 (B): end-of-row commit-WRITE (was READ)
+  input  logic                        dbg_spray_defuse,   // ROUND 4: per-boundary spray defuse (REG_DBG[18])
   input  logic                        wrap_en,           // drives front-end cmd_wrap for the wrap probe
 
   // ---- Avalon-MM slave ----------------------------------------------------
@@ -313,7 +314,8 @@ module hyperram_avalon
     .dbg_prewin_marker(dbg_prewin_marker),
     .dbg_postwin_hold (dbg_postwin_hold),
     .dbg_prewin_contig(dbg_prewin_contig),
-    .dbg_end_cwrite    (dbg_end_cwrite)
+    .dbg_end_cwrite    (dbg_end_cwrite),
+    .dbg_spray_defuse  (dbg_spray_defuse)
   );
 
   // -------------------------------------------------------------------------

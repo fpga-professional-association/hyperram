@@ -66,6 +66,10 @@
 //            |      |                      |        |        — masked 4-word write at the row-aligned end; the
 //            |      |                      |        |        prewin tail heals the orphan home. Was end-READ
 //            |      |                      |        |        (round 2), falsified: a read sprays it one row low)
+//            |      |                      |        |   [18]=dbg_spray_defuse (round 4: per-boundary spray defuse
+//            |      |                      |        |        — a READ fires the parked orphan then a masked heal-
+//            |      |                      |        |        WRITE re-covers the previous row's home; kills the
+//            |      |                      |        |        residual interior-boundary sprays 2048->4/4096->12)
 //            |      |                      |        |   reset = DBG_RESET
 //    0x3C    | 15   | REG_EMAP_STAT        |  R     | wound-map FIFO status: [6:0]=count(0..64),
 //            |      |                      |        |   [7]=valid(count>0), [8]=overflow(sticky/run)
@@ -142,6 +146,7 @@ module hyperram_bw_test
     output logic       dbg_ck_stretch_off, // board-only: disable gpio_io ck_stretch trailing masked cycle
     output logic       dbg_prewin_contig,  // round 2 (A): keep shadow at a contiguous command-edge reopen
     output logic       dbg_end_cwrite,      // round 3 (B): end-of-row (BURST_BOUNDARY-aligned) commit-WRITE
+    output logic       dbg_spray_defuse,    // round 4: per-boundary spray defuse (REG_DBG[18])
     output logic       wrap_en             // 1 = drive front-end cmd_wrap for the REG_WRAP probe burst
 );
 
@@ -233,6 +238,7 @@ module hyperram_bw_test
     assign dbg_ck_stretch_off = r_dbg[15];
     assign dbg_prewin_contig = r_dbg[16];   // round 2 (A)
     assign dbg_end_cwrite     = r_dbg[17];   // round 3 (B): end-of-row commit-WRITE (was end-READ)
+    assign dbg_spray_defuse  = r_dbg[18];   // round 4: per-boundary spray defuse
     // dbg_cr0_reprog is a generated 1-cycle pulse (in the sequential block), NOT a decode of r_dbg[8].
 
     // REG_PAT store (pattern select) and REG_WRAP arm (target word address + go-strobe).

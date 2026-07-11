@@ -48,6 +48,15 @@
 //      (silicon fact (1)'s commit-pipe sampling of the prewin tail into [end-4,end) is unmodeled) — it
 //      still applies its WR_END_GARBLE, so ERR is unchanged by the cwrite in sim. Silicon is the oracle
 //      for the heal itself; this TB proves the SHAPE (write-not-read, masked, no user-data disturbance).
+//  11  ROUND 4 interior-boundary SPRAY signature (a SECOND stack whose model runs WR_ORPHAN_MODEL, facts
+//      1-5, and whose ctrl chops at the 1024 row boundary). A 3-row stream with the full round-1/2/3 fix
+//      ON but dbg_spray_defuse OFF still loses 8 words: each row-multiple close parks an orphan (fact 2)
+//      and the read-back fires them (fact 4) — orphan @R_k sprays home_k's tail onto R_{k-1}'s home
+//      (fact 5). The first boundary's spray lands one row BELOW the stream (a dead zone) — no error.
+//  12  ROUND 4 spray DEFUSE (dbg_spray_defuse, REG_DBG[18]). Same stream: at each boundary close the ctrl
+//      interposes a defuse READ (fires the orphan onto the previous home now) + a masked heal-WRITE (re-
+//      drives that home's correct tail via prewin) -> ZERO errors; the below-stream dead zone is left
+//      identical to the defuse-OFF run.
 //
 // NOTE (integration): the dbg_* bundle + wrap_en + CSR_ADDR_WIDTH=5 + DBG_RESET reach the controller
 // only after WP-A/WP-B are applied, so this TB elaborates ONLY in the integrated tree (per A9 it is
@@ -106,6 +115,14 @@ module tb_dbg;
   localparam logic [31:0] DBG_A9_OFF  = DBG_HEAL_N4;                    // prewin n=4, contig OFF       = 0x01260
   localparam logic [31:0] DBG_A9_ON   = DBG_HEAL_N4 | (32'h1<<16);     // prewin n=4, contig ON        = 0x11260
   localparam logic [31:0] DBG_ENDCW   = 32'h0000_0060 | (32'h1<<17);  // dbg_end_cwrite                = 0x20060
+  // ROUND 4 checks 11/12: the full pipeline fix (prewin n=4 + contig + endcw) with defuse OFF vs ON.
+  localparam logic [31:0] DBG_R4_OFF  = DBG_HEAL_N4 | (32'h1<<16) | (32'h1<<17);        // = 0x31260
+  localparam logic [31:0] DBG_R4_ON   = DBG_R4_OFF  | (32'h1<<18);                       // = 0x71260
+  // A 3-row contiguous stream crossing 2 INTERIOR boundaries (0x1000, 0x1400) and ending on 0x1800.
+  // Started at a row multiple >0 so the FIRST boundary's spray lands one row BELOW the stream (a dead
+  // zone at [0xBFC,0xC00)) — check 12 asserts the defuse leaves that zone identical to defuse OFF.
+  localparam logic [ADDR_WIDTH-1:0] R4_BASE = 32'h0000_0C00;   // 3072
+  localparam logic [31:0]           R4_LEN  = 32'd3072;        // 3 rows -> orphans @0x1000/0x1400/0x1800
 
   // ROUND 2 check-9 geometry: two CONTIGUOUS 16-word write commands. cmd2 base == cmd1 end, so cmd2's
   // ST_IDLE reopen wounds [cmd2-4, cmd2) = cmd1's last 4 words (Feature A's target). Both < 0x600.
@@ -235,6 +252,69 @@ module tb_dbg;
     .hb_rwds_o (mdl_rwds_o), .hb_rwds_oe (mdl_rwds_oe)
   );
 
+  // ==================================================================
+  // ROUND 4 — a SECOND stack whose model runs the FULL orphan/spray mechanism (WR_ORPHAN_MODEL) and
+  // whose controller chops ONLY at the row boundary (MAX_BURST_WORDS=0, BURST_BOUNDARY_WORDS=1024 ==
+  // the model row), so the interior-boundary spray signature (facts 2-5) and its per-boundary DEFUSE
+  // (dbg_spray_defuse) are both exercised. Kept separate so checks 1-10 (stack 1, BB=2048, garble
+  // model) stay bit-identical. The model here does NOT set WR_BOUNDARY_END_GARBLE — WR_ORPHAN_MODEL
+  // subsumes it (a row-multiple close PARKS an orphan instead of garbling).
+  // ==================================================================
+  logic                 hb_ck2, hb_ck_n2, hb_cs_n2, hb_rst_n2;
+  logic [DQ_WIDTH-1:0]  phy_dq_o2;   logic phy_dq_oe2;
+  logic                 phy_rwds_o2; logic phy_rwds_oe2;
+  logic [DQ_WIDTH-1:0]  mdl_dq_o2;   logic mdl_dq_oe2;
+  logic                 mdl_rwds_o2; logic mdl_rwds_oe2;
+
+  wire [DQ_WIDTH-1:0] dq_line2   = mdl_dq_oe2   ? mdl_dq_o2   : (phy_dq_oe2   ? phy_dq_o2   : '0);
+  wire                rwds_line2 = mdl_rwds_oe2 ? mdl_rwds_o2 : (phy_rwds_oe2 ? phy_rwds_o2 : 1'b0);
+  wire [DQ_WIDTH-1:0] dq_line2_dly;   assign #RTT dq_line2_dly   = dq_line2;
+  wire                rwds_line2_dly; assign #RTT rwds_line2_dly = rwds_line2;
+
+  logic [CSR_ADDR_WIDTH-1:0] csr_address2;
+  logic                      csr_read2, csr_write2;
+  logic [31:0]               csr_writedata2, csr_readdata2;
+  logic                      csr_waitrequest2;
+  logic                      init_done2;
+
+  hyperram_bw_top #(
+    .DQ_WIDTH         (DQ_WIDTH),      .DATA_WIDTH (DATA_WIDTH), .ADDR_WIDTH (ADDR_WIDTH),
+    .LEN_WIDTH        (LEN_WIDTH),     .BURST_WORDS (BURST_WORDS), .CSR_ADDR_WIDTH (CSR_ADDR_WIDTH),
+    .VERSION_MAGIC    (TB_MAGIC),      .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),
+    .MAX_BURST_WORDS  (0),                    // chop ONLY at the row boundary (no tCSM chop)
+    .BURST_BOUNDARY_WORDS (1024),             // == model row: orphan/defuse geometry aligns
+    .PROGRAM_CR       (1'b1),          .POR_DELAY_CYCLES (0), .INIT_CR0 (TB_INIT_CR0),
+    .PHY_VARIANT      ("SDR"),         .DIFF_CK (1'b1), .RD_PREAMBLE_SKIP (1),
+    .CAL_RESET        (32'h0000_0002), .DBG_RESET (TB_DBG_POR)
+  ) dut2 (
+    .clk (clk), .clk90 (clk90), .clk_ref (clk_ref), .rst (rst),
+    .csr_address     (csr_address2),
+    .csr_read        (csr_read2),
+    .csr_readdata    (csr_readdata2),
+    .csr_write       (csr_write2),
+    .csr_writedata   (csr_writedata2),
+    .csr_waitrequest (csr_waitrequest2),
+    .hb_ck (hb_ck2), .hb_ck_n (hb_ck_n2), .hb_cs_n (hb_cs_n2), .hb_rst_n (hb_rst_n2),
+    .hb_dq_o (phy_dq_o2), .hb_dq_oe (phy_dq_oe2), .hb_dq_i (dq_line2_dly),
+    .hb_rwds_o (phy_rwds_o2), .hb_rwds_oe (phy_rwds_oe2), .hb_rwds_i (rwds_line2_dly),
+    .init_done (init_done2)
+  );
+
+  hyperram_model #(
+    .DQ_WIDTH                 (DQ_WIDTH),  .MEM_WORDS (1 << 16),
+    .LATENCY_CLOCKS           (6),         .FIXED_LATENCY (1'b1), .FIXED_2X (1'b1),
+    .ROW_WORDS                (0),         .REFRESH_EVERY (0), .RD_PREAMBLE_CLOCKS (1),
+    .WR_WOUND_WORDS           (4),         .WR_WOUND_SAMPLE_BUS (1'b1),
+    .WR_ORPHAN_MODEL          (1'b1),      // facts 1-5: sampled write-open commit + orphan park + spray
+    .WR_END_GARBLE_ROW_WORDS  (1024)       // the row the orphan parks/sprays on (== ctrl BURST_BOUNDARY)
+  ) model2 (
+    .hb_ck (hb_ck2), .hb_ck_n (hb_ck_n2), .hb_cs_n (hb_cs_n2), .hb_rst_n (hb_rst_n2),
+    .hb_dq_i  (dq_line2),  .hb_dq_ie  (phy_dq_oe2),
+    .hb_dq_o  (mdl_dq_o2), .hb_dq_oe  (mdl_dq_oe2),
+    .hb_rwds_i (rwds_line2), .hb_rwds_ie (phy_rwds_oe2),
+    .hb_rwds_o (mdl_rwds_o2), .hb_rwds_oe (mdl_rwds_oe2)
+  );
+
   // ------------------------------------------------------------------
   // Scoreboard
   // ------------------------------------------------------------------
@@ -311,6 +391,27 @@ module tb_dbg;
     csr_rd(REG_ERRCNT, err);
   endtask
 
+  // ---- ROUND 4 stack-2 CSR access + run (identical protocol, driving dut2's slave) ----
+  task automatic csr_wr2(input logic [CSR_ADDR_WIDTH-1:0] addr, input logic [31:0] data);
+    @(negedge clk); csr_address2 = addr; csr_writedata2 = data; csr_write2 = 1'b1; csr_read2 = 1'b0;
+    @(negedge clk); csr_write2 = 1'b0; csr_writedata2 = '0; csr_address2 = '0;
+  endtask
+  task automatic csr_rd2(input logic [CSR_ADDR_WIDTH-1:0] addr, output logic [31:0] data);
+    @(negedge clk); csr_address2 = addr; csr_read2 = 1'b1; csr_write2 = 1'b0;
+    @(negedge clk); data = csr_readdata2; csr_read2 = 1'b0; csr_address2 = '0;
+  endtask
+  logic [31:0] g_status2;
+  task automatic run2(input logic ro, input logic [31:0] len, input logic [ADDR_WIDTH-1:0] base,
+                      output logic done, output logic [31:0] err);
+    int unsigned guard;
+    csr_wr2(REG_LEN, len); csr_wr2(REG_BASE, 32'(base)); csr_wr2(REG_BURSTW, len); csr_wr2(REG_RBURSTW, len);
+    csr_wr2(REG_CTRL, ro ? CTRL_START_RO : CTRL_START);
+    guard = 0;
+    do begin csr_rd2(REG_CTRL, g_status2); guard = guard + 1; end while (!g_status2[1] && guard < 400000);
+    done = g_status2[1];
+    csr_rd2(REG_ERRCNT, err);
+  endtask
+
   // Arm ONE wrapped write at word address b (REG_WRAP), then wait for the autonomous burst to finish.
   // Two-phase poll: first catch busy=1 (the wrap started, clearing the previous run's done), then wait
   // for done=1 — so a stale done from the prior run is never mistaken for completion.
@@ -350,9 +451,11 @@ module tb_dbg;
   int unsigned c_snap, cs_off, cs_on, cs_na_on, cs_na_off;   // ROUND 3 check-10 CS#-open deltas
   int unsigned wr_snap, rd_snap, wr_off, rd_off, wr_on, rd_on;  // check-10(a) write/read CS# type deltas
   logic [DATA_WIDTH-1:0] endblk_pre [4];              // check-10(b) [end,end+4) array snapshot pre-cwrite
+  logic [DATA_WIDTH-1:0] belowoff [4], belowon [4];  // check-11/12 below-stream dead-zone snapshots
 
   initial begin
     csr_address = '0; csr_read = 1'b0; csr_write = 1'b0; csr_writedata = '0;
+    csr_address2 = '0; csr_read2 = 1'b0; csr_write2 = 1'b0; csr_writedata2 = '0;
     rst = 1'b1;
     repeat (5) @(posedge clk);
     @(negedge clk);
@@ -360,8 +463,9 @@ module tb_dbg;
 
     // ---- wait for POR init + CR0 programming ----
     guard = 0;
-    while (!init_done && guard < 100000) begin @(posedge clk); guard = guard + 1; end
-    check(init_done, "init_done never asserted");
+    while (!(init_done && init_done2) && guard < 100000) begin @(posedge clk); guard = guard + 1; end
+    check(init_done,  "init_done never asserted");
+    check(init_done2, "init_done2 (orphan-model stack) never asserted");
     repeat (4) @(posedge clk);
 
     $display("==================================================================");
@@ -654,6 +758,67 @@ module tb_dbg;
           $sformatf("[10] non-aligned CS# opens differ (%0d vs %0d) — no end-write off-boundary", cs_na_on, cs_na_off));
     check(wr_on === wr_off,
           $sformatf("[10] non-aligned WRITE CS# opens differ (%0d vs %0d) — no end-write off-boundary", wr_on, wr_off));
+
+    csr_wr(REG_DBG, TB_DBG_POR);
+
+    // Assert defuse-OFF invariance is intrinsic: every check 1-10 ran on stack 1 with REG_DBG[18]=0
+    // (POR default; none of the images above set bit18), so the round-4 controller path is provably
+    // inert for them. Confirm POR readback still has bit18 clear (belt-and-braces on the decode).
+    csr_rd(REG_DBG, rb);
+    check(rb[18] === 1'b0, $sformatf("[inv] POR REG_DBG[18]=%0b — dbg_spray_defuse must default OFF", rb[18]));
+
+    // =============================================================================================
+    // CHECK 11 — ROUND 4 interior-boundary SPRAY signature (WR_ORPHAN_MODEL, stack 2), defuse OFF.
+    // A 3-row contiguous stream [0xC00,0x1800) (PAT=3 addr-echo so sprayed values differ from the home
+    // they land on) with the FULL round-1/2/3 pipeline fix ON (prewin_drive n=4 + contig + endcw) but
+    // dbg_spray_defuse OFF. The write-open commits (fact 1) + contig reopen + endcw heal every home, yet
+    // each row-multiple close PARKS an orphan (fact 2) and the read-back fires them (fact 4): orphan @R_k
+    // sprays onto R_{k-1}'s home (fact 5). Two INTERIOR boundaries (0x1000, 0x1400) => 2 sprayed homes =>
+    // 8 residual errors, each carrying home_k's TAIL values. (The first boundary 0x1000's orphan sprays
+    // to [0xBFC,0xC00) — one row BELOW the stream — a dead zone, no error; fact 4.)
+    // =============================================================================================
+    csr_wr2(REG_PAT, 32'd3);                         // addr-echo: word(a) = a[15:0]
+    csr_wr2(REG_DBG, DBG_R4_OFF);
+    csr_rd2(REG_DBG, rb); check(rb === DBG_R4_OFF, $sformatf("[11] REG_DBG readback 0x%08x exp 0x%08x", rb, DBG_R4_OFF));
+    run2(1'b0, R4_LEN, R4_BASE, done, err);
+    for (int i = 0; i < 4; i++) belowoff[i] = model2.mem[R4_BASE - ADDR_WIDTH'(4) + ADDR_WIDTH'(i)];
+    $display("-- [11] 3-row stream, defuse OFF: ERR=%0d (expect 8 = 2 interior homes sprayed x4)", err);
+    check(done, "[11] defuse-OFF run did not complete");
+    check(err === 32'd8,
+          $sformatf("[11] defuse-OFF ERR=%0d exp 8 — interior-boundary spray signature", err));
+    // Concrete signature: home 0x1400 (5120) sprays its tail [5116..5119] onto [0x0FFC,0x1000); home
+    // 0x1800 (6144) sprays its tail [6140..6143] onto [0x13FC,0x1400). So home_{k-1} carries home_k's tail.
+    check(model2.mem[32'd4092] === 16'd5116,
+          $sformatf("[11] [0x0FFC]=0x%04x exp 0x%04x (5120's tail sprayed onto 0x1000's home)", model2.mem[32'd4092], 16'd5116));
+    check(model2.mem[32'd5116] === 16'd6140,
+          $sformatf("[11] [0x13FC]=0x%04x exp 0x%04x (6144's tail sprayed onto 0x1400's home)", model2.mem[32'd5116], 16'd6140));
+
+    // =============================================================================================
+    // CHECK 12 — ROUND 4 spray DEFUSE (dbg_spray_defuse), same stream. At each row-multiple close the
+    // controller interposes a defuse READ (deterministically fires the just-parked orphan onto the
+    // previous home NOW) + a masked heal-WRITE (re-drives that home's correct tail through the prewin
+    // window). So every interior spray is fired-then-recovered during the write; the read-back finds no
+    // orphans -> ZERO errors. The below-stream dead zone [0xBFC,0xC00) (the first boundary's spray target)
+    // is untouched by the defuse: identical to the defuse-OFF run (fact 4 — that spray is unavoidable and
+    // harmless, landing outside the stream in BOTH cases).
+    // =============================================================================================
+    csr_wr2(REG_DBG, DBG_R4_ON);
+    csr_rd2(REG_DBG, rb); check(rb === DBG_R4_ON, $sformatf("[12] REG_DBG readback 0x%08x exp 0x%08x", rb, DBG_R4_ON));
+    run2(1'b0, R4_LEN, R4_BASE, done, err);
+    for (int i = 0; i < 4; i++) belowon[i] = model2.mem[R4_BASE - ADDR_WIDTH'(4) + ADDR_WIDTH'(i)];
+    $display("-- [12] same stream, defuse ON: ERR=%0d (expect 0)", err);
+    check(done, "[12] defuse-ON run did not complete (defuse sequencer hang)");
+    check(err === 32'd0,
+          $sformatf("[12] defuse-ON ERR=%0d exp 0 — every interior spray fired-and-healed in place", err));
+    // The two previously-sprayed homes now read their OWN correct addr-echo data.
+    check(model2.mem[32'd4092] === 16'd4092,
+          $sformatf("[12] [0x0FFC]=0x%04x exp 0x0FFC — 0x1000's home no longer sprayed", model2.mem[32'd4092]));
+    check(model2.mem[32'd5116] === 16'd5116,
+          $sformatf("[12] [0x13FC]=0x%04x exp 0x13FC — 0x1400's home no longer sprayed", model2.mem[32'd5116]));
+    for (int i = 0; i < 4; i++)
+      check(belowon[i] === belowoff[i],
+            $sformatf("[12] below-stream [0x%03x] changed by defuse (0x%04x vs 0x%04x) — dead zone must match OFF",
+                      32'(R4_BASE) - 4 + i, belowon[i], belowoff[i]));
 
     csr_wr(REG_DBG, TB_DBG_POR);
     repeat (8) @(posedge clk);
