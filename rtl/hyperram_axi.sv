@@ -320,7 +320,21 @@ module hyperram_axi
     // debug taps (bring-up only; unused in the AXI top)
     .dbg_state      (),
     .dbg_rd_wptr    (),
-    .dbg_rd_rptr    ()
+    .dbg_rd_rptr    (),
+    // issue #13 live controller knobs — legacy tie-offs (A1: no port defaults). The AXI top drives
+    // no runtime instrumentation, so every knob is pinned at its POR-legacy value: the trim/latency
+    // seeds match this instance's ctrl elaboration constants (u_ctrl leaves WR_LAT_TRIM at its
+    // default 0; dbg_lat_clocks = LATENCY_CLOCKS), the rest are 0 = bit-identical to today.
+    .dbg_wr_lat_trim  (4'd0),
+    .dbg_lat_clocks   (4'(LATENCY_CLOCKS)),
+    .dbg_cr0_reprog   (1'b0),
+    .dbg_prewin_drive (1'b0),
+    .dbg_prewin_n     (3'd0),
+    .dbg_prewin_marker(1'b0),
+    .dbg_postwin_hold (1'b0),
+    .dbg_prewin_contig(1'b0),   // issue #13 round 2: legacy tie-off (bit-identical to today)
+    .dbg_end_cwrite    (1'b0),
+    .dbg_spray_defuse  (1'b0)    // issue #13 round 4: legacy tie-off
   );
 
   // -------------------------------------------------------------------------

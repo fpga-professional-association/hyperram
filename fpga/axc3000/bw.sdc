@@ -35,3 +35,15 @@ set_false_path -from [get_ports USER_BTN] -to [all_registers]
 
 # The user LEDs are slow status indicators; cut them from timing.
 set_false_path -to [get_ports {LED1 RLED GLED}]
+
+# ---- issue #13 REG_DBG / REG_PAT / REG_WRAP quasi-static knobs (default: NO extra constraint) --
+# The new dbg_*/wrap_en CSR bits fan out as single-cycle clk-domain SELECT lines into the
+# controller's per-state DQ/tail muxes (exactly like the cal_* read-eye knobs, which never needed a
+# special constraint). They are quasi-static — the host changes them only while STATUS.busy=0 — so a
+# late select cannot corrupt an in-flight burst, and they share the one `clk` domain (no CDC). Expect
+# setup closure at 175 with no change here.
+# FALLBACK (uncomment ONLY if the fit report shows a dbg_* SELECT path missing setup at 175):
+#   set_multicycle_path -setup 2 -from [get_registers {*r_dbg*}] -to [get_registers *]
+#   set_multicycle_path -hold  1 -from [get_registers {*r_dbg*}] -to [get_registers *]
+# Justified by the quasi-static contract. Do NOT multicycle/false_path the DATA regs (rp_word,
+# last_wr_word) — only these quasi-static SELECT lines out of r_dbg.

@@ -66,7 +66,11 @@ module tb_reg;
     .hb_ck (hb_ck), .hb_ck_n (hb_ck_n), .hb_cs_n (hb_cs_n), .hb_rst_n (hb_rst_n),
     .hb_dq_o (phy_dq_o), .hb_dq_oe (phy_dq_oe), .hb_dq_i (dq_line_dly),
     .hb_rwds_o (phy_rwds_o), .hb_rwds_oe (phy_rwds_oe), .hb_rwds_i (rwds_line_dly),
-    .init_done (init_done), .err_underrun (err_underrun), .dbg_bus ()
+    .init_done (init_done), .err_underrun (err_underrun), .dbg_bus (),
+    // issue #13: new hyperram_avalon debug bundle + wrap_en tied to per-instance legacy (A1).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0),
+    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .dbg_spray_defuse (1'b0), .wrap_en (1'b0)
   );
 
   hyperram_model #(
@@ -108,7 +112,11 @@ module tb_reg;
     .hb_ck (hb_ck2), .hb_ck_n (hb_ck_n2), .hb_cs_n (hb_cs_n2), .hb_rst_n (hb_rst_n2),
     .hb_dq_o (phy2_dq_o), .hb_dq_oe (phy2_dq_oe), .hb_dq_i (dq2_line_dly),
     .hb_rwds_o (phy2_rwds_o), .hb_rwds_oe (phy2_rwds_oe), .hb_rwds_i (rwds2_line_dly),
-    .init_done (init_done2), .err_underrun (err_underrun2), .dbg_bus ()
+    .init_done (init_done2), .err_underrun (err_underrun2), .dbg_bus (),
+    // issue #13: new hyperram_avalon debug bundle + wrap_en tied to per-instance legacy (A1).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0),
+    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .dbg_spray_defuse (1'b0), .wrap_en (1'b0)
   );
 
   hyperram_model #(

@@ -64,10 +64,10 @@ set m [lindex $paths 0]
 open_service master $m
 puts "Opened master service: $m"
 
-# ---- sanity: MAGIC ("HBWT") ----------------------------------------------
+# ---- sanity: MAGIC ("HBWT" legacy or "HBWU" issue-#13 instrumented) -------
 set magic [rd32 $m $MAGIC]
-puts [format "VERSION/MAGIC = 0x%08X (expect 0x48425754 \"HBWT\")" $magic]
-if {$magic != 0x48425754} {
+puts [format "VERSION/MAGIC = 0x%08X (expect 0x48425754 \"HBWT\" or 0x48425755 \"HBWU\")" $magic]
+if {$magic != 0x48425754 && $magic != 0x48425755} {
     puts "WARNING: unexpected MAGIC — wrong bitstream, address map, or JTAG target."
 }
 set bpw [rd32 $m $BYTES]

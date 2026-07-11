@@ -28,7 +28,7 @@ module tb_multiburst_generic;
   localparam int unsigned DATA_WIDTH     = 2 * DQ_WIDTH;           // 16
   localparam int unsigned ADDR_WIDTH     = HB_ADDR_WIDTH;          // 32
   localparam int unsigned LEN_WIDTH      = HB_LEN_WIDTH_DEFAULT;   // 16
-  localparam int unsigned CSR_ADDR_WIDTH = 3;
+  localparam int unsigned CSR_ADDR_WIDTH = 5;   // issue #13: 32-reg instrumented bench (avoids new-register aliasing)
   localparam int unsigned BURST_WORDS    = HB_BURST_WORDS_DEFAULT; // 16 (board Avalon burst size)
 
   // Number of EXTRA words the device over-streams after the master stops CK (silicon CK-stop pipeline
@@ -126,7 +126,11 @@ module tb_multiburst_generic;
     .m_readdatavalid (av_readdatavalid),
     .m_waitrequest   (av_waitrequest),
     // REG_CAL outputs unused here — u_hyperram's cal is tied to constants below (empty = PINCONNECTEMPTY)
-    .cal_capture_phase (), .cal_preamble_skip (), .cal_rx_tap (), .cal_pair_skew ()
+    .cal_capture_phase (), .cal_preamble_skip (), .cal_rx_tap (), .cal_pair_skew (),
+    // issue #13: new bench debug-bundle outputs left dangling here (u_hyperram's dbg inputs are tied
+    // off to legacy constants independently) — empty = PINCONNECTEMPTY, not PINMISSING.
+    .dbg_wr_lat_trim (), .dbg_lat_clocks (), .dbg_cr0_reprog (), .dbg_prewin_drive (),
+    .dbg_prewin_n (), .dbg_prewin_marker (), .dbg_postwin_hold (), .dbg_ck_stretch_off (), .dbg_prewin_contig (), .dbg_end_cwrite (), .dbg_spray_defuse (), .wrap_en ()
   );
 
   hyperram_avalon #(
@@ -159,7 +163,11 @@ module tb_multiburst_generic;
     .hb_ck (hb_ck), .hb_ck_n (hb_ck_n), .hb_cs_n (hb_cs_n), .hb_rst_n (hb_rst_n),
     .hb_dq_o (phy_dq_o), .hb_dq_oe (phy_dq_oe), .hb_dq_i (dq_line_dly),
     .hb_rwds_o (phy_rwds_o), .hb_rwds_oe (phy_rwds_oe), .hb_rwds_i (rwds_line_dly),
-    .init_done (init_done), .err_underrun (), .dbg_bus ()
+    .init_done (init_done), .err_underrun (), .dbg_bus (),
+    // issue #13: new hyperram_avalon debug bundle + wrap_en tied to per-instance legacy (A1).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0),
+    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .dbg_spray_defuse (1'b0), .wrap_en (1'b0)
   );
 
   // --------------------------------------------------------------------

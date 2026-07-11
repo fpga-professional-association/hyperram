@@ -38,8 +38,8 @@ puts "Opened master service: $m"
 
 # ---- sanity: bw_test MAGIC --------------------------------------------------
 set magic [rd32 $m $BW_MAGIC]
-puts [format "BW MAGIC      = 0x%08X (expect 0x48425754 \"HBWT\")" $magic]
-if {$magic != 0x48425754} {
+puts [format "BW MAGIC      = 0x%08X (expect 0x48425754 \"HBWT\" or 0x48425755 \"HBWU\")" $magic]
+if {$magic != 0x48425754 && $magic != 0x48425755} {
     puts "WARNING: unexpected MAGIC — wrong bitstream, address map, or JTAG target."
 }
 
@@ -73,11 +73,14 @@ if {!$done} {
 puts [format "CAPTURE DONE: fill = %d samples @ 100 MHz clk2x (10 ns/sample)" $fill]
 
 # ---- sample word bit-field key (decode header) --------------------------------
-puts "FIELD KEY (per sample, HI:LO = sample\[63:0\]):"
-puts "  LO\[0\]=hb_cs_n  LO\[1\]=hb_ck  LO\[2\]=hb_dq_oe  LO\[10:3\]=hb_dq_o\[7:0\]  LO\[18:11\]=hb_dq_i\[7:0\]"
-puts "  LO\[19\]=hb_rwds_oe  LO\[20\]=hb_rwds_o  LO\[21\]=hb_rwds_i"
-puts "  LO\[22\]=av_read  LO\[23\]=av_write  LO\[24\]=av_waitrequest  LO\[25\]=av_readdatavalid"
-puts "  LO\[31:26\]=0  HI\[31:0\]=0 (pad)"
+# issue #13: capture probes now tap the FABRIC side (phy_*_w) and DQ is 16-bit, so DATA_HI carries
+# real data and hb_dq_i STRADDLES bit 32 (LO[31:19]=hb_dq_i[12:0], HI[2:0]=hb_dq_i[15:13]).
+puts "FIELD KEY (per sample, HI:LO = sample\[63:0\]; issue #13 fabric probes, 16-bit DQ):"
+puts "  LO\[0\]=hb_cs_n  LO\[1\]=hb_ck(phy_ck_en)  LO\[2\]=hb_dq_oe  LO\[18:3\]=hb_dq_o\[15:0\]  LO\[31:19\]=hb_dq_i\[12:0\]"
+puts "  HI\[2:0\]=hb_dq_i\[15:13\]  HI\[3\]=hb_rwds_oe  HI\[4\]=hb_rwds_o(1st-phase mask)  HI\[5\]=hb_rwds_i"
+puts "  HI\[6\]=av_read  HI\[7\]=av_write  HI\[8\]=av_waitrequest  HI\[9\]=av_readdatavalid"
+puts "  HI\[25:10\]=av_readdata\[15:0\]  HI\[26\]=av_readdatavalid(dbg)  HI\[31:27\]=0"
+puts "  (full hb_dq_i = LO\[31:19\] | (HI\[2:0\] << 13))"
 
 # ---- dump every sample --------------------------------------------------------
 for {set i 0} {$i < $fill} {incr i} {

@@ -244,7 +244,48 @@ module hyperbus_ctrl
     // -- DEBUG taps (bring-up only; leave unconnected in normal instantiations) --
     output logic [3:0]              dbg_state,      // FSM state (state_e ordinal)
     output logic [5:0]              dbg_rd_wptr,    // (repurposed) rem_left[5:0]  — words remaining in burst
-    output logic [5:0]              dbg_rd_rptr     // (repurposed) seg_left[5:0]  — words remaining in segment
+    output logic [5:0]              dbg_rd_rptr,    // (repurposed) seg_left[5:0]  — words remaining in segment
+
+    // -- issue #13 live controller knobs (bench REG_DBG). Quasi-static, driven from the SAME `clk`
+    //    domain as bench+PHY (host changes them only while STATUS.busy=0) so they are used DIRECTLY —
+    //    NO synchronizer (contrast cal_*'s clk->clk90 crossing). Out of reset the bench holds
+    //    dbg_wr_lat_trim/dbg_lat_clocks at the WR_LAT_TRIM/LATENCY_CLOCKS parameter seeds, so behavior
+    //    is bit-identical to the elaboration constants until the host pokes. NO port default values
+    //    (Verilator rejects them) — every instantiation ties these to per-instance legacy values. --
+    input  logic [3:0]              dbg_wr_lat_trim,  // overrides WR_LAT_TRIM (2x write-latency add; POR 3)
+    input  logic [3:0]              dbg_lat_clocks,   // overrides LATENCY_CLOCKS (both latency seeds; 6/7)
+    input  logic                    dbg_cr0_reprog,   // 1-clk pulse: relaunch init CR0 write w/ new code
+    input  logic                    dbg_prewin_drive, // heal probe: drive [B-4..B-1] in the pre-data window
+    input  logic [2:0]              dbg_prewin_n,     // # trailing latency CK to drive (0..7)
+    input  logic                    dbg_prewin_marker,// 1 = drive 0xA5xx marker instead of shadow data
+    input  logic                    dbg_postwin_hold, // hold last data word 4 CK into the tail (Law-3 analog)
+    // issue #13 ROUND 2 — two runtime knobs (REG_DBG[16]/[17]; POR 0 = bit-identical to round 1):
+    input  logic                    dbg_prewin_contig,// A: keep shadow_full at a command-edge CONTIGUOUS
+                                                       //    ST_IDLE write reopen so the prewin heal fires
+                                                       //    there too (the 2048->8 / 4096/256->16 losses)
+    input  logic                    dbg_end_cwrite,   // B (ROUND 3): on a memory-write stream that ends
+                                                       //    EXACTLY on a BURST_BOUNDARY_WORDS row multiple,
+                                                       //    self-issue ONE internal FULLY-MASKED 4-word linear
+                                                       //    WRITE at the end. Its write CS# open fires the
+                                                       //    device commit pipe (silicon fact 1); with
+                                                       //    dbg_prewin_drive the prewin tail drives [end-4..
+                                                       //    end-1] into that commit -> the orphaned tail heals
+                                                       //    at [end-4,end). Supersedes round 2's end-READ,
+                                                       //    which silicon fact (4) falsified (a read sprays the
+                                                       //    orphan ONE ROW LOW, never home)
+    input  logic                    dbg_spray_defuse  // ROUND 4 (REG_DBG[18]): per-boundary spray DEFUSE.
+                                                       //    At every boundary-aligned memory-write close, hold a
+                                                       //    one-deep boundary-tail history {addr, last-4 words}.
+                                                       //    When the PREVIOUS boundary sits exactly ONE ROW below
+                                                       //    the current close (the only case a later orphan spray
+                                                       //    can hit healed data — silicon fact 5), interpose two
+                                                       //    internal micro-ops: (a) a 1-word READ at close_addr
+                                                       //    that DETERMINISTICALLY fires the just-parked orphan's
+                                                       //    spray onto the previous home NOW, then (b) a masked
+                                                       //    4-beat heal-WRITE at that previous home whose prewin
+                                                       //    window re-drives its correct [B-4..B-1] tail. Kills
+                                                       //    the residual interior-boundary sprays (2048->4,
+                                                       //    4096/256->12). POR 0 = bit-identical to round 3.
 );
 
   // ------------------------------------------------------------------------
@@ -354,6 +395,8 @@ module hyperbus_ctrl
   logic                    lat_extra_done; // the additional (2x) latency count has been inserted
   logic                    doing_init;   // current transaction is an internal CR0/CR1 init write
   logic                    init_cr1;     // A3: the internal init write in flight is CR1 (else CR0)
+  logic                    doing_cr0_reprog; // issue #13: the internal init write in flight is a RUNTIME
+                                             //   CR0 reprogram (dbg_lat_clocks code), not the POR CR0/CR1
   logic                    in_dpd;       // A1: device believed to be in Deep-Power-Down (needs wake)
 
   // -- Write-commit interpose (WR_COMMIT_READ). A memory-write burst's final word is only committed
@@ -363,8 +406,44 @@ module hyperbus_ctrl
   //    and still needs committing; `commit_resume` distinguishes an intra-command split (restore the
   //    shadow write context afterwards) from a deferred write->write interpose (return to idle). --
   logic                    doing_commit;
+  // -- issue #13 ROUND 3, Feature B (dbg_end_cwrite). The internal END-COMMIT masked WRITE in flight.
+  //    Mirrors doing_commit's "internal, self-issued transaction" role but for a WRITE: it opens a
+  //    genuine write CS# at the row-aligned stream end so the device's commit pipe fires (silicon fact
+  //    1), and — with dbg_prewin_drive — the prewin tail drives the orphaned [end-4..end-1] words into
+  //    that commit window, healing them at their home [end-4,end). It must be INVISIBLE to controller
+  //    bookkeeping: no shadow capture, no last_wr_addr advance, no postwin/coalesce/commit/DPD/read-FIFO
+  //    disturbance, and — critically — its own ST_RECOVER completion must NOT re-satisfy the launch
+  //    predicate (last_wr_addr is left unadvanced, so end_cwrite_aligned stays TRUE), so it self-clears
+  //    and returns to idle rather than re-triggering forever. --
+  logic                    doing_cwrite;
   logic                    wr_pending_commit;
   logic                    commit_resume;
+
+  // -- issue #13 ROUND 4 (dbg_spray_defuse) -----------------------------------------------------------
+  // ONE-DEEP boundary-tail history + a per-boundary spray-DEFUSE micro-op sequencer. `bt_*` records the
+  // MOST-RECENT boundary-aligned memory-write close {addr, its last 4 real data words} — these are the
+  // rp_word shadow (frozen during internal writes since round 3) captured at the close. When the NEXT
+  // boundary close finds that history exactly one row below it (bt_addr == close_addr - BURST_BOUNDARY_
+  // WORDS), the just-parked orphan-at-close_addr WILL spray onto bt_addr's (already-healed) home (fact
+  // 5), so the sequencer neutralizes it in place: a defuse-READ at close_addr fires that spray NOW, then
+  // a masked heal-WRITE at bt_addr re-drives bt_addr's correct tail via the prewin window. doing_dfread/
+  // doing_dfwrite mark these internal transactions (aliased with doing_commit/doing_cwrite through
+  // int_read/int_write so every round-3 guarantee — discard read data, freeze rp_word/last_wr_addr, no
+  // underrun/postwin/coalesce, cmd_ready blocked — holds). df_active defers the normal post-close action
+  // (chop reopen for an interior close; ST_IDLE for the final close) until the sequence drains.
+  logic                    bt_valid;
+  logic [ADDR_WIDTH-1:0]   bt_addr;
+  logic [DATA_WIDTH-1:0]   bt_word [WR_REPLAY_WORDS];
+  logic                    doing_dfread;   // internal defuse READ in flight (fires the orphan; discarded)
+  logic                    doing_dfwrite;  // internal defuse heal-WRITE in flight (masked; prewin=df_heal_word)
+  logic                    df_active;      // a defuse sequence is running -> defer the normal post-close action
+  logic                    df_final;       // sequence is at the FINAL stream close (-> ST_IDLE, endcw first)
+  logic [ADDR_WIDTH-1:0]   df_read_addr;   // close_addr: defuse-read + (final) endcw target
+  logic [ADDR_WIDTH-1:0]   df_heal_addr;   // bt_addr snapshot: heal-write target (= R_{k-1} home base)
+  logic [DATA_WIDTH-1:0]   df_heal_word [WR_REPLAY_WORDS];  // bt_word snapshot: the heal payload
+  logic [ADDR_WIDTH-1:0]   df_reopen_addr; // saved chop-reopen context (interior close)
+  logic [LEN_WIDTH-1:0]    df_reopen_rem;
+
   logic [ADDR_WIDTH-1:0]   last_wr_addr; // last WORD address written in the most recent write segment
   logic [ADDR_WIDTH-1:0]   wr_seg_base;  // base WORD address of the most recently CLOSED write segment
   logic [LEN_WIDTH-1:0]    wr_seg_len;   // word length of the most recently CLOSED write segment
@@ -408,6 +487,18 @@ module hyperbus_ctrl
   logic [LEN_WIDTH-1:0]    replay_real;   // real (shadow-sourced) beats within replay_left (mask lead)
   logic [RP_AW-1:0]        replay_idx;
 
+  // -- issue #13 heal/hold state ---------------------------------------------------------------------
+  //  shadow_full  : sticky "rp_word holds a full WR_REPLAY_WORDS-deep tail [B-4..B-1]". Set when rp_cnt
+  //                 saturates in ST_WRITE; cleared ONLY at a genuine ST_IDLE write CS# open and at reset
+  //                 (NOT in ST_RECOVER) — so an internal row-chop reopen (ST_RECOVER->ST_CS, bypassing
+  //                 ST_IDLE) still sees the prior segment's tail even though rp_cnt is reset there. That
+  //                 is what makes dbg_prewin_drive a HEAL for the contiguous row chops (the L-D target).
+  //  last_wr_word : the final data word of the FINAL segment, replayed onto DQ through the extended tail
+  //                 when dbg_postwin_hold (Law-3 analog).  postwin_active : that hold is armed.
+  logic                    shadow_full;
+  logic [DATA_WIDTH-1:0]   last_wr_word;
+  logic                    postwin_active;
+
   // read holding FIFO ({last, data})
   logic [DATA_WIDTH:0]     rd_fifo [RD_FIFO_DEPTH];
   logic [RD_AW:0]          rd_wptr, rd_rptr;
@@ -424,10 +515,21 @@ module hyperbus_ctrl
   wire                     commit_gate = WR_COMMIT_READ & wr_pending_commit &
                                          cmd_valid & ~cmd_read & ~cmd_reg;
 
-  // write-data source: internal CR0/CR1 image during init (A3: CR1 when init_cr1), else native write.
-  wire [DATA_WIDTH-1:0]    wsrc_data  = doing_init ? (init_cr1 ? DATA_WIDTH'(INIT_CR1)
-                                                               : DATA_WIDTH'(INIT_CR0))
-                                                   : wr_data;
+  // issue #13 runtime CR0 image: the POR INIT_CR0 with its latency code (CR0[7:4]) replaced by the
+  // code synthesized from the LIVE dbg_lat_clocks, written by the dbg_cr0_reprog strobe (§2.2). Pure
+  // combinational — hb_clocks_to_latency_code is a `function automatic` LUT, evaluable on live inputs
+  // (no pkg edit needed). dbg_lat_clocks=6 => code 0001 => cr0_rt == INIT_CR0 (POR-legacy).
+  wire [DATA_WIDTH-1:0]    cr0_rt     = {INIT_CR0[15:8],
+                                         hb_clocks_to_latency_code(32'(dbg_lat_clocks)),
+                                         INIT_CR0[3:0]};
+
+  // write-data source: internal CR0/CR1 image during init (A3: CR1 when init_cr1; issue #13: the live
+  // cr0_rt when doing_cr0_reprog), else native write.
+  wire [DATA_WIDTH-1:0]    wsrc_data  = doing_init
+                                        ? (doing_cr0_reprog ? cr0_rt
+                                           : (init_cr1 ? DATA_WIDTH'(INIT_CR1)
+                                                       : DATA_WIDTH'(INIT_CR0)))
+                                        : wr_data;
   wire [STRB_WIDTH-1:0]    wsrc_strb  = doing_init ? {STRB_WIDTH{1'b1}} : wr_strb;
   wire                     wsrc_valid = doing_init ? 1'b1 : wr_valid;
 
@@ -535,8 +637,9 @@ module hyperbus_ctrl
   // tracked hw-cap budget for the CURRENTLY OPEN CS# burst (see its declaration) — shows room for at
   // least one more word after the one this cycle is sending. seg_cap_left is read here BEFORE this
   // cycle's own decrement takes effect, so ">1" (not "!=0") is the correct "room after this word" test.
-  wire coalesce_try = WR_COALESCE & ~cur_read & ~cur_reg & ~cur_wrap & ~doing_init & ~doing_commit &
-                      (seg_cap_left > LEN_WIDTH'(1));
+  wire coalesce_try = WR_COALESCE & ~cur_read & ~cur_reg & ~cur_wrap & ~doing_init & ~int_read &
+                      ~int_write & (seg_cap_left > LEN_WIDTH'(1));   // #13 R3/R4: never coalesce onto an
+                                                                     //   internal end-commit / defuse write
 
   // A new, contiguous (picks up exactly where the closed segment left off), linear, memory-space
   // WRITE command, with hw-cap room left to accept at least one of its words. NOTE: unlike the write-
@@ -629,6 +732,64 @@ module hyperbus_ctrl
   wire [ADDR_WIDTH-1:0] acc_base    = cmd_addr - ADDR_WIDTH'(acc_pfx);
   wire [LEN_WIDTH-1:0]  acc_seg     = acc_pfx + acc_real;
 
+  // -- Pre-window heal probe (issue #13, dbg_prewin_drive) combinational helpers ---------------------
+  // prewin_widx = min(cnt,3), the word index into the replay shadow for the pre-data drive window: the
+  // LAST latency CK (cnt=0) emits rp_word[0] = the segment's NEWEST tail word (B-1); cnt=1 -> B-2;
+  // cnt=2 -> B-3; every earlier CK (cnt>=3) holds rp_word[3] = B-4. So the 4 CK before the first data
+  // beat carry B-4,B-3,B-2,B-1 in order (oldest-first) — exactly the [B-4..B-1] the device wounds,
+  // turning the wound into a heal. prewin_ok gates shadow-drive to a FULL shadow (suppressed on a run's
+  // first segment => legacy idle bus); marker mode is content-agnostic and always drives (attribution).
+  wire [RP_AW-1:0]      prewin_widx = (cnt >= 32'd3) ? RP_AW'(3) : cnt[RP_AW-1:0];
+  wire                  prewin_ok   = dbg_prewin_marker | shadow_full;
+
+  // #13 R4 internal-transaction aliases. doing_dfread is an internal READ (discard, like doing_commit);
+  // doing_dfwrite an internal masked WRITE (like doing_cwrite). Aliasing every behavioural site through
+  // these keeps dbg_spray_defuse=0 bit-identical (both df flags are then permanently 0 => alias==base).
+  wire                  int_read    = doing_commit | doing_dfread;
+  wire                  int_write   = doing_cwrite | doing_dfwrite;
+  // #13 R4 prewin source/gate MUX for the defuse heal-write: a doing_dfwrite drives its OWN 4-word heal
+  // payload (df_heal_word, = bt_addr's correct tail) across the full [B-4,B) window regardless of the
+  // dbg_prewin_* knobs, so the heal fires deterministically. All three collapse to the round-3 values
+  // when doing_dfwrite=0 (OFF-invariant): the endcw/normal prewin still sources rp_word / the marker.
+  wire                  prewin_drive_eff = dbg_prewin_drive | doing_dfwrite;
+  wire [4:0]            prewin_n_eff     = doing_dfwrite ? 5'(WR_REPLAY_WORDS) : {2'b0, dbg_prewin_n};
+  wire                  prewin_ok_eff    = doing_dfwrite | prewin_ok;
+  wire [DATA_WIDTH-1:0] prewin_data      = doing_dfwrite ? df_heal_word[prewin_widx]
+                                         : (dbg_prewin_marker ? (16'hA500 | 16'(prewin_widx))
+                                                              : rp_word[prewin_widx]);
+
+  // Post-window hold (issue #13, dbg_postwin_hold) tail-dwell seed: the ST_TAIL dwell stretches to 4 CK
+  // (32'd3 => 4 cycles) when the FINAL segment of a memory write closes, so last_wr_word can be held on
+  // DQ into the tail (CK not extended). The select matches the postwin_active arm in ST_WRITE below.
+  wire [31:0]           postwin_seed = (dbg_postwin_hold & ~cur_read & ~cur_reg & ~doing_init &
+                                        ~int_write &      // #13 R3/R4: internal masked writes never hold
+                                        (rem_left == LEN_WIDTH'(1))) ? 32'd3 : 32'(TAIL_CYCLES - 1);
+
+  // -- issue #13 ROUND 3, Feature B (dbg_end_cwrite) end-commit-WRITE helpers ------------------------
+  // The write-stream END = one past the last real memory-write beat = last_wr_addr + 1 (the SAME tracker
+  // Feature A compares against). Silicon fact (2): a write burst whose end sits exactly on a
+  // BURST_BOUNDARY_WORDS row multiple fails to commit its last 4 words at home — they stay PENDING (an
+  // orphan) in the device's 4-word pipe. Fact (3): the NEXT write open consumes that orphan via the
+  // commit-pipe sampling (fact 1), so it is safe to interpose one. Fact (4): a READ instead sprays the
+  // orphan ONE ROW LOW ([home-1024,...)) and NEVER puts it home — which is why the round-2 end-READ was
+  // falsified. END_CWRITE_WORDS = the device pipe depth (4). end_cwrite_aligned qualifies the orphan
+  // case; BURST_BOUNDARY_WORDS==0 makes it always-false (feature inert), so bit17 alone never fires it.
+  localparam int unsigned END_CWRITE_WORDS = 4;                          // device commit-pipe depth
+  wire [ADDR_WIDTH-1:0] end_cwrite_addr    = last_wr_addr + ADDR_WIDTH'(1);
+  wire                  end_cwrite_aligned = (BURST_BOUNDARY_WORDS != 0) &&
+                                             ((32'(end_cwrite_addr) % BURST_BOUNDARY_WORDS) == 32'd0);
+
+  // -- issue #13 ROUND 4 (dbg_spray_defuse) boundary-close predicates -------------------------------
+  // A REAL user memory-write CS# is closing (no internal/init transaction in flight). end_cwrite_addr =
+  // the close/home address; end_cwrite_aligned = it sits on a BURST_BOUNDARY_WORDS row multiple.
+  wire                  real_wr_close = ~cur_read & ~cur_reg & ~doing_init & ~doing_commit & ~doing_cwrite
+                                        & ~doing_dfread & ~doing_dfwrite;
+  // Arm the defuse when the PREVIOUS boundary (bt_addr) is exactly one row below this close: that is the
+  // only geometry where the orphan just parked at this close would later spray onto already-healed data
+  // (fact 5). BURST_BOUNDARY_WORDS==0 makes end_cwrite_aligned false => df_arm false => feature inert.
+  wire                  df_arm = dbg_spray_defuse & real_wr_close & end_cwrite_aligned & bt_valid &
+                                 (bt_addr == end_cwrite_addr - ADDR_WIDTH'(BURST_BOUNDARY_WORDS));
+
   // ------------------------------------------------------------------------
   // Read data-out (FIFO front)
   // ------------------------------------------------------------------------
@@ -655,7 +816,10 @@ module hyperbus_ctrl
     unique case (state)
       ST_RESET: phy_rst_n = 1'b0;
 
-      ST_IDLE:  cmd_ready = init_done & rd_fifo_empty & ~commit_gate;
+      // A3 (issue #13): when a CR0-reprogram pulse is being consumed this cycle, do NOT complete a
+      // command handshake — gate cmd_ready so the launch (ST_IDLE sequential) and a cmd accept are
+      // mutually exclusive. ~dbg_cr0_reprog is 1 in legacy, so cmd_ready is unchanged when idle.
+      ST_IDLE:  cmd_ready = init_done & rd_fifo_empty & ~commit_gate & ~dbg_cr0_reprog;
 
       ST_CS: begin
         phy_cs_n  = 1'b0;
@@ -680,6 +844,20 @@ module hyperbus_ctrl
         end else begin
           phy_rwds_oe = 1'b1;             // latency write: master drives RWDS Low preamble (mask)
           phy_rwds_o  = 2'b00;
+          // issue #13 pre-window HEAL probe: in the LAST dbg_prewin_n CK of the SECOND (2x) latency
+          // count, drive DQ with the just-closed segment's tail [B-4..B-1] (replay shadow, oldest
+          // first — prewin_widx) instead of leaving the bus idle; or an 0xA5xx marker for content
+          // attribution. The RWDS masked-Low preamble above is UNTOUCHED. lat_extra_done restricts
+          // this to the second count only, long after CA (ST_CS/ST_CA), so OE is never re-asserted
+          // during the CA phase and there is no bus gap at cnt=0 -> ST_WRITE (OE stays 1). With
+          // dbg_prewin_drive=0 the branch is inert (phy_dq_oe keeps its ST_LAT default 0) = today.
+          // #13 R4: prewin_*_eff collapse to the round-3 dbg_prewin_* behaviour unless a defuse heal-
+          // write (doing_dfwrite) is in flight, in which case its df_heal_word tail is driven across the
+          // full window (see the prewin MUX helpers).
+          if (prewin_drive_eff && lat_extra_done && (cnt < 32'(prewin_n_eff)) && prewin_ok_eff) begin
+            phy_dq_oe = 1'b1;
+            phy_dq_o  = prewin_data;
+          end
         end
         busy = ~doing_init;
       end
@@ -698,13 +876,20 @@ module hyperbus_ctrl
         // WR_CHOP_REPLAY: a replayed beat is sourced from the replay shadow — the front-end's
         // wr channel is NOT consumed (wr_ready stays Low) and its current word is left untouched
         // for the first post-replay beat.
-        phy_dq_o  = replay_beat ? rp_data_sel : wsrc_data;
+        // issue #13 ROUND 3 (B): the END-COMMIT masked write (doing_cwrite) drives don't-care DQ (0)
+        // — its heal payload rode the ST_LAT prewin window, not these beats — and holds RWDS FULLY
+        // MASKED (11) every beat so nothing user-visible lands at [end,end+4). It never consumes the
+        // front-end (wr_ready below is gated) and an all-masked internal beat is not an underrun.
+        // #13 R4: an internal masked WRITE (int_write = end-commit OR defuse heal) drives don't-care DQ
+        // (its heal payload rode the ST_LAT prewin window) and RWDS fully masked (11) every beat.
+        phy_dq_o  = int_write ? '0 : (replay_beat ? rp_data_sel : wsrc_data);
         if (!zlw) begin
           phy_rwds_oe = 1'b1;            // RWDS = byte mask (High = masked); underrun => mask both
-          phy_rwds_o  = replay_beat ? {~rp_strb_sel[1], ~rp_strb_sel[0]}
-                                    : (wsrc_valid ? {~wsrc_strb[1], ~wsrc_strb[0]} : 2'b11);
+          phy_rwds_o  = int_write ? 2'b11
+                      : (replay_beat  ? {~rp_strb_sel[1], ~rp_strb_sel[0]}
+                                      : (wsrc_valid ? {~wsrc_strb[1], ~wsrc_strb[0]} : 2'b11));
         end
-        if (wsrc_valid & ~doing_init & ~replay_beat) wr_ready = 1'b1;
+        if (wsrc_valid & ~doing_init & ~replay_beat & ~int_write) wr_ready = 1'b1;
         busy = ~doing_init;
       end
 
@@ -729,7 +914,17 @@ module hyperbus_ctrl
         busy        = ~doing_init;
       end
 
-      ST_TAIL:     busy = ~doing_init;
+      ST_TAIL: begin
+        busy = ~doing_init;
+        // issue #13 post-window HOLD (Law-3 analog): keep the FINAL data word on DQ through the
+        // extended tail dwell (4 CK; see postwin_seed) before CS# raises — the write end-of-burst
+        // counterpart of the pre-window heal. phy_ck_en stays 0 (default) so CK is NOT extended; CS#
+        // is forced Low for ST_TAIL just below (:phy_cs_n). Inert when postwin_active=0 (dbg off).
+        if (postwin_active) begin
+          phy_dq_oe = 1'b1;
+          phy_dq_o  = last_wr_word;
+        end
+      end
       ST_RECOVER: begin
         busy = ~doing_init;
         // WR_CHOP_PAUSE_CK (2026-07-09 silicon experiment): keep CK toggling through the post-WRITE
@@ -784,6 +979,82 @@ module hyperbus_ctrl
     state        <= ST_CS;
   endtask
 
+  // issue #13 ROUND 3, Feature B (dbg_end_cwrite): launch the internal END-COMMIT masked WRITE. A
+  // GENUINE write CS# open (CA write/memory/linear at `base`=stream end) so the device's commit pipe
+  // fires (silicon fact 1); its 4 data beats are FULLY MASKED in ST_WRITE (doing_cwrite forces RWDS=11
+  // there — nothing user-visible reaches [end,end+4), fact 1's commit ignores masking anyway). The heal
+  // payload is NOT this write's data: with dbg_prewin_drive on, the prewin emission in ST_LAT drives the
+  // preserved shadow [end-4..end-1] into the commit window (shadow_full survived the ST_RECOVER launch —
+  // it is cleared only at a genuine ST_IDLE write open — so prewin_ok holds here for the internal
+  // context too). doing_cwrite marks the transaction internal so ST_WRITE/ST_RECOVER suppress every
+  // side effect (shadow capture, last_wr_addr advance, underrun, wr_ready, postwin, wr_pending_commit,
+  // and the re-launch predicate). rp_cnt reset = fresh CS# word count (shadow_full/rp_word preserved as
+  // the heal source). This is E5's proven fix shape (a contiguous 4-word write at B=end heals) made
+  // self-contained inside the controller.
+  task automatic launch_end_cwrite(input logic [ADDR_WIDTH-1:0] base);
+    doing_cwrite <= 1'b1;
+    cur_read     <= 1'b0;
+    cur_reg      <= 1'b0;
+    cur_wrap     <= 1'b0;
+    cur_addr     <= base;
+    rem_left     <= LEN_WIDTH'(END_CWRITE_WORDS);
+    seg_count    <= LEN_WIDTH'(END_CWRITE_WORDS);
+    seg_left     <= LEN_WIDTH'(END_CWRITE_WORDS);
+    seg_cap_left <= hw_cap(base);                          // its own CS# hw-cap budget
+    ca_reg       <= hb_pack_ca(1'b0, 1'b0, 1'b1, base);    // write, memory, linear
+    rwds_hi      <= 1'b0;
+    ca_idx       <= 2'd0;
+    rp_cnt       <= '0;              // fresh CS#: nothing sent in it yet (shadow_full preserved = heal)
+    replay_left  <= '0;
+    state        <= ST_CS;
+  endtask
+
+  // issue #13 ROUND 4 (dbg_spray_defuse): launch the internal defuse READ — a short linear memory read
+  // at `base`=close_addr whose recovered data is DISCARDED (doing_dfread, aliased into int_read). Its
+  // only job is the read CS# OPEN: on silicon (and in WR_ORPHAN_MODEL) the FIRST read after parking
+  // fires every orphan's spray, so this deterministically drives the just-parked orphan-at-close_addr
+  // onto the previous boundary's home NOW (where the following heal-write re-covers it), instead of
+  // leaving it to strike at the user's eventual read. END_CWRITE_WORDS words keeps the read path (>=2)
+  // happy; the words read are thrown away.
+  task automatic launch_defuse_read(input logic [ADDR_WIDTH-1:0] base);
+    doing_dfread <= 1'b1;
+    cur_read     <= 1'b1;
+    cur_reg      <= 1'b0;
+    cur_wrap     <= 1'b0;
+    cur_addr     <= base;
+    rem_left     <= LEN_WIDTH'(END_CWRITE_WORDS);
+    seg_count    <= LEN_WIDTH'(END_CWRITE_WORDS);
+    seg_left     <= LEN_WIDTH'(END_CWRITE_WORDS);
+    ca_reg       <= hb_pack_ca(1'b1, 1'b0, 1'b1, base);   // read, memory, linear
+    rwds_hi      <= 1'b0;
+    ca_idx       <= 2'd0;
+    state        <= ST_CS;
+  endtask
+
+  // issue #13 ROUND 4 (dbg_spray_defuse): launch the internal defuse HEAL-WRITE — a FULLY-MASKED 4-word
+  // linear write at `base`=bt_addr (the previous boundary's home). doing_dfwrite (aliased into int_write)
+  // masks its data beats (nothing lands at [base,base+4)) exactly like the end-commit write; the healing
+  // payload rides the ST_LAT prewin window, sourced from df_heal_word (bt_addr's correct [B-4..B-1] tail)
+  // via the prewin MUX — so the write CS# open commits the correct home tail (silicon fact 1), re-healing
+  // the words the defuse-read just sprayed. rp_word is left frozen (prewin_data selects df_heal_word).
+  task automatic launch_defuse_write(input logic [ADDR_WIDTH-1:0] base);
+    doing_dfwrite <= 1'b1;
+    cur_read      <= 1'b0;
+    cur_reg       <= 1'b0;
+    cur_wrap      <= 1'b0;
+    cur_addr      <= base;
+    rem_left      <= LEN_WIDTH'(END_CWRITE_WORDS);
+    seg_count     <= LEN_WIDTH'(END_CWRITE_WORDS);
+    seg_left      <= LEN_WIDTH'(END_CWRITE_WORDS);
+    seg_cap_left  <= hw_cap(base);
+    ca_reg        <= hb_pack_ca(1'b0, 1'b0, 1'b1, base);   // write, memory, linear
+    rwds_hi       <= 1'b0;
+    ca_idx        <= 2'd0;
+    rp_cnt        <= '0;
+    replay_left   <= '0;
+    state         <= ST_CS;
+  endtask
+
   // ------------------------------------------------------------------------
   // Sequential FSM + datapath state
   // ------------------------------------------------------------------------
@@ -801,10 +1072,25 @@ module hyperbus_ctrl
       init_done    <= 1'b0;
       doing_init   <= 1'b0;
       init_cr1     <= 1'b0;
+      doing_cr0_reprog <= 1'b0;
       in_dpd       <= 1'b0;
       doing_commit <= 1'b0;
+      doing_cwrite <= 1'b0;       // issue #13 ROUND 3 (B): end-commit masked write not in flight
       wr_pending_commit <= 1'b0;
       commit_resume     <= 1'b0;
+      // issue #13 ROUND 4 (dbg_spray_defuse) state
+      bt_valid      <= 1'b0;
+      bt_addr       <= '0;
+      for (int i = 0; i < int'(WR_REPLAY_WORDS); i++) bt_word[i] <= '0;
+      doing_dfread  <= 1'b0;
+      doing_dfwrite <= 1'b0;
+      df_active     <= 1'b0;
+      df_final      <= 1'b0;
+      df_read_addr  <= '0;
+      df_heal_addr  <= '0;
+      for (int i = 0; i < int'(WR_REPLAY_WORDS); i++) df_heal_word[i] <= '0;
+      df_reopen_addr <= '0;
+      df_reopen_rem  <= '0;
       last_wr_addr <= '0;
       wr_seg_base  <= '0;
       wr_seg_len   <= '0;
@@ -816,6 +1102,9 @@ module hyperbus_ctrl
       replay_left  <= '0;
       replay_real  <= '0;
       replay_idx   <= '0;
+      shadow_full     <= 1'b0;   // issue #13 heal/hold state
+      last_wr_word    <= '0;
+      postwin_active  <= 1'b0;
       cur_read     <= 1'b0;
       cur_reg      <= 1'b0;
       cur_wrap     <= 1'b0;
@@ -886,7 +1175,30 @@ module hyperbus_ctrl
           rd_wptr <= '0;
           rd_rptr <= '0;
           if (init_done & rd_fifo_empty) begin
-            if (commit_gate) begin
+            if (dbg_cr0_reprog & ~doing_init & ~doing_commit) begin
+              // issue #13 CR0-REPROGRAM launch (§2.2, A3): re-run the init CR0 write with the LIVE
+              // dbg_lat_clocks latency code (wsrc_data selects cr0_rt while doing_cr0_reprog). Reuses
+              // the init machinery — a zero-latency register write that flows
+              // ST_CS->ST_CA->ST_WRITE(1 word)->ST_TAIL->ST_RECOVER. Checked FIRST and cmd_ready is
+              // gated by ~dbg_cr0_reprog (above), so no command handshake completes this cycle: the
+              // reprogram and a cmd accept are mutually exclusive. dbg_cr0_reprog is a 1-cycle bench
+              // pulse (edge-detected there), so no ctrl-side edge detect is needed. Host contract:
+              // pulse only while STATUS.busy=0 (the pulse is lost if the ctrl is busy).
+              doing_init       <= 1'b1;
+              doing_cr0_reprog <= 1'b1;
+              init_cr1         <= 1'b0;
+              cur_read         <= 1'b0;
+              cur_reg          <= 1'b1;
+              cur_wrap         <= 1'b0;
+              cur_addr         <= HB_REG_CR0[ADDR_WIDTH-1:0];
+              rem_left         <= LEN_WIDTH'(1);
+              seg_left         <= LEN_WIDTH'(1);
+              seg_count        <= LEN_WIDTH'(1);
+              ca_reg           <= hb_pack_ca(1'b0, 1'b1, 1'b1, HB_REG_CR0[ADDR_WIDTH-1:0]);
+              rwds_hi          <= 1'b0;
+              ca_idx           <= 2'd0;
+              state            <= ST_CS;
+            end else if (commit_gate) begin
               // DEFERRED write->write interpose: a new memory write is pending but the previous
               // write still needs committing. Self-issue the commit-read (shaped by COMMIT_READ_MODE);
               // the pending write command is NOT accepted (cmd_ready gated) and is taken after the
@@ -927,7 +1239,36 @@ module hyperbus_ctrl
               // rp_cnt tracks the LAST WRITE burst's tail; preserve it across READ accepts (reads
               // do not disturb the array or the shadow validity — silicon ladder L5/X2), reset it
               // for anything that writes (a new write rebuilds it; reg/wrap writes invalidate it).
-              if (~cmd_read) rp_cnt <= '0;
+              // issue #13: clear shadow_full here too — a genuine new write CS# open starts rebuilding
+              // the shadow, so its first segment's pre-window drive is suppressed (= legacy idle bus).
+              // ROUND 2, Feature A (dbg_prewin_contig): a COMMAND-EDGE contiguous write — cmd_addr ==
+              // one-past-the-last-real-write-beat (last_wr_addr+1, the same tracker Feature B uses) — is
+              // exactly the ST_IDLE reopen the silicon mechanism (c) wounds THROUGH: the previous burst's
+              // tail [B-4..B-1] is still sitting in rp_word[] (round 1 never clears its content) and is the
+              // correct heal payload for [cmd_addr-4, cmd_addr). Round 1 cleared shadow_full at every
+              // ST_IDLE write open, suppressing the prewin heal here (2048->8, 4096/256->16). When bit16 is
+              // set AND the reopen is contiguous AND the shadow is already full, KEEP shadow_full so the
+              // heal fires on this reopen too. Register/wrap writes and non-contiguous opens still clear.
+              // The tracker is valid only for the most recent memory write: a read leaves last_wr_addr
+              // pointing at that write (still correct); a register write clobbers it to the reg address,
+              // which simply fails the contiguity compare => clears (stale-but-harmless, POR-invariant).
+              if (~cmd_read) begin
+                rp_cnt <= '0;
+                if (!(dbg_prewin_contig & shadow_full & ~cmd_reg & ~cmd_wrap &
+                      (cmd_addr == last_wr_addr + ADDR_WIDTH'(1))))
+                  shadow_full <= 1'b0;
+                // #13 R4 (fixed on silicon 2026-07-11): the boundary-tail history survives a fresh
+                // ST_IDLE write accept iff it is a CONTIGUOUS memory-write continuation — the
+                // multi-command coalesce shape (4096/256: budget exhausts AT each command edge, so
+                // every row close is followed by an ST_IDLE re-accept) is one logical stream and its
+                // boundary chain must not be severed, or the defuse skips every interior boundary
+                // (silicon: 12 residual sprays). Non-contiguous / register / wrapped accepts still
+                // invalidate; df_arm's one-row-adjacency compare already rejects stale history from
+                // unrelated streams (and a stale ADJACENT bt re-heals the exact home the new
+                // stream's first spray hits — the E5 cross-stream case, where its data is correct).
+                if (!(~cmd_reg & ~cmd_wrap & (cmd_addr == last_wr_addr + ADDR_WIDTH'(1))))
+                  bt_valid <= 1'b0;
+              end
               wr_pending_commit <= 1'b0;           // a normally-accepted command clears the pending
                                                    //   flag (a covering read commits the prior write)
               // A1: if the device is in Deep-Power-Down, wake it (CS# pulse + tDPDOUT) BEFORE running
@@ -954,7 +1295,8 @@ module hyperbus_ctrl
             if (zlw) begin
               state <= ST_WRITE;                   // zero-latency write: data follows CA immediately
             end else begin
-              cnt            <= 32'(LATENCY_CLOCKS - 1);  // one latency count; doubled in ST_LAT if RWDS-high
+              cnt            <= 32'(dbg_lat_clocks - 1);  // one latency count; doubled in ST_LAT if RWDS-high
+                                                          //   (issue #13: runtime override; POR 6 = legacy)
               lat_extra_done <= 1'b0;
               state          <= ST_LAT;
             end
@@ -974,9 +1316,10 @@ module hyperbus_ctrl
           if (cnt == 32'd0) begin
             if (lat_double & ~lat_extra_done) begin
               lat_extra_done <= 1'b1;
-              // WR_LAT_TRIM: writes only — see the parameter note (board write-window calibration)
-              cnt            <= cur_read ? 32'(LATENCY_CLOCKS - 1)
-                                         : 32'(LATENCY_CLOCKS - 1 + WR_LAT_TRIM);
+              // WR_LAT_TRIM: writes only — see the parameter note (board write-window calibration).
+              // issue #13: dbg_lat_clocks/dbg_wr_lat_trim are runtime overrides (POR 6/3 = legacy).
+              cnt            <= cur_read ? 32'(dbg_lat_clocks - 1)
+                                         : 32'(dbg_lat_clocks - 1 + dbg_wr_lat_trim);
             end else if (cur_read) begin
               stall_cnt <= '0;
               state     <= ST_READ;
@@ -993,7 +1336,7 @@ module hyperbus_ctrl
           if (phy_dq_i_valid) begin
             // Commit-read data is DISCARDED (doing_commit): count the word for burst completion but
             // never push it to rd_fifo, so it is invisible to the front-end.
-            if (!rd_fifo_full & ~doing_commit) begin
+            if (!rd_fifo_full & ~int_read) begin   // #13 R4: defuse read discards like a commit-read
               rd_fifo[rd_wa] <= {(rem_left == LEN_WIDTH'(1)), phy_dq_i[DATA_WIDTH-1:0]};
               rd_wptr        <= rd_wptr + 1'b1;
             end
@@ -1019,7 +1362,7 @@ module hyperbus_ctrl
               // the remaining rem_left words as flagged filler rather than silently dropping rd_last.
               // A commit-read is internal (data discarded); a stall there must NOT surface as a
               // user-visible error, but it still drains through ST_RD_ABORT to recover cleanly.
-              err_timeout <= ~doing_commit;
+              err_timeout <= ~int_read;   // #13 R4: internal reads never surface a user timeout
               state       <= ST_RD_ABORT;
             end else begin
               stall_cnt <= stall_cnt + 1'b1;
@@ -1039,7 +1382,7 @@ module hyperbus_ctrl
           if (phy_dq_i_valid) drain_cnt <= '0;             // a straggler arrived: not quiet yet
           else                drain_cnt <= drain_cnt + 8'd1;
           if (drain_done) begin
-            cnt   <= 32'(TAIL_CYCLES - 1);
+            cnt   <= postwin_seed;   // issue #13: read path -> postwin select is 0 => TAIL_CYCLES (legacy)
             state <= ST_TAIL;
           end
         end
@@ -1049,9 +1392,9 @@ module hyperbus_ctrl
           if (rem_left == LEN_WIDTH'(0)) begin
             cnt   <= 32'(RECOVERY_CYCLES - 1);
             state <= ST_RECOVER;
-          end else if (doing_commit | !rd_fifo_full) begin
-            // Commit-read abort: discard (no fifo write, no back-pressure); else drain flagged filler.
-            if (~doing_commit) begin
+          end else if (int_read | !rd_fifo_full) begin
+            // Commit/defuse-read abort: discard (no fifo write, no back-pressure); else drain filler.
+            if (~int_read) begin
               rd_fifo[rd_wa] <= {(rem_left == LEN_WIDTH'(1)), {DATA_WIDTH{1'b0}}};
               rd_wptr        <= rd_wptr + 1'b1;
             end
@@ -1069,7 +1412,8 @@ module hyperbus_ctrl
           // Host underrun: word gets masked, burst continues. A replayed beat (WR_CHOP_REPLAY) is
           // sourced from the replay shadow and never consumes the front-end, so wsrc_valid Low is
           // expected there — not an underrun.
-          if (!wsrc_valid && !replay_beat) err_underrun <= 1'b1;
+          if (!wsrc_valid && !replay_beat && !int_write) err_underrun <= 1'b1;   // #13 R3/R4: masked
+                                                              //   internal beats are not an underrun
           // A1: snoop a host CR0 register-write for the Deep-Power-Down bit (CR0[15]); 0 => the device
           // will enter DPD, 1 => normal. Register writes are single-word / zero-latency, so the value
           // is on the bus this cycle. The next command is then guarded by a wake (ST_DPD_WAKE).
@@ -1087,7 +1431,13 @@ module hyperbus_ctrl
           // at WR_REPLAY_WORDS). An underrun filler is captured with an all-zero strobe.
           // Mask-led beats are NOT captured: they are array-neutral dummies, and shifting them in
           // would evict the real shadow words before their own replay emission.
-          if (WR_CHOP_REPLAY && !zlw && !lead_beat) begin
+          // issue #13: also capture the shadow when dbg_prewin_drive is on (the heal reuses rp_word's
+          // STORAGE only — no replay reopen paths are enabled). With replay off, lead_beat/replay_beat
+          // are 0, so this reduces to rp_word[0]<=wsrc_data and rp_cnt saturating at WR_REPLAY_WORDS.
+          // issue #13 ROUND 3 (B): gate capture OFF during the internal end-commit write — its masked
+          // beats must NOT shift into rp_word (that would evict the [end-4..end-1] shadow a later real
+          // continuation at B=end still needs to heal from, and pollute this write's own ST_LAT source).
+          if ((WR_CHOP_REPLAY | dbg_prewin_drive) && !zlw && !lead_beat && !int_write) begin
             for (int p = int'(WR_REPLAY_WORDS) - 1; p > 0; p--) begin
               rp_word[p] <= rp_word[p-1];
               rp_strb[p] <= rp_strb[p-1];
@@ -1095,6 +1445,9 @@ module hyperbus_ctrl
             rp_word[0] <= replay_beat ? rp_data_sel : wsrc_data;
             rp_strb[0] <= replay_beat ? rp_strb_sel : (wsrc_valid ? wsrc_strb : '0);
             if (rp_cnt != LEN_WIDTH'(WR_REPLAY_WORDS)) rp_cnt <= rp_cnt + 1'b1;
+            // Sticky "shadow holds a full WR_REPLAY_WORDS-deep tail" — set as rp_cnt saturates. Gates
+            // the pre-window heal (prewin_ok) so a run's first segment (shadow not yet full) stays idle.
+            if (rp_cnt >= LEN_WIDTH'(WR_REPLAY_WORDS - 1)) shadow_full <= 1'b1;
           end
           if (WR_CHOP_REPLAY && !zlw && replay_beat) replay_left <= replay_left - 1'b1;
           if (seg_left == LEN_WIDTH'(1)) begin
@@ -1102,14 +1455,27 @@ module hyperbus_ctrl
             // segment's own base/length, so a subsequent commit-read (WR_COMMIT_READ) can be shaped
             // by COMMIT_READ_MODE (SPAN_END spans last_wr_addr; FULL_BURST re-reads
             // [wr_seg_base, wr_seg_base+wr_seg_len-1] — this whole just-closed segment).
-            last_wr_addr <= cur_addr + ADDR_WIDTH'(seg_count) - ADDR_WIDTH'(1);
-            wr_seg_base  <= cur_addr;
-            wr_seg_len   <= seg_count;
+            // issue #13 ROUND 3 (B): the internal end-commit write must NOT advance last_wr_addr /
+            // wr_seg_base / wr_seg_len — a later real continuation at B=end must still compare
+            // contiguous against the ORIGINAL stream's end (and end_cwrite_aligned must stay stable so
+            // this write's own completion does not re-trigger the launch). It leaves those trackers put.
+            if (~int_write) begin   // #13 R4: internal masked writes leave the trackers frozen
+              last_wr_addr <= cur_addr + ADDR_WIDTH'(seg_count) - ADDR_WIDTH'(1);
+              wr_seg_base  <= cur_addr;
+              wr_seg_len   <= seg_count;
+            end
+            // issue #13 post-window hold: latch this beat's data word and arm the hold, but ONLY for
+            // the FINAL segment of a memory write (rem_left==1); a chop (rem_left!=1) leaves it off so
+            // the hold applies once, at the burst's true end (the Law-3 end-at-row target). The internal
+            // end-commit write (doing_cwrite) never arms the hold (~doing_cwrite).
+            last_wr_word   <= replay_beat ? rp_data_sel : wsrc_data;
+            postwin_active <= dbg_postwin_hold & ~cur_read & ~cur_reg & ~doing_init & ~int_write &
+                              (rem_left == LEN_WIDTH'(1));
             if (rem_left != LEN_WIDTH'(1)) begin
               // more of THIS native command remains beyond this segment's tCSM/boundary cap: normal
               // internal chop, unaffected by WR_COALESCE (which only applies at command completion).
               cur_addr <= cur_addr + ADDR_WIDTH'(seg_count);
-              cnt      <= 32'(TAIL_CYCLES - 1);
+              cnt      <= postwin_seed;   // issue #13: chop (rem_left!=1) => TAIL_CYCLES (legacy)
               state    <= ST_TAIL;
             end else if (coalesce_try) begin
               // WR_COALESCE: this command's data is exhausted but the CS# burst still has hw-cap room
@@ -1119,7 +1485,7 @@ module hyperbus_ctrl
               coalesce_wait_cnt <= '0;
               state             <= ST_WR_COALESCE;
             end else begin
-              cnt   <= 32'(TAIL_CYCLES - 1);
+              cnt   <= postwin_seed;   // issue #13: final segment => 4-CK hold dwell when dbg_postwin_hold
               state <= ST_TAIL;
             end
           end
@@ -1167,6 +1533,7 @@ module hyperbus_ctrl
             cnt   <= (~cur_read & ~cur_reg & ~doing_init & (WR_CHOP_PAUSE_CYCLES != 0))
                      ? 32'(RECOVERY_CYCLES - 1 + WR_CHOP_PAUSE_CYCLES)
                      : 32'(RECOVERY_CYCLES - 1);
+            postwin_active <= 1'b0;   // issue #13: the post-window hold is over; CS# raises in ST_RECOVER
             state <= ST_RECOVER;
           end else begin
             cnt <= cnt - 1'b1;
@@ -1175,6 +1542,78 @@ module hyperbus_ctrl
 
         ST_RECOVER: begin
           if (cnt == 32'd0) begin
+            // ============================ issue #13 ROUND 4 (dbg_spray_defuse) ============================
+            if (df_active) begin
+              // A defuse-sequence internal transaction just completed at ST_RECOVER; advance the micro-op
+              // queue.  Order:  [endcw @close] -> READ @close (fires the orphan spray) -> HEAL-WRITE @bt_addr
+              // (re-covers it) -> deferred post-close action.  df_active gates the WHOLE sequence away from
+              // the normal branches below.
+              if (doing_cwrite) begin
+                // (final close only) the end-commit masked WRITE finished -> issue the defuse READ next.
+                doing_cwrite      <= 1'b0;
+                wr_pending_commit <= 1'b0;
+                launch_defuse_read(df_read_addr);
+              end else if (doing_dfread) begin
+                // the defuse READ finished — its CS# open just fired the parked orphan's spray onto
+                // bt_addr's home (fact 4/5) — now re-heal that home with the masked heal-WRITE.
+                doing_dfread <= 1'b0;
+                launch_defuse_write(df_heal_addr);
+              end else begin  // doing_dfwrite
+                // the heal-WRITE finished — the sprayed home is re-covered. Sequence done: take the
+                // deferred normal post-close action (final close -> ST_IDLE; interior chop -> reopen).
+                doing_dfwrite <= 1'b0;
+                df_active     <= 1'b0;
+                if (df_final) begin
+                  wr_pending_commit <= 1'b1;   // the real memory write closed (a covering read commits it)
+                  state             <= ST_IDLE;
+                end else begin
+                  // deferred INTERIOR chop reopen — the normal linear-write reopen (defuse assumes
+                  // WR_CHOP_REPLAY / WR_COMMIT_READ off, its tb/board config): restore the saved
+                  // next-segment context the internal transactions clobbered and open it.
+                  cur_read     <= 1'b0;
+                  cur_reg      <= 1'b0;
+                  cur_wrap     <= 1'b0;
+                  cur_addr     <= df_reopen_addr;
+                  rem_left     <= df_reopen_rem;
+                  seg_count    <= seg_size(df_reopen_rem, 1'b0, df_reopen_addr);
+                  seg_left     <= seg_size(df_reopen_rem, 1'b0, df_reopen_addr);
+                  seg_cap_left <= hw_cap(df_reopen_addr);
+                  ca_reg       <= hb_pack_ca(1'b0, 1'b0, 1'b1, df_reopen_addr);   // write, memory, linear
+                  rwds_hi      <= 1'b0;
+                  ca_idx       <= 2'd0;
+                  rp_cnt       <= '0;
+                  state        <= ST_CS;
+                end
+              end
+            end else begin
+            // Not in a defuse sequence: on a REAL boundary-aligned memory-write close, refresh the one-deep
+            // boundary-tail history (bt_*) from the just-closed segment's frozen rp_word tail. Old bt_* are
+            // still readable this cycle (NB), so df_arm below (and the payload snapshot) see the PREVIOUS
+            // boundary while bt_* update to THIS one.
+            if (real_wr_close & end_cwrite_aligned) begin
+              bt_valid <= 1'b1;
+              bt_addr  <= end_cwrite_addr;
+              for (int i = 0; i < int'(WR_REPLAY_WORDS); i++) bt_word[i] <= rp_word[i];
+            end
+            if (df_arm) begin
+              // Start the spray-defuse micro-op sequence, DEFERRING the normal post-close action. Snapshot
+              // the previous boundary (bt_*, = R_{k-1}) as the heal target/payload and the interior reopen
+              // context. Final close: end-commit-WRITE FIRST (heals home_last), then READ+HEAL. Interior
+              // close: straight to the defuse READ.
+              df_active      <= 1'b1;
+              df_read_addr   <= end_cwrite_addr;
+              df_heal_addr   <= bt_addr;
+              for (int i = 0; i < int'(WR_REPLAY_WORDS); i++) df_heal_word[i] <= bt_word[i];
+              df_final       <= (rem_left == LEN_WIDTH'(0));
+              df_reopen_addr <= cur_addr;
+              df_reopen_rem  <= rem_left;
+              if ((rem_left == LEN_WIDTH'(0)) & dbg_end_cwrite & end_cwrite_aligned) begin
+                launch_end_cwrite(end_cwrite_addr);
+                commit_resume <= 1'b0;
+              end else begin
+                launch_defuse_read(end_cwrite_addr);
+              end
+            end else begin
             if (rem_left != LEN_WIDTH'(0)) begin
               // more linear segments remain in THIS transaction (chopped by tCSM / boundary)
               if (WR_CHOP_REPLAY & ~cur_read & ~cur_reg & ~doing_commit & (rp_cnt != '0)) begin
@@ -1244,8 +1683,11 @@ module hyperbus_ctrl
               end else begin
                 state <= ST_IDLE;                     // deferred interpose done: take the pending cmd
               end
-            end else if (doing_init & ~init_cr1 & PROGRAM_CR1) begin
+            end else if (doing_init & ~init_cr1 & PROGRAM_CR1 & ~doing_cr0_reprog) begin
               // A3: CR0 init write done -> chain the CR1 zero-latency register write before init_done.
+              // issue #13: a runtime CR0 REPROGRAM (doing_cr0_reprog) never chains CR1 — it completes
+              // straight to ST_IDLE below (with PROGRAM_CR1 off everywhere relevant this is moot, but
+              // keeps the reprogram a pure single-register write regardless of the CR1 option).
               // (Placed AFTER the doing_commit branch: doing_init/doing_commit are mutually exclusive —
               // an internal commit-read is never in flight during init — so ordering vs. it is moot, but
               // the commit/coalesce machinery above always gets first refusal of this cnt==0 event.)
@@ -1261,6 +1703,16 @@ module hyperbus_ctrl
               rwds_hi   <= 1'b0;
               ca_idx    <= 2'd0;
               state     <= ST_CS;
+            end else if (doing_cwrite) begin
+              // issue #13 ROUND 3, Feature B: the internal END-COMMIT masked WRITE just finished. Its
+              // job (fire the device commit pipe at the row-aligned end so the prewin tail heals the
+              // orphan at [end-4,end)) is done. Self-clear and return to idle. CRITICAL: this branch is
+              // taken BEFORE the launch predicate below — because last_wr_addr was left unadvanced,
+              // end_cwrite_aligned is still TRUE, so without this guard the write would re-launch itself
+              // endlessly. It also does NOT set wr_pending_commit (the just-closed write IS the commit).
+              doing_cwrite      <= 1'b0;
+              wr_pending_commit <= 1'b0;
+              state             <= ST_IDLE;
             end else begin
               // Normal user / init transaction complete.
               if (~cur_read & ~cur_reg & ~doing_init)
@@ -1269,9 +1721,31 @@ module hyperbus_ctrl
                 init_done  <= 1'b1;
                 doing_init <= 1'b0;
                 init_cr1   <= 1'b0;
+                doing_cr0_reprog <= 1'b0;   // issue #13: reprogram write complete (init_done stays 1)
               end
-              state <= ST_IDLE;
+              // issue #13 ROUND 3, Feature B (dbg_end_cwrite): a memory-write stream that ended EXACTLY
+              // on a BURST_BOUNDARY_WORDS row multiple leaves its last 4 words as an ORPHAN pending in the
+              // device pipe (silicon fact 2). Before returning to idle, self-issue ONE internal, FULLY-
+              // MASKED 4-word linear WRITE at the stream END = last_wr_addr+1. Fact (3): the next write
+              // open consumes the orphan via the commit-pipe sampling, so this write is the safe consumer;
+              // with dbg_prewin_drive its ST_LAT prewin window drives the preserved [end-4..end-1] shadow
+              // into that commit, healing the tail at its home. This SUPERSEDES round 2's end-READ, which
+              // fact (4) falsified: a READ open does NOT flush the orphan home — it sprays it ONE ROW LOW
+              // ([home-1024,...)), losing data at home AND spraying a row below (E4 swept read lengths
+              // 1/16/64/256/1024 — never home). Only a write open can consume it safely. This is E5's
+              // proven fix shape (a contiguous 4-word write at B=end heals) made self-contained. The
+              // launch flows ST_CS->ST_CA->ST_LAT->ST_WRITE(4 masked)->ST_TAIL->ST_RECOVER, honoring
+              // tRWR/tCSHI like any burst; its completion re-enters this ST_RECOVER via the doing_cwrite
+              // branch above (no re-trigger). WR_COMMIT_READ stays disabled; this is a distinct path.
+              if (dbg_end_cwrite & ~cur_read & ~cur_reg & ~doing_init & end_cwrite_aligned) begin
+                launch_end_cwrite(end_cwrite_addr);
+                commit_resume <= 1'b0;                // internal write done -> return to ST_IDLE (not resume)
+              end else begin
+                state <= ST_IDLE;
+              end
             end
+            end   // issue #13 R4: close `if (df_arm) ... else`
+            end   // issue #13 R4: close `if (df_active) ... else`
           end else begin
             cnt <= cnt - 1'b1;
           end

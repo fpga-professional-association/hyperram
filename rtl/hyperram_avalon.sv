@@ -80,6 +80,21 @@ module hyperram_avalon
   input  logic [HB_CAL_RX_TAP_WIDTH-1:0]        cal_rx_tap,
   input  logic                                  cal_pair_skew,
 
+  // ---- issue #13 live controller knobs (frozen debug bundle, §0). Quasi-static, single `clk`
+  //      domain — forwarded straight to u_ctrl (dbg_*) and u_avalon (wrap_en); no synchronizer. NO
+  //      port default values (Verilator rejects them); every instantiation ties them (legacy). ----
+  input  logic [3:0]                  dbg_wr_lat_trim,   // overrides ctrl WR_LAT_TRIM   (POR 3)
+  input  logic [3:0]                  dbg_lat_clocks,    // overrides ctrl LATENCY_CLOCKS (POR 6; 6/7)
+  input  logic                        dbg_cr0_reprog,    // 1-clk pulse: relaunch init CR0 write
+  input  logic                        dbg_prewin_drive,  // heal probe enable
+  input  logic [2:0]                  dbg_prewin_n,      // # trailing latency CK to drive (0..7)
+  input  logic                        dbg_prewin_marker, // 1 = 0xA5xx marker instead of shadow data
+  input  logic                        dbg_postwin_hold,  // hold last data word 4 CK into the tail
+  input  logic                        dbg_prewin_contig, // ROUND 2 (A): keep shadow at a contiguous reopen
+  input  logic                        dbg_end_cwrite,     // ROUND 3 (B): end-of-row commit-WRITE (was READ)
+  input  logic                        dbg_spray_defuse,   // ROUND 4: per-boundary spray defuse (REG_DBG[18])
+  input  logic                        wrap_en,           // drives front-end cmd_wrap for the wrap probe
+
   // ---- Avalon-MM slave ----------------------------------------------------
   input  logic [ADDR_WIDTH-1:0]       avs_address,      // word address; MSB = register-space select
   input  logic                        avs_read,
@@ -203,6 +218,8 @@ module hyperram_avalon
     .rd_ready          (rd_ready),
     .rd_data           (rd_data),
     .rd_last           (rd_last),
+    // issue #13: wrapped-write enable (lifts the FE cmd_wrap tie-off for the wrap probe)
+    .wrap_en           (wrap_en),
     .dbg_state         (fe_dbg_state)
   );
 
@@ -287,7 +304,18 @@ module hyperram_avalon
     // debug taps
     .dbg_state      (ctrl_dbg_state),
     .dbg_rd_wptr    (ctrl_dbg_rd_wptr),
-    .dbg_rd_rptr    (ctrl_dbg_rd_rptr)
+    .dbg_rd_rptr    (ctrl_dbg_rd_rptr),
+    // issue #13 live controller knobs (forwarded 1:1 from this wrapper's inputs)
+    .dbg_wr_lat_trim  (dbg_wr_lat_trim),
+    .dbg_lat_clocks   (dbg_lat_clocks),
+    .dbg_cr0_reprog   (dbg_cr0_reprog),
+    .dbg_prewin_drive (dbg_prewin_drive),
+    .dbg_prewin_n     (dbg_prewin_n),
+    .dbg_prewin_marker(dbg_prewin_marker),
+    .dbg_postwin_hold (dbg_postwin_hold),
+    .dbg_prewin_contig(dbg_prewin_contig),
+    .dbg_end_cwrite    (dbg_end_cwrite),
+    .dbg_spray_defuse  (dbg_spray_defuse)
   );
 
   // -------------------------------------------------------------------------

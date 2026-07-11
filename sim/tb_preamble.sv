@@ -91,7 +91,11 @@ module tb_preamble;
     .hb_ck (b_hb_ck), .hb_ck_n (b_hb_ck_n), .hb_cs_n (b_hb_cs_n), .hb_rst_n (b_hb_rst_n),
     .hb_dq_o (b_phy_dq_o), .hb_dq_oe (b_phy_dq_oe), .hb_dq_i (b_dq_dly),
     .hb_rwds_o (b_phy_rwds_o), .hb_rwds_oe (b_phy_rwds_oe), .hb_rwds_i (b_rwds_dly),
-    .init_done (b_init_done), .err_underrun (/* unused */), .dbg_bus ()
+    .init_done (b_init_done), .err_underrun (/* unused */), .dbg_bus (),
+    // issue #13: new hyperram_avalon debug bundle + wrap_en tied to per-instance legacy (A1).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0),
+    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .dbg_spray_defuse (1'b0), .wrap_en (1'b0)
   );
   hyperram_model #(
     .DQ_WIDTH (DQ_WIDTH), .MEM_WORDS (1 << 16), .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),
@@ -131,7 +135,11 @@ module tb_preamble;
     .hb_ck (f_hb_ck), .hb_ck_n (f_hb_ck_n), .hb_cs_n (f_hb_cs_n), .hb_rst_n (f_hb_rst_n),
     .hb_dq_o (f_phy_dq_o), .hb_dq_oe (f_phy_dq_oe), .hb_dq_i (f_dq_dly),
     .hb_rwds_o (f_phy_rwds_o), .hb_rwds_oe (f_phy_rwds_oe), .hb_rwds_i (f_rwds_dly),
-    .init_done (f_init_done), .err_underrun (/* unused */), .dbg_bus ()
+    .init_done (f_init_done), .err_underrun (/* unused */), .dbg_bus (),
+    // issue #13: new hyperram_avalon debug bundle + wrap_en tied to per-instance legacy (A1).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0),
+    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .dbg_spray_defuse (1'b0), .wrap_en (1'b0)
   );
   hyperram_model #(
     .DQ_WIDTH (DQ_WIDTH), .MEM_WORDS (1 << 16), .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),

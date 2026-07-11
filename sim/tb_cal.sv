@@ -29,7 +29,7 @@ module tb_cal;
   localparam int unsigned DATA_WIDTH     = 2 * DQ_WIDTH;           // 16
   localparam int unsigned ADDR_WIDTH     = HB_ADDR_WIDTH;          // 32
   localparam int unsigned LEN_WIDTH      = HB_LEN_WIDTH_DEFAULT;   // 16
-  localparam int unsigned CSR_ADDR_WIDTH = 4;                      // 16 regs — REG_CAL is word 13
+  localparam int unsigned CSR_ADDR_WIDTH = 5;                      // 32 regs (issue #13) — REG_CAL is word 13; width 5 avoids REG_PAT/WRAP/EMAP aliasing
   localparam int unsigned BURST_WORDS    = HB_BURST_WORDS_DEFAULT; // 16 (single-burst LEN)
 
   // CR0 image: latency code 0001 (=6), fixed-latency, legacy wrap, 32B group (matches the board/model).

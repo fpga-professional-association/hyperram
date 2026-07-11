@@ -65,48 +65,61 @@ clock-generation limit); the path to the device's rated 250 MHz / 500 MB/s is
 
 ## Device limitations and how they are handled
 
-Silicon characterization of the W957D8NBRA4I (read-only-probe verified, 2026-07;
-full trail: [`fpga/axc3000/README.md`](fpga/axc3000/README.md), `docs/INTERFACES.md` v10,
-[issue #1](https://github.com/fpga-professional-association/hyperram/issues/1)) found three
-hard device behaviors. **The core automatically reduces their cost to the physical floor; the
-residual is deterministic and is the application's to manage.**
+Silicon characterization of the W957D8NBRA4I (read-only-probe + wound-map verified, 2026-07;
+full trail: [`fpga/axc3000/README.md`](fpga/axc3000/README.md), `docs/INTERFACES.md`,
+issues [#1](https://github.com/fpga-professional-association/hyperram/issues/1) and
+[#13](https://github.com/fpga-professional-association/hyperram/issues/13)) reduced the
+2026-07-09 "three laws" to **one root mechanism** — a 4-word write-commit pipeline in the
+device — and issue #13 built a runtime-provable **fix set that drives every measured write
+shape to zero loss**.
 
-| # | Device behavior | What the core does | Residual for the user |
-|---|---|---|---|
-| 1 | **Write wound**: any memory-write CS# opening at word address B destroys the 4 words below it, `[B-4, B)`. Reads never wound. Unsuppressible (rollback, dummy-masked lead-ins, pauses and CK dwells were all tested and falsified). | Coalescing removes CS# openings *inside* a contiguous stream, so a stream wounds only at forced row transitions — where the wound lands on the 4 words the device garbles anyway (one shared 4-word cost, not two). | Any **separate, later** write whose base abuts live data kills the 4 words below its base. See the rules below. |
-| 2 | **Row wrap**: a linear burst must never cross the device's **1024-word (2 KB) row**. Writes that cross wrap back onto the row start (large-scale aliasing corruption); reads release the bus. | Segments are row-bounded and row-aligned (`MAX_BURST_WORDS=1024` = `BURST_BOUNDARY_WORDS='h400` in the reference build): **no burst ever crosses a row**. Fully transparent for reads. | None (handled entirely by the core). |
-| 3 | **End-at-row garble**: a write burst ending exactly on a row multiple garbles its own last 4 words. | Row-aligned segmenting makes this coincide with the law-1 wound at the same 4 addresses — one cost, not two. | Merged into the row-transition cost below. |
+**The mechanism** (marker-attribution proven — the wound content is literally whatever is
+driven on DQ, `0xA500..03` landed on demand):
 
-**The net cost model (measured, exactly predictive):** a write transfer that stays inside one
-1024-word row is **loss-free**. A write stream that spans rows loses **exactly 4 words per row
-transition**, always at `[N·1024−4, N·1024)` — e.g. a 4096-word stream loses 16 words at 4 known
-addresses. Reads are always safe.
+| # | Device behavior (all RO/EMAP-verified) | What the core does about it |
+|---|---|---|
+| 1 | **Open-sampling commit**: at every memory-write CS# open at word B, the device shifts DQ bus state through its 4-word pipe across the write-latency window and commits the last 4 slots to `[B-4, B)`. Idle bus ⇒ the classic "wound" (zeros); the bus is never idle if the core drives it. | **Pre-window heal** (`REG_DBG[9]`, width `[12:10]`, sweep-proven n=4): re-drives the true `[B-4..B-1]` from the retained write shadow during the last 4 latency clocks — the commit *is* the heal. Works at internal row chops out of the box; `REG_DBG[16]` (contiguity qualifier) extends it across contiguous command-edge reopens. |
+| 2 | **Row wrap**: a linear burst must never cross the **1024-word (2 KB) row** — writes wrap onto the row start, reads release the bus. | Row-bounded, row-aligned segments (`MAX_BURST_WORDS=1024` = `BURST_BOUNDARY_WORDS='h400`): no burst ever crosses a row. Transparent. |
+| 3 | **Row-end orphan**: a write burst *closing* exactly on a row multiple never commits its last 4 words — they park in a device register (a **discard**, not a garble: old content stays; the historic "0x5050" was stale data). Orphans coexist, survive all writes (masked included). | **End-commit-write** (`REG_DBG[17]`): after a row-aligned final close the core opens one masked 4-beat write at `B=end` — its open-sampling commit (fact 1) heals the tail home; the mask keeps `[end, end+4)` untouched. |
+| 4 | **Orphan spray**: at the first READ after parking, each orphan fires once — its 4 words land at `[home-1028, home-1024)`, exactly the *previous* boundary's home (below-zero targets are dropped). Reads never place it home (lengths 1..1024 swept). This is why the historic `WR_COMMIT_READ` and every read-shaped repair failed. | **Spray defuse** (`REG_DBG[18]`): at each interior row boundary the core fires the spray deterministically with an internal read, then re-heals the one known casualty from a retained boundary-tail history. First boundary needs nothing (its spray lands in the already-dead below-base zone or is dropped). |
 
-**What an application must do:**
+**Measured result (issue #13 acceptance, 175 MHz, `PAT=addr-echo`, RO-ground-truth confirmed,
+25-run soak clean):** with the fix set enabled (`prewin=1 pn=4 contig=1 endcw=1 defuse=1`,
+i.e. `REG_DBG=0x0007_1263`), **768 / 1024 / 1536 / 2048 / 4096-by-256 / 16 KB-crosser / 8192
+all read back `ERR_COUNT=0`**. In-row throughput is unchanged (341.1 W / 332.3 R MB/s); an
+8-row stream pays ~7 % write throughput for the per-boundary defuse (315.9 W / 329.5 R MB/s).
 
-1. **Zero-loss rule:** keep each independently-written data object inside one 2 KB row —
-   2 KB-aligned buffers of ≤1024 words (≤2 KB) never lose anything. This is the same discipline
-   as DMA-descriptor or sector alignment.
-2. **Bulk streams** (buffers > 2 KB): either
-   - reserve the last **8 bytes of every 2 KB row** as padding in your data layout (the loss
-     addresses are fixed and known), or
-   - tolerate/scrub: reads are safe, so read back the 4-word groups at row edges and account for
-     them at a higher layer (ECC framing, length fields that skip row tails, etc.).
-   There is no write-only repair: *any* write wounds below its own base, so rewriting a lost
-   group just relocates the loss 4 words lower. (This was proven exhaustively — see the issue #1
-   trail.)
-3. **Abutting regions written as separate transactions:** a later write starting exactly where
-   earlier data ends wounds that data's last 4 words. Leave an 8-byte guard gap below any
-   independently-written base, write abutting regions in **descending** address order, or make
-   region boundaries coincide with row boundaries (rule 1 covers this automatically).
-4. **Read throughput:** reads never coalesce (each read command pays CA + initial latency), so
-   issue reads as large burstcounts rather than many small ones. Read integrity needs no care.
-5. **Different silicon:** these are W957D8NB sample findings. The management knobs are
-   parameters (`MAX_BURST_WORDS`, `BURST_BOUNDARY_WORDS`, `WR_COALESCE`), so retune them from
-   your device's datasheet — and the repo ships the read-only-probe method
-   (`fpga/axc3000/sysconsole/bw_read.tcl` arg 6) to verify *your* part's behavior directly.
-   A default-off experiment family (`WR_CHOP_REPLAY`/`WR_REPLAY_*`, `WR_CHOP_PAUSE_*`) remains in
-   the RTL for devices with genuinely different boundary semantics.
+**Defaults and enabling:** the fix set is **default-off** (POR `REG_DBG` seeds the legacy
+trim/latency only) — the legacy contract below still describes default behavior. Enable at
+runtime (`sysconsole/dbg_poke.tcl prewin 1 / pn 4 / contig 1 / endcw 1 / defuse 1`) or bake it
+in with the bench parameter `DBG_RESET=32'h0007_1263`.
+
+**Legacy (fix set off) cost model — measured, exactly predictive:** in-row transfers are
+loss-free; a write stream spanning rows loses exactly 4 words per row transition at
+`[N·1024−4, N·1024)`. Reads are safe *unless a row-end orphan is pending* (fact 4: the first
+read then sprays 4 stale words one row below the orphan's home — this is the corrected form of
+the old "reads never wound" claim).
+
+**What an application must still mind:**
+
+1. **Non-contiguous fresh writes** wound `[base-4, base)` (fact 1 with an idle bus and no valid
+   shadow). Keep an 8-byte guard gap below independently-written bases, write abutting regions
+   descending, or align bases to rows. (With the fix set on, *contiguous* appends heal
+   automatically — the old "no write-only repair" rule is superseded: a contiguous re-write
+   with the heal active repairs in place, E5-proven.)
+2. **Read throughput:** reads never coalesce (each read pays CA + latency); prefer large
+   burstcounts. 
+3. **Rebuild discipline:** the DQ/CK pad launch is calibration-based (`WR_LAT_TRIM`), not
+   SDC-constrained — a refit can be silicon-marginal even with STA met (seen once: 2 words per
+   row-end close uncommitted). Re-run the bw_read shape suite after **every** recompile; the
+   known-good bitstream is banked at
+   `fpga/axc3000/bitstreams/ddio_row_175_issue13_fixset_seed4_20260711.sof`.
+4. **Different silicon:** these are single-sample W957D8NB findings (temperature/voltage/second
+   -unit margining still open — issue #13 L-G). The knobs are parameters/CSRs
+   (`MAX_BURST_WORDS`, `BURST_BOUNDARY_WORDS`, `WR_COALESCE`, `DBG_RESET`), and the repo ships
+   the probe method: read-only runs (`bw_read.tcl` arg 6), the 64-deep wound map
+   (`emap_dump.tcl`), pattern scrubbing (`pat_set.tcl`), and marker attribution
+   (`dbg_poke.tcl marker 1`) to verify *your* part's behavior directly.
 
 ---
 
@@ -218,7 +231,7 @@ Coverage by area:
 | Bursts & data | `tb_chop`, `tb_wrap` (all four CR0 wrap sizes), `tb_masked`, `tb_multiburst`, `tb_multiburst_generic` |
 | Registers & init | `tb_reg`, `tb_cr1init` |
 | Power management | `tb_dpd`, `tb_clkstop` |
-| Device quirks | `tb_commit` (wound/row model: coalescing, row segmenting, the parked replay family — 11 stacks) |
+| Device quirks | `tb_commit` (wound/row model: coalescing, row segmenting, the parked replay family — 11 stacks); `tb_dbg` (issue #13: REG_DBG knobs, heal/marker, EMAP wound map, REG_PAT, wrapped-write probe, orphan/spray model + the defuse — 12 checks) |
 | PHY variants | `tb_sdr`, `tb_preamble`, `tb_preamble_generic`, `tb_xilinx` (7-series datapath via shim), `tb_cal` (live REG_CAL retune, no recompile) |
 | Bench engine | `tb_bw` (bandwidth engine + CSRs) |
 

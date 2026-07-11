@@ -102,7 +102,10 @@ module tb_por_timing;
     .phy_cs_n (phy_cs_n), .phy_rst_n (phy_rst_n), .phy_ck_en (phy_ck_en),
     .phy_dq_o (phy_dq_o), .phy_dq_oe (phy_dq_oe), .phy_rwds_o (phy_rwds_o), .phy_rwds_oe (phy_rwds_oe),
     .phy_rd_arm (phy_rd_arm), .phy_dq_i (phy_dq_i), .phy_dq_i_valid (phy_dq_i_valid), .phy_rwds_i (phy_rwds_i),
-    .dbg_state (), .dbg_rd_wptr (), .dbg_rd_rptr ()
+    .dbg_state (), .dbg_rd_wptr (), .dbg_rd_rptr (),
+    // issue #13: new hyperbus_ctrl debug bundle tied to per-instance legacy (A1; no wrap_en on ctrl).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0), .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .dbg_spray_defuse (1'b0)
   );
 
   hyperbus_phy_generic #(

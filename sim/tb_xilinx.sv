@@ -100,7 +100,11 @@ module tb_xilinx;
     .hb_ck (a_hb_ck), .hb_ck_n (a_hb_ck_n), .hb_cs_n (a_hb_cs_n), .hb_rst_n (a_hb_rst_n),
     .hb_dq_o (a_phy_dq_o), .hb_dq_oe (a_phy_dq_oe), .hb_dq_i (a_dq_dly),
     .hb_rwds_o (a_phy_rwds_o), .hb_rwds_oe (a_phy_rwds_oe), .hb_rwds_i (a_rwds_dly),
-    .init_done (a_init_done), .err_underrun (), .dbg_bus ()
+    .init_done (a_init_done), .err_underrun (), .dbg_bus (),
+    // issue #13: new hyperram_avalon debug bundle + wrap_en tied to per-instance legacy (A1).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0),
+    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .dbg_spray_defuse (1'b0), .wrap_en (1'b0)
   );
   hyperram_model #(
     .DQ_WIDTH (DQ_WIDTH), .MEM_WORDS (1 << 16), .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),
@@ -141,7 +145,11 @@ module tb_xilinx;
     .hb_ck (n_hb_ck), .hb_ck_n (n_hb_ck_n), .hb_cs_n (n_hb_cs_n), .hb_rst_n (n_hb_rst_n),
     .hb_dq_o (n_phy_dq_o), .hb_dq_oe (n_phy_dq_oe), .hb_dq_i (n_dq_dly),
     .hb_rwds_o (n_phy_rwds_o), .hb_rwds_oe (n_phy_rwds_oe), .hb_rwds_i (n_rwds_dly),
-    .init_done (n_init_done), .err_underrun (), .dbg_bus ()
+    .init_done (n_init_done), .err_underrun (), .dbg_bus (),
+    // issue #13: new hyperram_avalon debug bundle + wrap_en tied to per-instance legacy (A1).
+    .dbg_wr_lat_trim (4'd0), .dbg_lat_clocks (4'd6), .dbg_cr0_reprog (1'b0),
+    .dbg_prewin_drive (1'b0), .dbg_prewin_n (3'd0), .dbg_prewin_marker (1'b0),
+    .dbg_postwin_hold (1'b0), .dbg_prewin_contig (1'b0), .dbg_end_cwrite (1'b0), .dbg_spray_defuse (1'b0), .wrap_en (1'b0)
   );
   hyperram_model #(
     .DQ_WIDTH (DQ_WIDTH), .MEM_WORDS (1 << 16), .LATENCY_CLOCKS (6), .FIXED_LATENCY (1'b1),

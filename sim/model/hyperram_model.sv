@@ -115,6 +115,34 @@ module hyperram_model
                                                                       //   unsuppressible (apply the wound
                                                                       //   regardless of masking; keeps all
                                                                       //   existing TBs aligned).
+    parameter bit          WR_WOUND_SAMPLE_BUS = 1'b0,                 // issue #13 (L-C/L-D, the HEAL): the
+                                                                      //   load-bearing sampling hypothesis.
+                                                                      //   When 1 the wound content is NOT a
+                                                                      //   hard zero but the DQ words the
+                                                                      //   device SAMPLES off the bus in the
+                                                                      //   pre-data window — the last
+                                                                      //   2*WR_WOUND_WORDS latency edges
+                                                                      //   before first_data_beat, mapped
+                                                                      //   oldest-first (see wound_samp). So
+                                                                      //   whatever the controller drives in
+                                                                      //   that window lands in mem[B-N..B-1]:
+                                                                      //   idle bus -> 0x0000 (the 8-aligned-
+                                                                      //   zero observation); residual CA
+                                                                      //   bytes -> foreign (0x0404 @508);
+                                                                      //   dbg_prewin_drive shadow -> the exact
+                                                                      //   [B-4..B-1] (readback ERR=0 = the
+                                                                      //   heal); dbg_prewin_marker -> 0xA5xx
+                                                                      //   (content attribution). 0 = hard-
+                                                                      //   zero the wound (identical to the
+                                                                      //   pre-#13 model; keeps every existing
+                                                                      //   TB aligned).
+    parameter bit          WR_WOUND_WRAP_IMMUNE = 1'b0,                // issue #13 (L-F): when 1 a WRAPPED
+                                                                      //   memory write (CA[45]=0) does NOT
+                                                                      //   arm a wound. Makes a wrapped write
+                                                                      //   over a wound zone a REPAIR primitive
+                                                                      //   (it writes real data and re-arms
+                                                                      //   nothing). 0 = wrapped writes wound
+                                                                      //   like linear (keeps TBs aligned).
     parameter bit          WR_BOUNDARY_END_GARBLE = 1'b0,              // silicon ladder finding 5 (a
                                                                       //   separate, rarer defect from the
                                                                       //   wound above): a memory WRITE
@@ -134,6 +162,84 @@ module hyperram_model
                                                                       //   row-accurate device sim is needed
                                                                       //   (the controller now never crosses
                                                                       //   rows, so sim never exercises it).
+    parameter int unsigned WR_END_GARBLE_ROW_WORDS = 32'h2000,        // issue #13: the WR_BOUNDARY_END_
+                                                                      //   GARBLE granularity, parameterized.
+                                                                      //   Default 0x2000 preserves tb_commit
+                                                                      //   idx7 (a burst ending at 0x2000);
+                                                                      //   instantiate 1024 for the true
+                                                                      //   W957D8NB law — a write ending on
+                                                                      //   ANY 1024-word ROW multiple garbles
+                                                                      //   its own last 4 words.
+    parameter logic [15:0] WR_END_GARBLE_VALUE     = 16'h5050,        // issue #13: the persistent garble fill
+                                                                      //   (0x5050 observed). A param so a
+                                                                      //   content-attribution run can retarget
+                                                                      //   it. Default keeps tb_commit idx7.
+    parameter bit          WR_END_GARBLE_SAMPLE_BUS = 1'b0,           // issue #13 (L-E, optional, default off):
+                                                                      //   the Law-3 analog of WR_WOUND_SAMPLE_
+                                                                      //   BUS. When 1 the end-garble stores the
+                                                                      //   last written word (what dbg_postwin_
+                                                                      //   hold parks on DQ into the tail)
+                                                                      //   instead of WR_END_GARBLE_VALUE — so a
+                                                                      //   postwin heal CHANGES the garble
+                                                                      //   content. Only ONE word is held, so
+                                                                      //   B-4..B-2 still cannot fully heal —
+                                                                      //   matching the L-E prediction that
+                                                                      //   postwin-hold is a separate, partial
+                                                                      //   mechanism from the pre-window heal.
+                                                                      //   0 = constant fill (keeps TBs aligned).
+    parameter bit          WR_ORPHAN_MODEL = 1'b0,                    // issue #13 ROUND 4: the FULL, RO/EMAP-
+                                                                      //   verified W957D8NB write-path mechanism
+                                                                      //   (silicon facts 1-5). Default OFF. When
+                                                                      //   ON it SUBSUMES the WR_WOUND_SAMPLE_BUS
+                                                                      //   write-open behaviour (forces sampled-
+                                                                      //   bus commit at [B-4,B), so requires
+                                                                      //   WR_WOUND_WORDS=4) AND replaces the
+                                                                      //   WR_END_GARBLE end behaviour with the
+                                                                      //   ORPHAN/SPRAY model:
+                                                                      //   (fact 1) write CS# open at B commits
+                                                                      //     the 4 pre-data-window sampled words
+                                                                      //     at [B-4,B) (reuses wound_samp);
+                                                                      //   (fact 2) a memory write CLOSING exactly
+                                                                      //     on a WR_END_GARBLE_ROW_WORDS multiple
+                                                                      //     PARKS its last 4 real data words as an
+                                                                      //     ORPHAN {home=end, 4 words} instead of
+                                                                      //     the constant end-garble;
+                                                                      //   (fact 3) orphans are NOT consumed by
+                                                                      //     later writes and MULTIPLE COEXIST
+                                                                      //     (append-only list, oldest dropped on
+                                                                      //     overflow);
+                                                                      //   (fact 4) the FIRST read CS# open fires
+                                                                      //     ALL parked orphans — each sprays its 4
+                                                                      //     words to [home-ROW-4, home-ROW) (one
+                                                                      //     ROW below home; target < 0 dropped) —
+                                                                      //     then clears the list;
+                                                                      //   (fact 5) spray(home=R_k) lands on
+                                                                      //     [R_k-ROW-4, R_k-ROW) = R_{k-1}'s home.
+                                                                      //   MODEL SIMPLIFICATION (documented): the
+                                                                      //   data phase still commits the last 4
+                                                                      //   words to mem[home-4..home-1] (fact 2's
+                                                                      //   "never commits at home" is NOT undone).
+                                                                      //   It is a no-op under every configuration
+                                                                      //   this exercises — on silicon home is
+                                                                      //   healed anyway (round-3 end-commit-WRITE
+                                                                      //   for the final home, the contiguous
+                                                                      //   prewin reopen for interior homes) — so
+                                                                      //   the OBSERVABLE array state (the spray
+                                                                      //   onto the previous row's home) is exact,
+                                                                      //   which is what the defuse must fix. A
+                                                                      //   FULLY-MASKED closing burst parks NO
+                                                                      //   orphan (mask suppresses parking): this
+                                                                      //   is the simplest choice consistent with
+                                                                      //   every silicon observation (the round-3
+                                                                      //   fully-masked end-write left the real
+                                                                      //   orphan intact = "did not form a second
+                                                                      //   orphan"). 0 = disabled (WR_WOUND_SAMPLE_
+                                                                      //   BUS / WR_END_GARBLE behave as before;
+                                                                      //   keeps every existing TB aligned).
+    parameter int unsigned WR_ORPHAN_DEPTH = 8,                       // issue #13 R4: orphan list depth (facts
+                                                                      //   3/5: 4096/256 has 3 coexisting interior
+                                                                      //   sprays; 8 is plenty). Overflow drops the
+                                                                      //   OLDEST entry (documented).
     // ---- DEPRECATED (2026-07-09): the split-write "commit quirk" (pending/discard on the next
     //      write) this pair used to model is FALSIFIED on silicon — see WR_WOUND_WORDS above for the
     //      real defect. Both names are kept, ACCEPTED BUT IGNORED (no-ops), only so any stale
@@ -226,6 +332,42 @@ module hyperram_model
   logic [AW-1:0]           wound_base;      // CA base (B) for the armed wound
   logic                    wound_mask_hi;   // beat-0 byte-A (rising-edge) RWDS sample
 
+  // ---- WR_WOUND_SAMPLE_BUS pre-data sampling buffer (issue #13) ----
+  // The DQ words captured off the bus in the last 2*WR_WOUND_WORDS latency edges before first_data_beat.
+  // wound_samp[0] is the OLDEST slot (sampled first, at cnt=N-1 = the earliest window edge) and
+  // wound_samp[N-1] the NEWEST (sampled last, at cnt=0 = the edge just before data). Applied newest->
+  // B-1: mem[B-k] <= wound_samp[N-k]. Depth is guarded >=1 so the default WR_WOUND_WORDS=0 build
+  // elaborates (the buffer is dead when WR_WOUND_SAMPLE_BUS=0).
+  localparam int unsigned  WOUND_SAMP_DEPTH = (WR_WOUND_WORDS == 0) ? 1 : WR_WOUND_WORDS;
+  logic [15:0]             wound_samp [WOUND_SAMP_DEPTH];
+
+  // ---- issue #13 ROUND 4: sampled-bus commit is FORCED ON by WR_ORPHAN_MODEL (fact 1). So the
+  //      write-open wound content follows the DQ pre-data window whenever EITHER the standalone
+  //      WR_WOUND_SAMPLE_BUS knob or the full orphan model is enabled; OFF for both reduces to the
+  //      pre-#13 hard-zero wound (identical to legacy).
+  wire                     sample_bus = WR_WOUND_SAMPLE_BUS | WR_ORPHAN_MODEL;
+
+  // ---- issue #13 ROUND 4 orphan/spray machinery (WR_ORPHAN_MODEL, silicon facts 2-5) ----
+  // Rolling shadow of the last 4 REAL data words RECEIVED on the bus this write burst (mask-agnostic:
+  // the value seen on DQ, since fact 2 parks what the device received). wr_tail[3] = NEWEST (the just-
+  // completed word = word(addr-1) at close), wr_tail[0] = OLDEST of the last 4. wr_ba latches byte A
+  // (rising edge) so the falling edge can assemble the full big-endian word {A,B}. wr_any_unmasked is
+  // set if ANY byte of this burst arrived unmasked — a FULLY-masked burst parks NO orphan (fact 3
+  // simplest-consistent choice, documented on WR_ORPHAN_MODEL).
+  logic [DATA_WIDTH-1:0]   wr_tail [4];
+  logic [DQ_WIDTH-1:0]     wr_ba;
+  logic                    wr_any_unmasked;
+
+  // Orphan list (append-only until a read fires it; oldest dropped on overflow). Each entry holds the
+  // parking home (= the row-multiple close address) and its 4 tail words (wr_tail order preserved, so
+  // the spray lays them one row below in the SAME relative order — fact 5 EMAP: word(home-4)->word(
+  // home-ROW-4)). Depth guarded >=1 for elaboration when WR_ORPHAN_MODEL=0 (the list is then dead).
+  localparam int unsigned  ORPH_DEPTH = (WR_ORPHAN_DEPTH == 0) ? 1 : WR_ORPHAN_DEPTH;
+  logic                    orph_valid [ORPH_DEPTH];
+  logic [AW-1:0]           orph_home  [ORPH_DEPTH];
+  logic [DATA_WIDTH-1:0]   orph_word  [ORPH_DEPTH][4];
+  logic [$clog2(ORPH_DEPTH+1)-1:0] orph_cnt;   // number of valid entries (0..ORPH_DEPTH)
+
   // ---- 0x2000-word boundary release quirk (BURST_BOUNDARY_WORDS) ----
   logic                    bnd_rel;         // this transaction crossed a boundary -> bus released
 
@@ -310,6 +452,11 @@ module hyperram_model
       wound_pending <= 1'b0;
       wound_base    <= '0;
       wound_mask_hi <= 1'b0;
+      wr_any_unmasked <= 1'b0;
+      wr_ba         <= '0;
+      for (int t = 0; t < 4; t++) wr_tail[t] <= '0;
+      for (int e = 0; e < int'(ORPH_DEPTH); e++) orph_valid[e] <= 1'b0;
+      orph_cnt      <= '0;
       bnd_rel     <= 1'b0;
       cs_q        <= 1'b1;
       ck_q        <= hb_ck;
@@ -340,17 +487,51 @@ module hyperram_model
       // reset — the resets below only take effect after this invocation); guard on wcnt!=0 so this
       // only fires once per CS# (a re-invocation of this branch — e.g. from CK still toggling while
       // CS# is High, WR_CHOP_PAUSE_CK — sees wcnt already cleared to 0 by the first pass).
-      if (WR_BOUNDARY_END_GARBLE && !cur_rw && !cur_as && (wcnt != 32'd0) &&
-          ((32'(addr) % 32'h2000) == 32'd0)) begin
+      // issue #13 ROUND 4: WR_ORPHAN_MODEL SUPERSEDES the constant end-garble. A memory-write burst
+      // that closes with `addr` (one past the last written word = its home/end) on a WR_END_GARBLE_ROW_
+      // WORDS multiple PARKS an ORPHAN {home=addr, last-4 tail words} (fact 2) instead of garbling —
+      // fired later by the first read (fact 4). A FULLY-masked burst parks nothing (wr_any_unmasked).
+      // Append-only (facts 3): drop the OLDEST on overflow. When WR_ORPHAN_MODEL=0 the legacy constant/
+      // sampled end-garble path below runs unchanged.
+      if (WR_ORPHAN_MODEL) begin
+        if (!cur_rw && !cur_as && (wcnt != 32'd0) && wr_any_unmasked &&
+            ((32'(addr) % WR_END_GARBLE_ROW_WORDS) == 32'd0)) begin
+          if (orph_cnt < ($clog2(ORPH_DEPTH+1))'(ORPH_DEPTH)) begin
+            orph_valid[orph_cnt] <= 1'b1;
+            orph_home [orph_cnt] <= addr;
+            for (int i = 0; i < 4; i++) orph_word[orph_cnt][i] <= wr_tail[i];
+            orph_cnt <= orph_cnt + 1'b1;
+          end else begin
+            // full: shift down (drop the oldest, entry 0), append at the top slot
+            for (int e = 0; e < int'(ORPH_DEPTH) - 1; e++) begin
+              orph_valid[e] <= orph_valid[e+1];
+              orph_home [e] <= orph_home [e+1];
+              for (int i = 0; i < 4; i++) orph_word[e][i] <= orph_word[e+1][i];
+            end
+            orph_valid[ORPH_DEPTH-1] <= 1'b1;
+            orph_home [ORPH_DEPTH-1] <= addr;
+            for (int i = 0; i < 4; i++) orph_word[ORPH_DEPTH-1][i] <= wr_tail[i];
+          end
+        end
+      end else if (WR_BOUNDARY_END_GARBLE && !cur_rw && !cur_as && (wcnt != 32'd0) &&
+          ((32'(addr) % WR_END_GARBLE_ROW_WORDS) == 32'd0)) begin
+        // Fill: WR_END_GARBLE_VALUE (constant, the pre-#13 behaviour) unless WR_END_GARBLE_SAMPLE_BUS —
+        // then the postwin-held last word (mem[addr-1] still holds it here, garble not yet applied) is
+        // stored instead, the Law-3 analog of the pre-window sampling heal. addr>=1 guard: never index
+        // below the array.
+        logic [DATA_WIDTH-1:0] eg_val;
+        eg_val = (WR_END_GARBLE_SAMPLE_BUS && (addr >= AW'(1))) ? mem[addr - AW'(1)]
+                                                                : DATA_WIDTH'(WR_END_GARBLE_VALUE);
         for (int k = 1; k <= 4; k++)
-          if (addr >= AW'(k)) mem[addr - AW'(k)] <= 16'h5050;
+          if (addr >= AW'(k)) mem[addr - AW'(k)] <= eg_val;
       end
       // Safety net: a wound armed at CA decode is normally resolved at beat 0 of the data phase (see
       // below) long before CS# can deassert. If CS# somehow closes with no data beats at all, apply
       // the wound unconditionally here rather than lose it silently.
       if (wound_pending) begin
         for (int k = 1; k <= int'(WR_WOUND_WORDS); k++)
-          if (wound_base >= AW'(k)) mem[wound_base - AW'(k)] <= '0;
+          if (wound_base >= AW'(k))
+            mem[wound_base - AW'(k)] <= sample_bus ? wound_samp[int'(WR_WOUND_WORDS) - k] : '0;
         wound_pending <= 1'b0;
       end
     end else if (cs_q) begin
@@ -364,6 +545,10 @@ module hyperram_model
       pen_pending <= '0;
       wcnt    <= '0;
       stall_done <= 1'b0;
+      // issue #13 R4: a fresh burst starts with no unmasked bytes seen and a cleared tail shadow (so a
+      // short burst never parks a prior burst's stale tail). The orphan LIST persists across CS#.
+      wr_any_unmasked <= 1'b0;
+      for (int t = 0; t < 4; t++) wr_tail[t] <= '0;
       collide <= (!fixed_active) && (REFRESH_EVERY != 0) &&
                  (((txn_cnt + 1) % REFRESH_EVERY) == 0);
       txn_cnt <= txn_cnt + 1;
@@ -400,12 +585,32 @@ module hyperram_model
           // base. Resolution (apply, vs. WR_WOUND_MASK_SUPPRESS-discard) happens once beat 0 of the
           // data phase is fully sampled (see the write data-phase handling below) — NOT here — so the
           // mask-suppress decision can see beat 0's RWDS before committing to zeroing anything. Any
-          // non-memory-write CA (read or register) leaves no wound armed.
-          if ((WR_WOUND_WORDS != 0) && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca)) begin
+          // non-memory-write CA (read or register) leaves no wound armed. WR_WOUND_WRAP_IMMUNE (issue
+          // #13, L-F): a WRAPPED memory write (CA[45]=0 => !hb_ca_linear) also leaves no wound armed, so
+          // a wrapped write over a wound zone repairs it instead of re-wounding.
+          if ((WR_WOUND_WORDS != 0) && !hb_ca_read(full_ca) && !hb_ca_reg(full_ca) &&
+              !(WR_WOUND_WRAP_IMMUNE && !hb_ca_linear(full_ca))) begin
             wound_pending <= 1'b1;
             wound_base    <= start_addr;
           end else begin
             wound_pending <= 1'b0;
+          end
+
+          // issue #13 ROUND 4 (fact 4): the FIRST read CS# open (any memory/register read) FIRES every
+          // parked orphan — each sprays its 4 words to [home-ROW-4, home-ROW) (exactly ONE ROW below
+          // home; fact 5: that is R_{k-1}'s home) if the target is in-array (home >= ROW+4, else the
+          // spray is DROPPED — silicon: a spray below word 0 is lost) — then the list is cleared. The
+          // spray lands BEFORE this read's own data phase, so an RO probe of the sprayed region reads
+          // the corruption. Orphans persist across intervening writes (fact 3): only a read fires them.
+          if (WR_ORPHAN_MODEL && hb_ca_read(full_ca)) begin
+            for (int e = 0; e < int'(ORPH_DEPTH); e++)
+              if (orph_valid[e] &&
+                  (32'(orph_home[e]) >= (WR_END_GARBLE_ROW_WORDS + 32'd4)))
+                for (int i = 0; i < 4; i++)
+                  mem[orph_home[e] - AW'(WR_END_GARBLE_ROW_WORDS) - AW'(4) + AW'(i)]
+                      <= orph_word[e][i];
+            for (int e = 0; e < int'(ORPH_DEPTH); e++) orph_valid[e] <= 1'b0;
+            orph_cnt <= '0;
           end
 
           // Data-phase address / burst setup.
@@ -464,6 +669,11 @@ module hyperram_model
               // Beat-0 byte-A mask sample for WR_WOUND_MASK_SUPPRESS (paired with byte B's sample,
               // captured this same word's falling edge below, to decide the armed wound's fate).
               if (wcnt == 32'd0) wound_mask_hi <= hb_rwds_i;
+              // issue #13 R4: latch the RECEIVED byte A (mask-agnostic) so the falling edge can assemble
+              // the full {A,B} word into the orphan tail shadow; note any unmasked byte (a fully-masked
+              // burst parks no orphan).
+              wr_ba <= hb_dq_i;
+              if (!hb_rwds_i) wr_any_unmasked <= 1'b1;
             end
           end else begin                           // falling edge: byte B (word[7:0])
             // Boundary-release quirk (writes): once the burst steps onto a boundary the device stops
@@ -485,14 +695,28 @@ module hyperram_model
               if (!hb_rwds_i && !bnd_rel) begin
                 mem[addr][DQ_WIDTH-1:0] <= hb_dq_i;
               end
+              // issue #13 R4: push this word (received {A,B}, mask-agnostic) into the rolling tail
+              // shadow — wr_tail[3]=newest — so a row-multiple close parks the last 4 as an orphan.
+              if (WR_ORPHAN_MODEL) begin
+                wr_tail[0] <= wr_tail[1];
+                wr_tail[1] <= wr_tail[2];
+                wr_tail[2] <= wr_tail[3];
+                wr_tail[3] <= {wr_ba, hb_dq_i};
+              end
+              if (!hb_rwds_i) wr_any_unmasked <= 1'b1;
               // Wound resolve (WR_WOUND_WORDS / WR_WOUND_MASK_SUPPRESS): beat 0 (word index 0 of this
               // burst) is now fully sampled — byte A from this same word's rising edge (wound_mask_hi),
               // byte B this edge (hb_rwds_i). Apply the wound armed at CA decode unless mask-suppress
               // is enabled and beat 0 arrived fully byte-masked on both phases (the E-D hypothesis).
               if (wound_pending && (wcnt == 32'd0)) begin
                 if (!(WR_WOUND_MASK_SUPPRESS && wound_mask_hi && hb_rwds_i)) begin
+                  // Content: hard zero (pre-#13) unless WR_WOUND_SAMPLE_BUS, in which case the words
+                  // sampled off the bus in the pre-data window are stored newest-first (mem[B-k] <=
+                  // wound_samp[N-k]) — idle bus -> 0x0000 (== hard zero), controller shadow -> the heal.
                   for (int k = 1; k <= int'(WR_WOUND_WORDS); k++)
-                    if (wound_base >= AW'(k)) mem[wound_base - AW'(k)] <= '0;
+                    if (wound_base >= AW'(k))
+                      mem[wound_base - AW'(k)] <= sample_bus ? wound_samp[int'(WR_WOUND_WORDS) - k]
+                                                             : '0;
                 end
                 wound_pending <= 1'b0;
               end
@@ -501,8 +725,25 @@ module hyperram_model
             wcnt <= wcnt + 32'd1;
           end
         end
+      end else if (sample_bus && wound_pending &&
+                   (bnew >= first_data_beat - 16'(2*WR_WOUND_WORDS)) && (bnew < first_data_beat)) begin
+        // -------- Initial-latency window: sample the pre-data bus (issue #13, WR_WOUND_SAMPLE_BUS) --------
+        // These are the edges the ideal model ignores. On silicon the write-CA wound content is whatever
+        // the device latches off DQ here; the controller's dbg_prewin_drive parks [B-4..B-1] on the bus
+        // in exactly this window (oldest-first: B-4 earliest, B-1 just before data), so sampling it and
+        // storing it as the wound turns the wound into a heal. Byte A on the rising (hb_ck High) phase,
+        // byte B on the falling — the SAME big-endian mapping the write data phase uses, so a faithful
+        // shadow drive reconstructs the exact [B-N..B-1] words. rel/j map the 2N window edges to N word
+        // slots, oldest (rel 0..1 -> slot 0) to newest (rel 2N-2..2N-1 -> slot N-1).
+        int rel; int j;
+        rel = int'(bnew) - (int'(first_data_beat) - 2*int'(WR_WOUND_WORDS));  // 0 .. 2N-1
+        j   = rel >> 1;                                                       // word slot 0 .. N-1
+        if (j >= 0 && j < int'(WR_WOUND_WORDS)) begin
+          if (hb_ck) wound_samp[j][15:8] <= hb_dq_i;   // byte A (rising edge)
+          else       wound_samp[j][7:0]  <= hb_dq_i;   // byte B (falling edge)
+        end
       end
-      // else: initial-latency edges (bnew in 7..first_data_beat-1) — nothing captured/driven here.
+      // else: initial-latency edges outside the sampling window — nothing captured/driven here.
 
       beat <= bnew;
     end
