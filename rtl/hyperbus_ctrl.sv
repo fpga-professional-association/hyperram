@@ -1257,11 +1257,17 @@ module hyperbus_ctrl
                 if (!(dbg_prewin_contig & shadow_full & ~cmd_reg & ~cmd_wrap &
                       (cmd_addr == last_wr_addr + ADDR_WIDTH'(1))))
                   shadow_full <= 1'b0;
-                // #13 R4: a fresh write CS# opened from ST_IDLE starts a NEW boundary chain — invalidate
-                // the one-deep boundary-tail history so a stale prior-stream boundary can never spuriously
-                // arm the defuse. (The check-11/12 stream is one chopped command, so its interior chops
-                // stay in ST_RECOVER and never clear this.)
-                bt_valid <= 1'b0;
+                // #13 R4 (fixed on silicon 2026-07-11): the boundary-tail history survives a fresh
+                // ST_IDLE write accept iff it is a CONTIGUOUS memory-write continuation — the
+                // multi-command coalesce shape (4096/256: budget exhausts AT each command edge, so
+                // every row close is followed by an ST_IDLE re-accept) is one logical stream and its
+                // boundary chain must not be severed, or the defuse skips every interior boundary
+                // (silicon: 12 residual sprays). Non-contiguous / register / wrapped accepts still
+                // invalidate; df_arm's one-row-adjacency compare already rejects stale history from
+                // unrelated streams (and a stale ADJACENT bt re-heals the exact home the new
+                // stream's first spray hits — the E5 cross-stream case, where its data is correct).
+                if (!(~cmd_reg & ~cmd_wrap & (cmd_addr == last_wr_addr + ADDR_WIDTH'(1))))
+                  bt_valid <= 1'b0;
               end
               wr_pending_commit <= 1'b0;           // a normally-accepted command clears the pending
                                                    //   flag (a covering read commits the prior write)
