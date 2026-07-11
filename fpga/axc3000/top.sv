@@ -201,6 +201,8 @@ module top (
   wire        dbg_prewin_marker;
   wire        dbg_postwin_hold;
   wire        dbg_ck_stretch_off;   // -> u_io: disable the board ck_stretch trailing masked cycle
+  wire        dbg_prewin_contig;    // -> u_ctrl: round 2 (A) keep shadow at a contiguous command-edge reopen
+  wire        dbg_end_cread;        // -> u_ctrl: round 2 (B) end-of-row (BURST_BOUNDARY-aligned) commit-read
   wire        wrap_en;              // -> u_fe: drive front-end cmd_wrap for the wrapped-write probe
 
   hyperram_bw_test #(
@@ -252,6 +254,8 @@ module top (
     .dbg_prewin_marker (dbg_prewin_marker),
     .dbg_postwin_hold  (dbg_postwin_hold),
     .dbg_ck_stretch_off(dbg_ck_stretch_off),
+    .dbg_prewin_contig (dbg_prewin_contig),
+    .dbg_end_cread     (dbg_end_cread),
     .wrap_en           (wrap_en)
   );
 
@@ -398,7 +402,9 @@ module top (
     .dbg_prewin_drive  (dbg_prewin_drive),
     .dbg_prewin_n      (dbg_prewin_n),
     .dbg_prewin_marker (dbg_prewin_marker),
-    .dbg_postwin_hold  (dbg_postwin_hold)
+    .dbg_postwin_hold  (dbg_postwin_hold),
+    .dbg_prewin_contig (dbg_prewin_contig),   // round 2 (A)
+    .dbg_end_cread     (dbg_end_cread)         // round 2 (B)
   );
 
   // dbg_bus for the capture module — REPURPOSED as an Avalon read-stream logger (error-map debug):

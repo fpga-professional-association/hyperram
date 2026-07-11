@@ -331,7 +331,9 @@ module hyperram_axi
     .dbg_prewin_drive (1'b0),
     .dbg_prewin_n     (3'd0),
     .dbg_prewin_marker(1'b0),
-    .dbg_postwin_hold (1'b0)
+    .dbg_postwin_hold (1'b0),
+    .dbg_prewin_contig(1'b0),   // issue #13 round 2: legacy tie-off (bit-identical to today)
+    .dbg_end_cread    (1'b0)
   );
 
   // -------------------------------------------------------------------------

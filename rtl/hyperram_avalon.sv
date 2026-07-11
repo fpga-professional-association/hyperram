@@ -90,6 +90,8 @@ module hyperram_avalon
   input  logic [2:0]                  dbg_prewin_n,      // # trailing latency CK to drive (0..7)
   input  logic                        dbg_prewin_marker, // 1 = 0xA5xx marker instead of shadow data
   input  logic                        dbg_postwin_hold,  // hold last data word 4 CK into the tail
+  input  logic                        dbg_prewin_contig, // ROUND 2 (A): keep shadow at a contiguous reopen
+  input  logic                        dbg_end_cread,     // ROUND 2 (B): end-of-row commit-read
   input  logic                        wrap_en,           // drives front-end cmd_wrap for the wrap probe
 
   // ---- Avalon-MM slave ----------------------------------------------------
@@ -309,7 +311,9 @@ module hyperram_avalon
     .dbg_prewin_drive (dbg_prewin_drive),
     .dbg_prewin_n     (dbg_prewin_n),
     .dbg_prewin_marker(dbg_prewin_marker),
-    .dbg_postwin_hold (dbg_postwin_hold)
+    .dbg_postwin_hold (dbg_postwin_hold),
+    .dbg_prewin_contig(dbg_prewin_contig),
+    .dbg_end_cread    (dbg_end_cread)
   );
 
   // -------------------------------------------------------------------------

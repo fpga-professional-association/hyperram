@@ -258,7 +258,15 @@ module hyperbus_ctrl
     input  logic                    dbg_prewin_drive, // heal probe: drive [B-4..B-1] in the pre-data window
     input  logic [2:0]              dbg_prewin_n,     // # trailing latency CK to drive (0..7)
     input  logic                    dbg_prewin_marker,// 1 = drive 0xA5xx marker instead of shadow data
-    input  logic                    dbg_postwin_hold  // hold last data word 4 CK into the tail (Law-3 analog)
+    input  logic                    dbg_postwin_hold, // hold last data word 4 CK into the tail (Law-3 analog)
+    // issue #13 ROUND 2 — two runtime knobs (REG_DBG[16]/[17]; POR 0 = bit-identical to round 1):
+    input  logic                    dbg_prewin_contig,// A: keep shadow_full at a command-edge CONTIGUOUS
+                                                       //    ST_IDLE write reopen so the prewin heal fires
+                                                       //    there too (the 2048->8 / 4096/256->16 losses)
+    input  logic                    dbg_end_cread     // B: on a memory-write stream that ends EXACTLY on a
+                                                       //    BURST_BOUNDARY_WORDS row multiple, self-issue ONE
+                                                       //    discarded 1-word read AT the end so the device's
+                                                       //    read-open flushes its pending tail home (1024->4)
 );
 
   // ------------------------------------------------------------------------
@@ -684,6 +692,16 @@ module hyperbus_ctrl
   wire [31:0]           postwin_seed = (dbg_postwin_hold & ~cur_read & ~cur_reg & ~doing_init &
                                         (rem_left == LEN_WIDTH'(1))) ? 32'd3 : 32'(TAIL_CYCLES - 1);
 
+  // -- issue #13 ROUND 2, Feature B (dbg_end_cread) end-commit-read helpers ---------------------------
+  // The write-stream END = one past the last real memory-write beat = last_wr_addr + 1 (the SAME tracker
+  // Feature A compares against). Silicon mechanism (a)+(loss 2): a stream whose final word lands so that
+  // its end sits exactly on a BURST_BOUNDARY_WORDS row multiple leaves the last 4 words pending in the
+  // device pipe with NO healing reopen to follow (the 1024->4 residual). end_cread_aligned qualifies that
+  // case; BURST_BOUNDARY_WORDS==0 makes it always-false (feature inert), so bit17 alone never fires it.
+  wire [ADDR_WIDTH-1:0] end_cread_addr    = last_wr_addr + ADDR_WIDTH'(1);
+  wire                  end_cread_aligned = (BURST_BOUNDARY_WORDS != 0) &&
+                                            ((32'(end_cread_addr) % BURST_BOUNDARY_WORDS) == 32'd0);
+
   // ------------------------------------------------------------------------
   // Read data-out (FIFO front)
   // ------------------------------------------------------------------------
@@ -1036,9 +1054,22 @@ module hyperbus_ctrl
               // for anything that writes (a new write rebuilds it; reg/wrap writes invalidate it).
               // issue #13: clear shadow_full here too — a genuine new write CS# open starts rebuilding
               // the shadow, so its first segment's pre-window drive is suppressed (= legacy idle bus).
+              // ROUND 2, Feature A (dbg_prewin_contig): a COMMAND-EDGE contiguous write — cmd_addr ==
+              // one-past-the-last-real-write-beat (last_wr_addr+1, the same tracker Feature B uses) — is
+              // exactly the ST_IDLE reopen the silicon mechanism (c) wounds THROUGH: the previous burst's
+              // tail [B-4..B-1] is still sitting in rp_word[] (round 1 never clears its content) and is the
+              // correct heal payload for [cmd_addr-4, cmd_addr). Round 1 cleared shadow_full at every
+              // ST_IDLE write open, suppressing the prewin heal here (2048->8, 4096/256->16). When bit16 is
+              // set AND the reopen is contiguous AND the shadow is already full, KEEP shadow_full so the
+              // heal fires on this reopen too. Register/wrap writes and non-contiguous opens still clear.
+              // The tracker is valid only for the most recent memory write: a read leaves last_wr_addr
+              // pointing at that write (still correct); a register write clobbers it to the reg address,
+              // which simply fails the contiguity compare => clears (stale-but-harmless, POR-invariant).
               if (~cmd_read) begin
-                rp_cnt      <= '0;
-                shadow_full <= 1'b0;
+                rp_cnt <= '0;
+                if (!(dbg_prewin_contig & shadow_full & ~cmd_reg & ~cmd_wrap &
+                      (cmd_addr == last_wr_addr + ADDR_WIDTH'(1))))
+                  shadow_full <= 1'b0;
               end
               wr_pending_commit <= 1'b0;           // a normally-accepted command clears the pending
                                                    //   flag (a covering read commits the prior write)
@@ -1401,7 +1432,25 @@ module hyperbus_ctrl
                 init_cr1   <= 1'b0;
                 doing_cr0_reprog <= 1'b0;   // issue #13: reprogram write complete (init_done stays 1)
               end
-              state <= ST_IDLE;
+              // issue #13 ROUND 2, Feature B (dbg_end_cread): a memory-write stream that ended EXACTLY on
+              // a BURST_BOUNDARY_WORDS row multiple (end_cread_aligned) leaves its last 4 words pending in
+              // the device pipe with no healing reopen (the 1024->4 residual). Before returning to idle,
+              // self-issue ONE internal, DISCARDED 1-word linear READ at the stream END = last_wr_addr+1.
+              // Mechanism (b)+(d): a READ CS# open flushes the pending pipe INTACT into [B_open-4, B_open);
+              // opening it AT `end` therefore lands the flush at [end-4, end) — the pending tail's correct
+              // home. The read reuses the doing_commit launch/discard idiom (data never enters rd_fifo,
+              // no err_timeout surfaced, normal read latency/RWDS/phy_ck), then the doing_commit branch
+              // above returns to ST_IDLE. WHY `end` and NOT the segment BASE (the historical WR_COMMIT_READ
+              // falsification, resolved): the flush ALWAYS lands at [B_open-4, B_open), so WR_COMMIT_READ's
+              // read from BASE / from end-4 (SPAN_END) flushed to [base-4, base) / [end-8, end-4) — never
+              // the tail's home, which is why no covering read ever committed a write->write tail. Only a
+              // read whose CS# opens AT `end` works. WR_COMMIT_READ stays disabled; this is a distinct path.
+              if (dbg_end_cread & ~cur_read & ~cur_reg & ~doing_init & end_cread_aligned) begin
+                launch_commit_read(end_cread_addr, LEN_WIDTH'(1));
+                commit_resume <= 1'b0;                // discarded read done -> return to ST_IDLE (not resume)
+              end else begin
+                state <= ST_IDLE;
+              end
             end
           end else begin
             cnt <= cnt - 1'b1;

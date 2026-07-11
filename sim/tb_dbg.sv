@@ -32,6 +32,18 @@
 //   8  REG_DBG postwin/ck_stretch (L-E smoke): both are inert on a normal (non-row-end) burst in sim
 //      (dbg_ck_stretch_off is a board-only gpio knob, unrouted here; dbg_postwin_hold parks the last
 //      word into a CK-less tail the device never clocks) -> ERR unchanged.
+//   9  ROUND 2 Feature A — dbg_prewin_contig (REG_DBG[16]). Two back-to-back CONTIGUOUS write commands
+//      (cmd2 base == cmd1 end) reopen through ST_IDLE, where round 1 cleared shadow_full and so
+//      SUPPRESSED the prewin heal (the 2048->8 / 4096/256->16 command-edge losses). With prewin_drive
+//      on: bit16=0 leaves the ST_IDLE-reopen wound (RO ERR>0); bit16=1 keeps the shadow at the
+//      contiguous reopen so the heal fires there too (RO ERR==0).
+//  10  ROUND 2 Feature B — dbg_end_cread (REG_DBG[17]). A memory-write stream ending EXACTLY on a
+//      BURST_BOUNDARY_WORDS row multiple self-issues one DISCARDED 1-word end-read. Smoke: bit17=1 on a
+//      row-aligned-end run completes (no hang), leaves user-visible ERR identical to bit17=0 (the read
+//      is discarded), and opens exactly ONE extra read CS#; on a NON-aligned-end run bit17 is inert
+//      (identical ERR and CS# count). NOTE: the model does NOT reproduce the real flush-home BENEFIT
+//      (mechanism (b)/(d), read-open flush into [end-4,end), is unmodeled) — it still applies its
+//      WR_END_GARBLE, so ERR is unchanged by the cread in sim. Silicon is the oracle for the fix.
 //
 // NOTE (integration): the dbg_* bundle + wrap_en + CSR_ADDR_WIDTH=5 + DBG_RESET reach the controller
 // only after WP-A/WP-B are applied, so this TB elaborates ONLY in the integrated tree (per A9 it is
@@ -84,6 +96,19 @@ module tb_dbg;
   localparam logic [31:0] DBG_LAT6_RP = 32'h0000_0060 | (32'h1<<8);    // lat=6 + fire CR0-reprogram   = 0x0160
   localparam logic [31:0] DBG_POSTWIN = 32'h0000_0060 | (32'h1<<14);   // dbg_postwin_hold             = 0x4060
   localparam logic [31:0] DBG_CKSTR   = 32'h0000_0060 | (32'h1<<15);   // dbg_ck_stretch_off           = 0x8060
+  // ROUND 2 images. Feature A (contig) rides on prewin_drive+n=4; Feature B (endcread) is standalone.
+  localparam logic [31:0] DBG_A9_OFF  = DBG_HEAL_N4;                    // prewin n=4, contig OFF       = 0x01260
+  localparam logic [31:0] DBG_A9_ON   = DBG_HEAL_N4 | (32'h1<<16);     // prewin n=4, contig ON        = 0x11260
+  localparam logic [31:0] DBG_ENDCR   = 32'h0000_0060 | (32'h1<<17);  // dbg_end_cread                = 0x20060
+
+  // ROUND 2 check-9 geometry: two CONTIGUOUS 16-word write commands. cmd2 base == cmd1 end, so cmd2's
+  // ST_IDLE reopen wounds [cmd2-4, cmd2) = cmd1's last 4 words (Feature A's target). Both < 0x600.
+  localparam logic [ADDR_WIDTH-1:0] A9_B1 = 32'h0000_0300;   // 768  -> cmd1 [0x300,0x310)
+  localparam logic [ADDR_WIDTH-1:0] A9_B2 = 32'h0000_0310;   // 784  -> cmd2 [0x310,0x320) (contiguous)
+  // ROUND 2 check-10 geometry: a 16-word write ending EXACTLY on 2048 (row-aligned end -> Feature B
+  // fires) vs one ending on 2032 (non-aligned -> inert). Both single-segment (no chop at BB=2048).
+  localparam logic [ADDR_WIDTH-1:0] B10_ALIGN = 32'h0000_07F0;   // 2032 -> [2032,2048), end=0x800 aligned
+  localparam logic [ADDR_WIDTH-1:0] B10_NALGN = 32'h0000_07E0;   // 2016 -> [2016,2032), end=0x7F0 not aligned
 
   // Wound-test geometry: single Avalon burst, controller chops at 64. BASE not 64-aligned => no chop
   // boundary and no burst end lands on a 1024 row multiple (no end-of-row garble interference).
@@ -143,6 +168,11 @@ module tb_dbg;
     .LATENCY_CLOCKS   (6),
     .FIXED_LATENCY    (1'b1),
     .MAX_BURST_WORDS  (MAXBURST),
+    // ROUND 2: a row boundary the controller's Feature B (dbg_end_cread) keys off. Set to 2048 — far
+    // above every wound-check region (all < 0x600), so its chop cap NEVER binds for checks 1-9 (they are
+    // bit-identical to a 0 boundary) — yet non-zero so check 10 can end a write EXACTLY on 2048 and fire
+    // the end-commit-read. The model's own BURST_BOUNDARY_WORDS stays 0 (no bus-release quirk here).
+    .BURST_BOUNDARY_WORDS (2048),
     .PROGRAM_CR       (1'b1),
     .POR_DELAY_CYCLES (0),
     .INIT_CR0         (TB_INIT_CR0),
@@ -203,6 +233,11 @@ module tb_dbg;
   // Scoreboard
   // ------------------------------------------------------------------
   int unsigned errors = 0;
+
+  // ROUND 2 check-10: count CS# opens (falling edges of the master-driven hb_cs_n). Sampled as a delta
+  // around a run() so the Feature-B end-commit-read shows up as exactly one extra transaction.
+  int unsigned cs_fall_cnt = 0;
+  always @(negedge hb_cs_n) cs_fall_cnt = cs_fall_cnt + 1;
 
   task automatic check(input logic cond, input string msg);
     if (!cond) begin
@@ -295,6 +330,8 @@ module tb_dbg;
   int unsigned guard;
   logic [31:0] wound_base;   // ERR of the PAT=1 drive=0 run — the pure wound count, reused everywhere
   logic [31:0] emap_count;
+  logic [31:0] err_off, err_on;                       // ROUND 2 check-10 A/B ERR captures
+  int unsigned c_snap, cs_off, cs_on, cs_na_on, cs_na_off;   // ROUND 2 check-10 CS#-open deltas
 
   initial begin
     csr_address = '0; csr_read = 1'b0; csr_write = 1'b0; csr_writedata = '0;
@@ -511,6 +548,76 @@ module tb_dbg;
     run(1'b0, 32'd16, 32'h0000_0130, done, err);
     $display("   [8] dbg_ck_stretch_off on: ERR=%0d (expect 0, board-only knob inert in sim)", err);
     check(done && err === 32'd0, $sformatf("[8] ck_stretch_off ERR=%0d expected 0", err));
+
+    // =============================================================================================
+    // CHECK 9 — ROUND 2 Feature A: contiguity-qualified shadow validity (dbg_prewin_contig, bit16).
+    // Two contiguous 16-word write commands (cmd2 base == cmd1 end) reopen through ST_IDLE. cmd2's CS#
+    // open wounds [cmd2-4, cmd2) = cmd1's last 4 words. prewin_drive is ON in BOTH runs; only bit16
+    // differs. bit16=0 (round-1 behaviour): shadow_full is cleared at the ST_IDLE write open, the heal
+    // is suppressed, cmd1's tail is wounded to 0x0000 -> RO ERR=4. bit16=1: the contiguous reopen KEEPS
+    // shadow_full, the prewin heal parks cmd1's tail [cmd2-4..cmd2-1] on the bus, the model samples it
+    // -> the wound is healed -> RO ERR=0. RO-probe [cmd1, cmd1+16) covers the wounded tail [cmd2-4,cmd2).
+    // =============================================================================================
+    csr_wr(REG_PAT, 32'd1);                          // 0xFFFF background
+    csr_wr(REG_DBG, DBG_A9_OFF);                     // prewin n=4, contig OFF
+    run(1'b0, 32'd16, A9_B1, done, err);             // cmd1: write [0x300,0x310)
+    run(1'b0, 32'd16, A9_B2, done, err);             // cmd2: contiguous write [0x310,0x320) -> wounds cmd1 tail
+    run(1'b1, 32'd16, A9_B1, done, err);             // RO probe [0x300,0x310) — sees the [0x30C,0x310) wound
+    $display("-- [9] Feature A contig OFF (round-1): RO ERR=%0d (expect 4 — ST_IDLE-reopen wound unhealed)", err);
+    check(done && err === 32'd4,
+          $sformatf("[9] contig-off ERR=%0d exp 4 (round 1 suppresses the command-edge heal)", err));
+
+    csr_wr(REG_DBG, DBG_A9_ON);                      // prewin n=4, contig ON
+    csr_rd(REG_DBG, rb); check(rb === DBG_A9_ON, $sformatf("[9] REG_DBG readback 0x%08x exp 0x%08x", rb, DBG_A9_ON));
+    run(1'b0, 32'd16, A9_B1, done, err);             // cmd1 (rewrites the zone clean)
+    run(1'b0, 32'd16, A9_B2, done, err);             // cmd2 contiguous -> Feature A keeps shadow -> heal
+    run(1'b1, 32'd16, A9_B1, done, err);             // RO probe
+    $display("   [9] Feature A contig ON: RO ERR=%0d (expect 0 — heal fires at the contiguous reopen)", err);
+    check(done && err === 32'd0,
+          $sformatf("[9] contig-on ERR=%0d exp 0 (bit16 keeps shadow_full at the command-edge reopen)", err));
+
+    // =============================================================================================
+    // CHECK 10 — ROUND 2 Feature B: end-commit-read (dbg_end_cread, bit17). A write ending EXACTLY on
+    // the 2048 row boundary (BURST_BOUNDARY_WORDS) fires ONE discarded 1-word end-read; a write ending
+    // off-boundary does not. The model does NOT reproduce the real flush-home benefit (read-open flush
+    // is unmodeled) — it still applies WR_END_GARBLE at the 1024-multiple end — so the cread must leave
+    // user-visible ERR IDENTICAL (the read data is discarded) while adding exactly one read CS#. Silicon
+    // is the oracle for the actual repair; here we prove no-hang, no-user-disturb, and the extra CS#.
+    // =============================================================================================
+    csr_wr(REG_PAT, 32'd1);                          // 0xFFFF background
+    csr_wr(REG_DBG, TB_DBG_POR);                     // bit17=0
+    c_snap = cs_fall_cnt;
+    run(1'b0, 32'd16, B10_ALIGN, done, err_off);     // [2032,2048), end=0x800 aligned; bit17 off
+    cs_off = cs_fall_cnt - c_snap;
+    check(done, "[10] aligned-end run (bit17=0) did not complete");
+
+    csr_wr(REG_DBG, DBG_ENDCR);                      // bit17=1
+    csr_rd(REG_DBG, rb); check(rb === DBG_ENDCR, $sformatf("[10] REG_DBG readback 0x%08x exp 0x%08x", rb, DBG_ENDCR));
+    c_snap = cs_fall_cnt;
+    run(1'b0, 32'd16, B10_ALIGN, done, err_on);      // same run, bit17 on -> end-commit-read fires
+    cs_on = cs_fall_cnt - c_snap;
+    $display("-- [10] aligned end: bit17=0 ERR=%0d CS#=%0d | bit17=1 ERR=%0d CS#=%0d", err_off, cs_off, err_on, cs_on);
+    check(done, "[10] aligned-end run (bit17=1) did not complete (Feature B hang)");
+    check(err_on === err_off,
+          $sformatf("[10] aligned ERR changed by bit17 (%0d vs %0d) — the end-read must NOT disturb user data", err_on, err_off));
+    check(cs_on === cs_off + 1,
+          $sformatf("[10] aligned CS# opens %0d vs %0d — expected exactly ONE extra (the end-commit-read)", cs_on, cs_off));
+
+    // Non-aligned end: Feature B inert -> identical ERR and CS# count with bit17 on vs off.
+    csr_wr(REG_DBG, DBG_ENDCR);                      // bit17=1
+    c_snap = cs_fall_cnt;
+    run(1'b0, 32'd16, B10_NALGN, done, err_on);      // [2016,2032), end=0x7F0 NOT aligned
+    cs_na_on = cs_fall_cnt - c_snap;
+    csr_wr(REG_DBG, TB_DBG_POR);                     // bit17=0
+    c_snap = cs_fall_cnt;
+    run(1'b0, 32'd16, B10_NALGN, done, err_off);
+    cs_na_off = cs_fall_cnt - c_snap;
+    $display("   [10] non-aligned end (feature inert): bit17=1 ERR=%0d CS#=%0d | bit17=0 ERR=%0d CS#=%0d",
+             err_on, cs_na_on, err_off, cs_na_off);
+    check(err_on === err_off,
+          $sformatf("[10] non-aligned ERR differs (%0d vs %0d) — bit17 must be inert off-boundary", err_on, err_off));
+    check(cs_na_on === cs_na_off,
+          $sformatf("[10] non-aligned CS# opens differ (%0d vs %0d) — no end-read off-boundary", cs_na_on, cs_na_off));
 
     csr_wr(REG_DBG, TB_DBG_POR);
     repeat (8) @(posedge clk);

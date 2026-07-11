@@ -1,6 +1,7 @@
 # dbg_poke.tcl <field> <value> — named-knob read-modify-write of REG_DBG (byte 0x38) on the
 # issue-#13 instrumented AXC3000 build. Fields map onto the REG_DBG bit layout (spec §1):
 #   wrtrim [3:0]   lat [7:4]   prewin [9]   pn [12:10]   marker [13]   posthold [14]   ckstretchoff [15]
+#   contig [16]    endcread [17]   (round 2: A heal contiguous ST_IDLE write reopens; B end-of-row commit-read)
 # Special field `reprog`: writes REG_DBG with bit8=1 — the CR0-reprogram strobe (self-clearing, reads
 # back 0). To change latency: `dbg_poke lat 7` FIRST (sets the live seed), THEN `dbg_poke reprog`, and
 # ONLY while STATUS.busy=0 — the pulse is LOST if the controller is busy (host responsibility, spec §1).
@@ -26,6 +27,8 @@ array set FMAP {
     marker       {13 1}
     posthold     {14 1}
     ckstretchoff {15 1}
+    contig       {16 1}
+    endcread     {17 1}
 }
 
 # ---- helpers -------------------------------------------------------------
@@ -85,8 +88,9 @@ if {$field eq "reprog"} {
 
 # ---- read back (bit8 always reads 0) -------------------------------------
 set now [rd32 $m $REG_DBG]
-puts [format "REG_DBG = 0x%08X  (wrtrim=%d lat=%d prewin=%d pn=%d marker=%d posthold=%d ckstretchoff=%d)" \
+puts [format "REG_DBG = 0x%08X  (wrtrim=%d lat=%d prewin=%d pn=%d marker=%d posthold=%d ckstretchoff=%d contig=%d endcread=%d)" \
         $now [expr {$now & 0xF}] [expr {($now >> 4) & 0xF}] [expr {($now >> 9) & 1}] \
-        [expr {($now >> 10) & 0x7}] [expr {($now >> 13) & 1}] [expr {($now >> 14) & 1}] [expr {($now >> 15) & 1}]]
+        [expr {($now >> 10) & 0x7}] [expr {($now >> 13) & 1}] [expr {($now >> 14) & 1}] [expr {($now >> 15) & 1}] \
+        [expr {($now >> 16) & 1}] [expr {($now >> 17) & 1}]]
 
 close_service master $m

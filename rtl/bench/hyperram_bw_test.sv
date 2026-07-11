@@ -59,7 +59,11 @@
 //            |      |                      |        |   [8]=cr0_reprog (W1 strobe, self-clearing, reads 0)
 //            |      |                      |        |   [9]=dbg_prewin_drive  [12:10]=dbg_prewin_n(0..7)
 //            |      |                      |        |   [13]=dbg_prewin_marker [14]=dbg_postwin_hold
-//            |      |                      |        |   [15]=dbg_ck_stretch_off; reset = DBG_RESET
+//            |      |                      |        |   [15]=dbg_ck_stretch_off
+//            |      |                      |        |   [16]=dbg_prewin_contig (round 2 A: heal contiguous
+//            |      |                      |        |        command-edge ST_IDLE write reopens)
+//            |      |                      |        |   [17]=dbg_end_cread (round 2 B: end-of-row commit-read)
+//            |      |                      |        |   reset = DBG_RESET
 //    0x3C    | 15   | REG_EMAP_STAT        |  R     | wound-map FIFO status: [6:0]=count(0..64),
 //            |      |                      |        |   [7]=valid(count>0), [8]=overflow(sticky/run)
 //    0x40    | 16   | REG_PAT              |  R/W   | pattern select [1:0]: 0=gen_pattern 1=0xFFFF
@@ -133,6 +137,8 @@ module hyperram_bw_test
     output logic       dbg_prewin_marker,  // 1 = drive 0xA500|k marker instead of shadow (attribution)
     output logic       dbg_postwin_hold,   // hold last data word 4 CK into the tail (law-3 analog)
     output logic       dbg_ck_stretch_off, // board-only: disable gpio_io ck_stretch trailing masked cycle
+    output logic       dbg_prewin_contig,  // round 2 (A): keep shadow at a contiguous command-edge reopen
+    output logic       dbg_end_cread,      // round 2 (B): end-of-row (BURST_BOUNDARY-aligned) commit-read
     output logic       wrap_en             // 1 = drive front-end cmd_wrap for the REG_WRAP probe burst
 );
 
@@ -222,6 +228,8 @@ module hyperram_bw_test
     assign dbg_prewin_marker = r_dbg[13];
     assign dbg_postwin_hold  = r_dbg[14];
     assign dbg_ck_stretch_off = r_dbg[15];
+    assign dbg_prewin_contig = r_dbg[16];   // round 2 (A)
+    assign dbg_end_cread     = r_dbg[17];   // round 2 (B)
     // dbg_cr0_reprog is a generated 1-cycle pulse (in the sequential block), NOT a decode of r_dbg[8].
 
     // REG_PAT store (pattern select) and REG_WRAP arm (target word address + go-strobe).
