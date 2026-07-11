@@ -174,27 +174,29 @@ module hyperbus_capture #(
   end
   wire cs_fall = cs_prev & ~samp_q[0];
 
-  logic [15:0] fall_cnt, N_cap;
-  wire trig_now = (st == S_ARMED) && cs_fall && (fall_cnt == N_cap - 16'd1);   // the Nth fall
+  // Round-2 timing rework: the original up-counter compared (fall_cnt == N_cap - 1) — a 16-bit
+  // subtract+compare in the trig_now->wptr/RAM-enable cone that missed 350 MHz setup by ~190 ps.
+  // A DOWN-counter loads capcfg-1 once at arm (slow host event) so the hot cone is just a
+  // zero-detect: same Nth-fall semantics, falls_left==0 on the fall that fires.
+  logic [15:0] falls_left;                             // CS# falls remaining BEFORE the trigger fall
+  wire trig_now = (st == S_ARMED) && cs_fall && (falls_left == 16'd0);   // the Nth fall
   wire cap_we   = trig_now || (st == S_RUN);
 
   always_ff @(posedge cap_clk) begin
     if (rst2x) begin
-      st       <= S_IDLE;
-      wptr     <= '0;
-      done2x   <= 1'b0;
-      fall_cnt <= '0;
-      N_cap    <= 16'd1;
+      st         <= S_IDLE;
+      wptr       <= '0;
+      done2x     <= 1'b0;
+      falls_left <= '0;
     end else if (arm_pulse) begin
-      st       <= S_ARMED;                             // arm: clear any previous capture
-      wptr     <= '0;
-      done2x   <= 1'b0;
-      fall_cnt <= '0;
-      N_cap    <= (capcfg == 16'd0) ? 16'd1 : capcfg;  // latch REG_CAPCFG (min 1) for this capture
+      st         <= S_ARMED;                           // arm: clear any previous capture
+      wptr       <= '0;
+      done2x     <= 1'b0;
+      falls_left <= (capcfg == 16'd0) ? 16'd0 : capcfg - 16'd1;  // latch REG_CAPCFG (min 1) for this capture
     end else begin
       unique case (st)
         S_ARMED: begin
-          if (cs_fall)  fall_cnt <= fall_cnt + 16'd1;                    // count CS# falls
+          if (cs_fall && falls_left != 16'd0) falls_left <= falls_left - 16'd1;  // count down the falls
           if (trig_now) begin st <= S_RUN; wptr <= wptr + 1'b1; end      // Nth fall: first sample stored
           else if (!arm_s)    st <= S_IDLE;                              // host disarmed
         end

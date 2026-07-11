@@ -464,6 +464,24 @@ module top (
   wire        cap_rwds_o  = CAP_PROBE_LIVE ? phy_rwds_o_w[1]  : 1'b0;       // 1st-phase write mask
   wire        cap_rwds_i  = hb_rwds;                                        // raw RWDS pad input (always live)
 
+  // Round-2 timing fix: one clk-domain register stage on every fabric-side probe. The raw probe
+  // cones (u_ctrl state/addr muxes behind phy_dq_o_w etc.) missed the 2.857 ns clk->clk2x setup
+  // half-window into u_cap's samplers (-0.147 ns worst, 9 endpoints). Reg->reg crossings close
+  // trivially, and every probe shifts by the SAME 1 clk so the record stays coherent — absolute
+  // wire alignment is 1 clk late; cap_rwds_i stays raw (pad-timed, 1 clk of skew vs the registered
+  // probes, tolerable for forensics and unchanged from the pre-#13 build).
+  logic        cap_cs_n_q, cap_ck_q, cap_dq_oe_q, cap_rwds_oe_q, cap_rwds_o_q;
+  logic [15:0] cap_dq_o_q, cap_dq_i_q;
+  always_ff @(posedge clk) begin
+    cap_cs_n_q    <= cap_cs_n;
+    cap_ck_q      <= cap_ck;
+    cap_dq_oe_q   <= cap_dq_oe;
+    cap_dq_o_q    <= cap_dq_o;
+    cap_dq_i_q    <= cap_dq_i;
+    cap_rwds_oe_q <= cap_rwds_oe;
+    cap_rwds_o_q  <= cap_rwds_o;
+  end
+
   // =========================================================================
   // On-chip logic analyzer (DEBUG): records the HyperBus pin-side signals + the av_* handshake at
   // 100 MHz from the first hb_cs_n low after arming. CSR at base 0x100 (decode above). See
@@ -481,13 +499,13 @@ module top (
     // recovered RX word, and phy_ck_en as the CK proxy — which is what the wound-window capture needs.
     // hb_dq_o / hb_dq_i are now the full 16-bit fabric words (byte A hi / byte B lo). Flip
     // CAP_PROBE_LIVE=1'b0 above to revert to tied-off probes if the fabric fanout re-trips the Fitter.
-    .hb_cs_n          (cap_cs_n),
-    .hb_ck            (cap_ck),          // fabric CK-enable proxy (phy_ck_en)
-    .hb_dq_oe         (cap_dq_oe),
-    .hb_dq_o          (cap_dq_o),        // 16-bit fabric TX word (widened for issue #13)
-    .hb_dq_i          (cap_dq_i),        // 16-bit fabric recovered RX word
-    .hb_rwds_oe       (cap_rwds_oe),
-    .hb_rwds_o        (cap_rwds_o),      // 1st-phase write mask
+    .hb_cs_n          (cap_cs_n_q),
+    .hb_ck            (cap_ck_q),        // fabric CK-enable proxy (phy_ck_en), 1 clk late (see above)
+    .hb_dq_oe         (cap_dq_oe_q),
+    .hb_dq_o          (cap_dq_o_q),      // 16-bit fabric TX word (widened for issue #13)
+    .hb_dq_i          (cap_dq_i_q),      // 16-bit fabric recovered RX word
+    .hb_rwds_oe       (cap_rwds_oe_q),
+    .hb_rwds_o        (cap_rwds_o_q),    // 1st-phase write mask
     .hb_rwds_i        (cap_rwds_i),
     .av_read          (av_read),
     .av_write         (av_write),
